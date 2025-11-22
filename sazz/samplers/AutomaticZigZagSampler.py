@@ -34,9 +34,9 @@ class AutomaticZigZagSampler:
     def sample(self):
         time_passed = 0.0
         # Set up a progress bar
-        pbar = tqdm(total=(self.N - 1), desc="Zig-Zag time", unit="iter")
+        pbar = tqdm(total=self.N, desc="Zig-Zag time", unit="iter")
 
-        while self.iteration < self.N:
+        while self.iteration <= self.N:
             n = self.iteration
             # Current velocity and position
             pos = self.Position[(n-1),:]
@@ -73,10 +73,11 @@ class AutomaticZigZagSampler:
                 pbar.update(1)
             else:
                 time_passed += self.t_max
+        print("Time passed: " + str(self.Time[n]))
 
     def getSamples(self,N_samples: int = 1000):
-        time = self.Time[self.iteration]
-        dt = time / N_samples
+        time = np.max(self.Time).item()
+        dt = time / (N_samples-1)
         _, samples, _ = sample_trajectory_at_regular_intervals(self.Position, self.Velocity, self.Time, dt)
         return samples
 

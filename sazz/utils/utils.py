@@ -2,7 +2,7 @@ import numpy as np
 
 def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100):
     """
-    Given a function f, and an interval [a,b], find arg min f(x) for x \in [a,b]
+    Given a function f, and an interval [a,b], find arg min f(x) for x in [a,b]
     Parameters:
     - f: function of a single input, time
     - a: minimum of search interval
