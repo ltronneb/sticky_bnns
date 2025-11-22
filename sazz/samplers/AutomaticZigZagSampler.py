@@ -1,8 +1,9 @@
 from functools import partial
 
 import numpy as np
+from tqdm.auto import tqdm
 
-from sazz.utils.utils import brent
+from sazz.utils.utils import brent, sample_trajectory_at_regular_intervals
 
 
 class AutomaticZigZagSampler:
@@ -32,6 +33,9 @@ class AutomaticZigZagSampler:
 
     def sample(self):
         time_passed = 0.0
+        # Set up a progress bar
+        pbar = tqdm(total=(self.N - 1), desc="Zig-Zag time", unit="iter")
+
         while self.iteration < self.N:
             n = self.iteration
             # Current velocity and position
@@ -66,8 +70,17 @@ class AutomaticZigZagSampler:
                 # Increase iteration and reset time_passed
                 self.iteration += 1
                 time_passed = 0.0
+                pbar.update(1)
             else:
                 time_passed += self.t_max
+
+    def getSamples(self,N_samples: int = 1000):
+        time = self.Time[self.iteration]
+        dt = time / N_samples
+        _, samples, _ = sample_trajectory_at_regular_intervals(self.Position, self.Velocity, self.Time, dt)
+        return samples
+
+
 
 
 
