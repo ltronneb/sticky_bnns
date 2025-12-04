@@ -39,20 +39,33 @@ class AutomaticZigZagSampler:
         while self.iteration <= self.N:
             n = self.iteration
             # Current velocity and position
-            pos = self.Position[(n-1),:]
             vel = self.Velocity[(n-1),:]
+            pos = self.Position[(n-1),:] + time_passed * vel
             # Define a single-argument function for Brent
             rate_time = partial(self.rate,pos0=pos,vel=vel)
 
             # Optimize bound on rate
             x_star = brent(rate_time,0,self.t_max) # Find time point at which rate is maximum
             lambda_max = -rate_time(x_star) # Rate at this time, basically a flat bound
+            #if lambda_max == 0:
+            #    print("lambda_max: " + str(lambda_max))
+            #    print("x_star: " + str(x_star))
+            #    print("current_pos: ")
+            #    print(pos + x_star*vel)
+            #    print(self.grad_target(pos + x_star*vel))
+            # If lambda_max = 0 move deterministically
             # Compute event time
             tau_star = np.random.exponential(1.0/lambda_max,1)
+            #print("tau_star: " + str(tau_star))
             # Thinning
             u = np.random.random()
             lambda_star = -rate_time(tau_star)
             p = lambda_star / lambda_max
+            #if p > 1: # Something went terrible in the optimization
+
+            #print(p)
+            #print("lambda_max: " + str(lambda_max))
+            #print("lambda_star: " + str(lambda_star))
             acc = (u <= p)
             if acc and (tau_star < self.t_max):
                 # Event <3
@@ -71,9 +84,16 @@ class AutomaticZigZagSampler:
                 self.iteration += 1
                 time_passed = 0.0
                 pbar.update(1)
+                #pbar.refresh()
+
+                # Adapt t_max
+                self.t_max *= 0.96
             else:
                 time_passed += self.t_max
+                # Adapt t_max
+                self.t_max *= 1.01
         print("Time passed: " + str(self.Time[n]))
+        pbar.close()
 
     def getSamples(self,N_samples: int = 1000):
         time = np.max(self.Time).item()
