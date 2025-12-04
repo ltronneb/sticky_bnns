@@ -41,6 +41,7 @@ class AutomaticZigZagSampler:
             # Current velocity and position
             vel = self.Velocity[(n-1),:]
             pos = self.Position[(n-1),:] + time_passed * vel
+
             # Define a single-argument function for Brent
             rate_time = partial(self.rate,pos0=pos,vel=vel)
 
