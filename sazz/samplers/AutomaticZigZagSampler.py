@@ -26,7 +26,7 @@ class AutomaticZigZagSampler:
         # Set current iteration, which after init is 1
         self.iteration = 1
 
-    def rate(self, time, pos0, vel):
+    def neg_rate(self, time, pos0, vel):
         pos = pos0 + time*vel
         rate = np.sum(np.maximum(0,vel*self.grad_target(pos)) + self.gamma)
         return -rate
@@ -43,7 +43,7 @@ class AutomaticZigZagSampler:
             pos = self.Position[(n-1),:] + time_passed * vel
 
             # Define a single-argument function for Brent
-            rate_time = partial(self.rate,pos0=pos,vel=vel)
+            rate_time = partial(self.neg_rate,pos0=pos,vel=vel)
 
             # Optimize bound on rate
             x_star = brent(rate_time,0,self.t_max) # Find time point at which rate is maximum
