@@ -14,9 +14,12 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
     Parameters:
         kappa:
     """
-    def __init__(self, N: int, D: int, grad_target, kappa, t_max: float = 0.01, gamma: float = 0.01):
+    def __init__(self, N: int, D: int, grad_target, kappa,
+                 t_max: float = 0.01, gamma: float = 0.01,
+                 tempering: bool = True):
         super().__init__(N, D, grad_target, t_max=t_max, gamma=gamma)
         self.kappa = kappa
+        self.tempering = tempering
         # Also here set up clocks to keep track of frozen states etc.
         self.freezing = self.freezing_time(self.Position[0,:],self.Velocity[0,:])
         self.thawing = np.full((D), np.inf, float)
@@ -55,6 +58,8 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
 
             # Optimize bound on rate
             x_star = brent(rate_time, 0, self.t_max)  # Find time point at which rate is maximum
+            if (x_star > self.t_max):
+                x_star = self.t_max
             lambda_max = -rate_time(x_star)  # Rate at this time, basically a flat bound
             # Compute event time
             tau_star = np.random.exponential(1.0/lambda_max,1)

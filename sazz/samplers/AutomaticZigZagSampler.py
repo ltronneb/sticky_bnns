@@ -47,6 +47,8 @@ class AutomaticZigZagSampler:
 
             # Optimize bound on rate
             x_star = brent(rate_time,0,self.t_max) # Find time point at which rate is maximum
+            if (x_star > self.t_max):
+                x_star = self.t_max
             lambda_max = -rate_time(x_star) # Rate at this time, basically a flat bound
 
             # Compute event time
