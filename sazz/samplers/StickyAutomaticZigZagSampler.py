@@ -107,7 +107,9 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
             # If regular event:
             if regular_event:
                 # Which component is flipping velocity?
-                rates = np.maximum(0,vel*self.grad_target(pos + vel*tau_star)) + self.gamma
+                rates = np.maximum(0,vel*self.grad_target(pos + vel*tau_star))
+                # NB note that gamma should only enter on active rates!
+                rates[self.active] += self.gamma
                 rates = np.asarray(rates).astype('float64')
                 rates = rates / np.sum(rates)
                 i0 = np.argmax(np.random.multinomial(1, rates)).item()
