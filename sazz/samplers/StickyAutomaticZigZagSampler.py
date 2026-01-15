@@ -62,7 +62,8 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
                 x_star = self.t_max
             lambda_max = -rate_time(x_star)  # Rate at this time, basically a flat bound
             # Compute event time
-            tau_star = np.random.exponential(1.0/lambda_max,1)
+            #tau_star = np.random.exponential(1.0/lambda_max,1)
+            tau_star = -np.log(np.random.rand()) / lambda_max # Numerically stable
             # Thinning
             u = np.random.random()
             lambda_star = -rate_time(tau_star)
@@ -78,14 +79,14 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
             thawing_event = False
             freezing_event = False
             # Is there a regular event
-            if acc and (tau_star < self.t_max):
+            if acc and (tau_star < self.t_max) and (np.sum(self.active) != 0):
                 regular_event = True
             else:
                 tau_star = self.t_max  # tau_star now just becomes the end of the interval
 
             # Are there freezing or thawing events before this?
             # Find times for next freezing and thawing events
-            next_freeze = self.freezing[self.active].min()
+            next_freeze = self.freezing[self.active].min(initial=np.inf)
             next_thaw = self.thawing[~self.active].min(initial=np.inf)
 
             if min(next_freeze, next_thaw) < tau_star:
@@ -112,6 +113,7 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
                 rates[self.active] += self.gamma
                 rates = np.asarray(rates).astype('float64')
                 rates = rates / np.sum(rates)
+                #print(rates)
                 i0 = np.argmax(np.random.multinomial(1, rates)).item()
                 # Setting new values for positions and parameters
                 self.Position[n, :] = pos + vel * tau_star

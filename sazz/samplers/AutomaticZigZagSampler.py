@@ -47,12 +47,15 @@ class AutomaticZigZagSampler:
 
             # Optimize bound on rate
             x_star = brent(rate_time,0,self.t_max) # Find time point at which rate is maximum
+            #print("x_star" + str(x_star))
             if (x_star > self.t_max):
                 x_star = self.t_max
+            #print("x_star" + str(x_star))
             lambda_max = -rate_time(x_star) # Rate at this time, basically a flat bound
-
+            #print("lambda_max" + str(lambda_max))
             # Compute event time
-            tau_star = np.random.exponential(1.0/lambda_max,1)
+            #tau_star = np.random.exponential(1.0/lambda_max,1)
+            tau_star = -np.log(np.random.rand()) / lambda_max # Numerically stable
             #print("tau_star: " + str(tau_star))
             # Thinning
             u = np.random.random()
