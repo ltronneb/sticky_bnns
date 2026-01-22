@@ -10,7 +10,7 @@ class AutomaticZigZagSampler:
     """
     Basic Automatic ZigZag Sampler
     """
-    def __init__(self, N: int, D: int, grad_target, t_max: float = 0.01, gamma: float = 0.01):
+    def __init__(self, N: int, D: int, grad_target, t_max: float = 0.01, gamma: float = 0.01, temper: bool=False, temperature=None):
         self.N = N
         self.D = D
         self.Position = np.zeros((N+1,D))
@@ -25,10 +25,19 @@ class AutomaticZigZagSampler:
         self.Time[0] = 0.0
         # Set current iteration, which after init is 1
         self.iteration = 1
+        # Deal with temperature
+        if temperature is None:
+            self.temperature = self._default_temperature
+        else:
+            self.temperature = temperature
+        self.temper = temper
+        # Also need a global thing for the current time
+        self.current_time = 0.0
+
 
     def neg_rate(self, time, pos0, vel):
         pos = pos0 + time*vel
-        rate = np.sum(np.maximum(0,vel*self.grad_target(pos)) + self.gamma)
+        rate = np.sum(np.maximum(0,vel*self.grad_target(pos,self.T())) + self.gamma)
         return -rate
 
     def sample(self):
@@ -64,9 +73,11 @@ class AutomaticZigZagSampler:
 
             acc = (u <= p)
             if acc and (tau_star < self.t_max):
+                # Update current time
+                self.current_time += tau_star
                 # Event <3
                 # Which component is flipping
-                rates = np.maximum(0,vel*self.grad_target(pos + vel*tau_star)) + self.gamma
+                rates = np.maximum(0,vel*self.grad_target(pos + vel*tau_star,self.T())) + self.gamma
                 rates = np.asarray(rates).astype('float64')
                 rates = rates / np.sum(rates)
                 i0 = np.argmax(np.random.multinomial(1, rates)).item()
@@ -81,11 +92,12 @@ class AutomaticZigZagSampler:
                 time_passed = 0.0
                 pbar.update(1)
                 #pbar.refresh()
-
                 # Adapt t_max
                 self.t_max *= 0.96
             else:
                 time_passed += self.t_max
+                # Update current time
+                self.current_time += self.t_max
                 # Adapt t_max
                 self.t_max *= 1.01
         print("Time passed: " + str(self.Time[n]))
@@ -96,6 +108,12 @@ class AutomaticZigZagSampler:
         dt = time / (N_samples-1)
         _, samples, _ = sample_trajectory_at_regular_intervals(self.Position, self.Velocity, self.Time, dt)
         return samples
+
+    def _default_temperature(self, t,t0=20):
+        return np.clip(t / t0, 0.0, 1.0)**2
+
+    def T(self):
+        return self.temperature(self.current_time)
 
 
 
