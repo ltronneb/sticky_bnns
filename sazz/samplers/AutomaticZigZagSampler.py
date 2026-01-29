@@ -10,7 +10,12 @@ class AutomaticZigZagSampler:
     """
     Basic Automatic ZigZag Sampler
     """
-    def __init__(self, N: int, D: int, grad_target, t_max: float = 0.01, gamma: float = 0.01, temper: bool=False, temperature=None):
+    def __init__(self, N: int, D: int,
+                 grad_target,
+                 t_max: float = 0.01,
+                 gamma: float = 0.01,
+                 temper: bool=False, temperature=None,
+                 t0: float = 100.0):
         self.N = N
         self.D = D
         self.Position = np.zeros((N+1,D))
@@ -33,11 +38,12 @@ class AutomaticZigZagSampler:
         self.temper = temper
         # Also need a global thing for the current time
         self.current_time = 0.0
+        self.t0 = t0
 
 
     def neg_rate(self, time, pos0, vel):
         pos = pos0 + time*vel
-        rate = np.sum(np.maximum(0,vel*self.grad_target(pos,self.T())) + self.gamma)
+        rate = np.sum(np.maximum(0, vel * self.grad_target(pos, self.T)) + self.gamma)
         return -rate
 
     def sample(self):
@@ -77,7 +83,7 @@ class AutomaticZigZagSampler:
                 self.current_time += tau_star
                 # Event <3
                 # Which component is flipping
-                rates = np.maximum(0,vel*self.grad_target(pos + vel*tau_star,self.T())) + self.gamma
+                rates = np.maximum(0, vel * self.grad_target(pos + vel * tau_star, self.T)) + self.gamma
                 rates = np.asarray(rates).astype('float64')
                 rates = rates / np.sum(rates)
                 i0 = np.argmax(np.random.multinomial(1, rates)).item()
@@ -100,6 +106,7 @@ class AutomaticZigZagSampler:
                 self.current_time += self.t_max
                 # Adapt t_max
                 self.t_max *= 1.01
+            pbar.set_postfix_str((f"time={self.current_time:.3f}"),refresh=False)
         print("Time passed: " + str(self.Time[n]))
         pbar.close()
 
@@ -109,9 +116,17 @@ class AutomaticZigZagSampler:
         _, samples, _ = sample_trajectory_at_regular_intervals(self.Position, self.Velocity, self.Time, dt)
         return samples
 
-    def _default_temperature(self, t,t0=20):
-        return np.clip(t / t0, 0.0, 1.0)**2
+    #def _default_temperature(self, t):
+    #    return np.clip(t / self.t0, 0.0, 1.0)**2
+    def _default_temperature(self, t, T_min=0.1):
+        """
+        Exponential ramp for tempering:
+        Starts flat (T_min) and increase to 1.0
+        """
+        return 1.0 - (1.0 - T_min) * np.exp(-t / self.t0)
 
+
+    @property
     def T(self):
         return self.temperature(self.current_time)
 

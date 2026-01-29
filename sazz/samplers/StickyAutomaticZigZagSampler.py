@@ -15,11 +15,12 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
         kappa:
     """
     def __init__(self, N: int, D: int, grad_target, kappa,
-                 t_max: float = 0.01, gamma: float = 0.01,
-                 tempering: bool = True):
-        super().__init__(N, D, grad_target, t_max=t_max, gamma=gamma)
+                 t_max: float = 0.01, gamma: float = 0.00,
+                 temper: bool = False, temperature=None,
+                 t0: float = 100.0):
+        super().__init__(N, D, grad_target, t_max=t_max, gamma=gamma,
+                         temper=temper, temperature=temperature,t0=t0)
         self.kappa = kappa
-        self.tempering = tempering
         # Also here set up clocks to keep track of frozen states etc.
         self.freezing = self.freezing_time(self.Position[0,:],self.Velocity[0,:])
         self.thawing = np.full((D), np.inf, float)
@@ -103,12 +104,13 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
                     regular_event = False
                     freezing_event = False
                     tau_star = next_thaw
-
+            # Can update clock here then I think
+            self.current_time += tau_star
             # Now we handle the events
             # If regular event:
             if regular_event:
                 # Which component is flipping velocity?
-                rates = np.maximum(0,vel*self.grad_target(pos + vel*tau_star))
+                rates = np.maximum(0, vel * self.grad_target(pos + vel * tau_star, self.T))
                 # NB note that gamma should only enter on active rates!
                 rates[self.active] += self.gamma
                 rates = np.asarray(rates).astype('float64')
@@ -155,17 +157,23 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
                 self.Position[n, :] = pos + vel * tau_star
                 self.Time[n] = self.Time[(n-1)] + time_passed + tau_star
                 self.Velocity[n, :] = vel
-                self.Position[n, i_freeze] = 0.0  # set position for frozen component
-                self.Velocity[n, i_freeze] = 0.0  # set velocity for frozen component
-                self.vel_at_freeze[i_freeze] = vel[i_freeze]  # store the velocity it had before it froze
-                self.active[i_freeze] = False  # set component as inactive
-                self.thawing[i_freeze] = np.random.exponential(1.0 / self.kappa[i_freeze])  # How long will it stay frozen?
+                if self.freezing_dynamics_active:
+                    # Allow the model to skip freezing while reaching the typical set
+                    self.Position[n, i_freeze] = 0.0  # set position for frozen component
+                    self.Velocity[n, i_freeze] = 0.0  # set velocity for frozen component
+                    self.vel_at_freeze[i_freeze] = vel[i_freeze]  # store the velocity it had before it froze
+                    self.active[i_freeze] = False  # set component as inactive
+                    self.thawing[i_freeze] = np.random.exponential(1.0 / self.kappa[i_freeze])  # How long will it stay frozen?
 
-                pbar.update(1)
+                    pbar.update(1)
 
-                # Increasing iteration and setting the local clock to zero again
-                self.iteration += 1
-                time_passed = 0.0
+                    # Increasing iteration and setting the local clock to zero again
+                    self.iteration += 1
+                    time_passed = 0.0
+                else:
+                    time_passed += self.t_max
+                    # Adapt t_max
+                    self.t_max *= 1.01
 
             # If nothing happens we increase the time passed by the tmax
             if not (regular_event or freezing_event or thawing_event):
@@ -175,6 +183,12 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
 
             # And in any case, thawing clocks tick down
             self.thawing = self.thawing - tau_star
+            # And set some information on the progresbar
+            pbar.set_postfix_str((f"time={self.current_time:.3f}"),refresh=False)
 
         print("Time passed: " + str(self.Time[n]))
         pbar.close()
+
+    @property
+    def freezing_dynamics_active(self):
+        return self.current_time > self.t0
