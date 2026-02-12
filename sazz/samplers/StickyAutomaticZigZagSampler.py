@@ -26,6 +26,8 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
         self.thawing = np.full((D), np.inf, float)
         self.active = np.full((D), True, bool)
         self.vel_at_freeze = np.zeros((D))
+        # Also we indicate which event caused the skeleton point
+        self.cause = []
 
     def freezing_time(self, pos, vel):
         valid = (pos*vel < 0) # were current position and velocity means they'll freeze at some point
@@ -56,7 +58,7 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
             # Update our freezing times
             self.freezing = self.freezing_time(pos,vel)
             self.freezing = np.where(self.freezing > 0, self.freezing, np.inf)
-
+            #print(self.freezing[0:self.D])
             # Optimize bound on rate
             x_star = brent(rate_time, 0, self.t_max)  # Find time point at which rate is maximum
             if (x_star > self.t_max):
@@ -89,7 +91,12 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
             # Find times for next freezing and thawing events
             next_freeze = self.freezing[self.active].min(initial=np.inf)
             next_thaw = self.thawing[~self.active].min(initial=np.inf)
-
+            if next_freeze == next_thaw:
+                raise RuntimeError("two things happening at once!")
+            if (next_freeze < 0):
+                raise RuntimeError("negative next freeze!")
+            if (min(next_freeze,next_thaw) == tau_star):
+                raise RuntimeError("two things at once!")
             if min(next_freeze, next_thaw) < tau_star:
                 # Handle the freeze event
                 if next_freeze < next_thaw:
@@ -128,9 +135,13 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
                 self.Velocity[n, :] = vel
 
                 pbar.update(1)
+                # Check flips
+                self.check_direct_flips()
                 # Increasing iteration and setting the local clock to zero again
                 self.iteration += 1
                 time_passed = 0.0
+                self.cause.append("Flip")
+
 
                 # Adapt t_max
                 self.t_max *= 0.96
@@ -147,13 +158,20 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
 
                 pbar.update(1)
 
+                # Check flips
+                self.check_direct_flips()
                 # Increasing iteration and setting the local clock to zero again
                 self.iteration += 1
                 time_passed = 0.0
+                self.cause.append("Thaw")
+
 
                 # If there is a freezing event
             elif freezing_event:
                 i_freeze = np.argmin(np.where(self.active, self.freezing, np.inf))
+                if i_freeze.size!=1:
+                    # print(i_freeze[0:self.D])
+                    raise RuntimeError()
                 self.Position[n, :] = pos + vel * tau_star
                 self.Time[n] = self.Time[(n-1)] + time_passed + tau_star
                 self.Velocity[n, :] = vel
@@ -166,10 +184,13 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
                     self.thawing[i_freeze] = np.random.exponential(1.0 / self.kappa[i_freeze])  # How long will it stay frozen?
 
                     pbar.update(1)
-
+                    # Check flips
+                    self.check_direct_flips()
                     # Increasing iteration and setting the local clock to zero again
                     self.iteration += 1
                     time_passed = 0.0
+                    self.cause.append("Freeze")
+
                 else:
                     time_passed += self.t_max
                     # Adapt t_max
@@ -184,11 +205,41 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
             # And in any case, thawing clocks tick down
             self.thawing = self.thawing - tau_star
             # And set some information on the progresbar
-            pbar.set_postfix_str((f"time={self.current_time:.3f}"),refresh=False)
+            pbar.set_postfix_str((f"time={self.current_time:.3f}, sparsity={np.sum(self.active)}"),refresh=False)
+            # And do some checks on clocks
+            if (self.thawing < 0).any():
+                raise RuntimeError("negative thawing clocks!")
+            if (self.freezing < 0).any():
+                raise RuntimeError("negative freezing clocks!")
 
         print("Time passed: " + str(self.Time[n]))
         pbar.close()
 
+
+    def check_direct_flips(self):
+        if (self.iteration > 0):
+
+            i = self.iteration
+            cur = self.Position[i,:]
+            prev = self.Position[i-1,:]
+
+            sign_prev = np.zeros_like(prev,dtype=int)
+            sign_prev[prev < 0] = -1
+            sign_prev[prev > 0] = 1
+
+            sign_cur = np.zeros_like(cur)
+            sign_cur[cur < 0] = -1
+            sign_cur[cur > 0] = 1
+
+            # Direct flips will have opposite signs
+            violations = (sign_prev * sign_cur) == -1
+            if violations.any():
+                bad_cols = np.nonzero(violations)[0]
+                print(bad_cols)
+                print("Direct sign flip without zero: ", bad_cols)
+                raise RuntimeError("direct flips noticed!")
+
     @property
     def freezing_dynamics_active(self):
-        return self.current_time > self.t0
+        #return self.current_time > 100
+        return True
