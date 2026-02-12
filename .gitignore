@@ -42,3 +42,6 @@ Thumbs.db
 */.ipynb_checkpoints/*
 __pycache__/
 .Rhistory
+
+# Directories #
+personal/
