@@ -24,7 +24,7 @@ class StickyBoomerangSampler(BoomerangSampler):
         
         # --- Sticky specifics ---
         kappa_arr = np.array([kappa])
-        self.kappa = np.full(D, kappa)
+        self.kappa = np.full(D, kappa_arr)
         
         self.frozen_mask = np.zeros(D, dtype=bool)
         self.frozen_velocity = np.zeros(D, dtype=float)
