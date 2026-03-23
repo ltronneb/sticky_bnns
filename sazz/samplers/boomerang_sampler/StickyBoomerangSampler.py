@@ -201,13 +201,13 @@ class StickyBoomerangSampler(BoomerangSampler):
                     # Accepted velocity bounce
                     self.current_time += tau_star
                     
-                    pos_prop, vel_prop = self.trajectory(
+                    pos_prop, vel_prop = self.trajectory_sticky(
                         time_passed + tau_star,
                         self.Position[(n-1), :],
                         self.Velocity[(n-1), :]
                     )
                     self.Position[n, :] = pos_prop
-                    self.Velocity[n, :] = self.reflect_velocity(vel_prop, self.gradU(pos_prop))
+                    self.Velocity[n, :] = self.reflect_velocity_sticky(vel_prop, self.gradU(pos_prop))
                     self.Time[n] = self.Time[(n-1)] + time_passed + tau_star
                     
                     self.iteration += 1
@@ -262,7 +262,7 @@ class StickyBoomerangSampler(BoomerangSampler):
             if dt_refresh <= 1e-14:
                 if self.iteration < self.N:
                     n = self.iteration
-                    pos_ref, _ = self.trajectory(
+                    pos_ref, _ = self.trajectory_sticky(
                         time_passed,
                         self.Position[(n-1), :],
                         self.Velocity[(n-1), :]
