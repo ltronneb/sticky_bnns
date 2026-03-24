@@ -9,8 +9,10 @@ from tqdm import tqdm
 from sazz.utils.utils import brent
 from sazz.samplers.boomerang_sampler.BoomerangSampler import BoomerangSampler
 
+# --------- More efficient sampling of thawing times --------- #
 
-class StickyBoomerangSampler(BoomerangSampler):
+
+class StickyBoomerangSampler_New(BoomerangSampler):
     """
     Sticky Boomerang sampler
     """
@@ -28,6 +30,7 @@ class StickyBoomerangSampler(BoomerangSampler):
         
         self.frozen_mask = np.zeros(D, dtype=bool)
         self.frozen_velocity = np.zeros(D, dtype=float)
+        self.thaw_deadline = np.full(D, np.inf)
 
 
     # --- Sticky specific dynamics ---
@@ -41,19 +44,18 @@ class StickyBoomerangSampler(BoomerangSampler):
         v_t[self.frozen_mask] = 0.0
         return x_t, v_t
     
-    def freeze(self, i, v):
-        """
-        Freeze coordinate i: store its velocity, then set x_i = v_i = 0.
-        """
+    def freeze(self, i, v, current_time):
         self.frozen_mask[i] = True
         self.frozen_velocity[i] = v[i]
-        
+        rate_i = self.kappa[i] * abs(v[i])
+        if rate_i > 1e-14:
+            self.thaw_deadline[i] = current_time + np.random.exponential(1.0 / rate_i)
+        else:
+            self.thaw_deadline[i] = np.inf
+            
     def thaw(self, i):
-        """
-        Thaw coordinate i: restore its stored velocity (non-reversible jump).
-        Position stays at 0.
-        """
         self.frozen_mask[i] = False
+        self.thaw_deadline[i] = np.inf
         
     def reflect_velocity_sticky(self, v, gradU):
         """
@@ -119,97 +121,69 @@ class StickyBoomerangSampler(BoomerangSampler):
 
         return t_hit, i_hit
     
-    def sample_thaw_event(self):
-        """
-        Sample when and which frozen coordinate thaws.
-        Each frozen coordinate i has thaw rate kappa_i * |v_i_stored|.
-        """
+    def next_thaw_event(self):
         frozen_idx = np.flatnonzero(self.frozen_mask)
-
-        # Nothing frozen — no thaw event possible
         if len(frozen_idx) == 0:
             return np.inf, None
-
-        # Individual thaw rates
-        rates = self.kappa[frozen_idx] * np.abs(self.frozen_velocity[frozen_idx])
-        total_rate = float(np.sum(rates))
-
-        # All frozen velocities were ~zero — stuck forever
-        if total_rate < 1e-14:
-            return np.inf, None
-
-        # Time until first thaw: min of competing exponentials
-        t_thaw = np.random.exponential(1.0 / total_rate)
-
-        # Which coordinate wins: proportional to its rate
-        probs = rates / total_rate
-        i_thaw = int(np.random.choice(frozen_idx, p=probs))
-
-        return t_thaw, i_thaw
-
+        i_min = frozen_idx[np.argmin(self.thaw_deadline[frozen_idx])]
+        return self.thaw_deadline[i_min], i_min
 
     def sample_auto(self):
-        """
-        Sticky Automatic Boomerang sampler.
-        
-        Four competing clocks determine what happens next:
-            1. Bounce proposal (Poisson thinning on local rate bound)
-            2. Velocity refresh (exponential clock)
-            3. Coordinate freeze (deterministic: orbit crosses x_i = 0)
-            4. Coordinate thaw (exponential clock per frozen coordinate)
-        
-        Whichever fires first within [0, t_max] wins.
-        """
-        self.Position[0,:] = np.random.normal(0,1,size=self.D)
-        self.Velocity[0,:] = self.Sigma_sqrt @ np.random.randn(self.D)
+        self.Position[0, :] = np.random.normal(0, 1, size=self.D)
+        self.Velocity[0, :] = self.Sigma_sqrt @ np.random.randn(self.D)
         self.Time[0] = 0.0
-        #self.frozen_mask[:] = False
-        #self.frozen_velocity[:] = 0.0
- 
+        self.thaw_deadline[:] = np.inf  # reset schedule
+
         dt_refresh = np.random.exponential(1.0 / self.refresh_rate)
-        
+
         time_passed = 0.0
         pbar = tqdm(total=self.N, desc="Sticky Boomerang time", unit="iter")
         while self.iteration < self.N:
             n = self.iteration
-            pos, vel = self.trajectory_sticky(time_passed, self.Position[(n-1), :], self.Velocity[(n-1), :])
-            
+            pos, vel = self.trajectory_sticky(
+                time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
+            )
+
             dt_hit, i_hit = self.next_hitting_event(pos, vel)
-            dt_thaw , i_thaw = self.sample_thaw_event()
+
+            # --- thaw: lookup from schedule instead of sampling ---
+            T_thaw_abs, i_thaw = self.next_thaw_event()
+            dt_thaw = T_thaw_abs - self.current_time  # time until thaw from *now*
+            if dt_thaw < 0:
+                dt_thaw = 0.0  # safety clamp
+
             horizon = min(self.t_max, dt_refresh, dt_hit, dt_thaw)
-            
+
             rate_time = partial(self.neg_rate, x=pos, v=vel)
             x_star = brent(rate_time, 0, horizon)
-            lambda_max = max(-rate_time(x_star), 0.0) 
-            
+            lambda_max = max(-rate_time(x_star), 0.0)
+
             regular_event_proposal = False
-            thawing_event = False
-            freezing_event = False
-            
+
             if lambda_max <= 1e-14:
                 tau_star = np.inf
             else:
                 tau_star = -np.log(np.random.rand()) / lambda_max
-                
-            if tau_star < horizon: # Regular event
-                regular_event_proposal = True
+
+            if tau_star < horizon:  # Regular event (bounce proposal)
                 u = np.random.random()
                 lambda_star = max(-rate_time(tau_star), 0.0)
                 p = lambda_star / lambda_max
-                
+
                 if u <= p:
-                    # Accepted velocity bounce
+                    # Accepted bounce
                     self.current_time += tau_star
-                    
                     pos_prop, vel_prop = self.trajectory_sticky(
                         time_passed + tau_star,
-                        self.Position[(n-1), :],
-                        self.Velocity[(n-1), :]
+                        self.Position[n - 1, :],
+                        self.Velocity[n - 1, :],
                     )
                     self.Position[n, :] = pos_prop
-                    self.Velocity[n, :] = self.reflect_velocity_sticky(vel_prop, self.gradU(pos_prop))
-                    self.Time[n] = self.Time[(n-1)] + time_passed + tau_star
-                    
+                    self.Velocity[n, :] = self.reflect_velocity_sticky(
+                        vel_prop, self.gradU(pos_prop)
+                    )
+                    self.Time[n] = self.Time[n - 1] + time_passed + tau_star
+
                     self.iteration += 1
                     time_passed = 0.0
                     dt_refresh -= tau_star
@@ -218,56 +192,56 @@ class StickyBoomerangSampler(BoomerangSampler):
                     time_passed += tau_star
                     self.current_time += tau_star
                     dt_refresh -= tau_star
-            else: # Either thaw, freeze or refresh fired and became the horizon
+
+            else:  # horizon fired: freeze, thaw, or refresh
                 time_passed += horizon
                 self.current_time += horizon
                 dt_refresh -= horizon
-                
+
                 tol = 1e-12
-                
+
                 if abs(horizon - dt_hit) < tol and i_hit is not None:
-                    freezing_event = True
+                    # --- Freeze: draw thaw deadline here ---
                     pos_now, vel_now = self.trajectory_sticky(
-                        time_passed, self.Position[n-1, :], self.Velocity[n-1, :]
+                        time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
                     )
-                    self.freeze(i_hit, vel_now)
+                    self.freeze(i_hit, vel_now, self.current_time)
                     pos_now[i_hit] = 0.0
                     vel_now[i_hit] = 0.0
 
                     self.Position[n, :] = pos_now
                     self.Velocity[n, :] = vel_now
-                    self.Time[n] = self.Time[n-1] + time_passed
+                    self.Time[n] = self.Time[n - 1] + time_passed
 
                     self.iteration += 1
                     time_passed = 0.0
                     pbar.update(1)
-                    
-                elif abs(horizon - dt_thaw)<tol and i_thaw is not None:
-                    thawing_event = True
+
+                elif abs(horizon - dt_thaw) < tol and i_thaw is not None:
+                    # --- Thaw: just clear the deadline ---
                     pos_now, vel_now = self.trajectory_sticky(
-                        time_passed, self.Position[n-1, :], self.Velocity[n-1, :]
+                        time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
                     )
                     self.thaw(i_thaw)
-                    #pos_now[i_thaw] = 0.0
                     vel_now[i_thaw] = self.frozen_velocity[i_thaw]
-                    
+
                     self.Position[n, :] = pos_now
                     self.Velocity[n, :] = vel_now
-                    self.Time[n] = self.Time[n-1] + time_passed
-                    
+                    self.Time[n] = self.Time[n - 1] + time_passed
+
                     self.iteration += 1
                     time_passed = 0.0
                     pbar.update(1)
-                
+
             if dt_refresh <= 1e-14:
                 if self.iteration < self.N:
                     n = self.iteration
                     pos_ref, _ = self.trajectory_sticky(
                         time_passed,
-                        self.Position[(n-1), :],
-                        self.Velocity[(n-1), :]
+                        self.Position[n - 1, :],
+                        self.Velocity[n - 1, :],
                     )
-                    
+
                     v_refreshed = np.zeros(self.D)
                     active = ~self.frozen_mask
                     if np.any(active):
@@ -276,10 +250,10 @@ class StickyBoomerangSampler(BoomerangSampler):
                             Sigma_a + 1e-12 * np.eye(np.sum(active))
                         )
                         v_refreshed[active] = chol_a @ np.random.randn(np.sum(active))
-                    
+
                     self.Position[n, :] = pos_ref
                     self.Velocity[n, :] = v_refreshed
-                    self.Time[n] = self.Time[(n-1)] + time_passed
+                    self.Time[n] = self.Time[n - 1] + time_passed
                     self.iteration += 1
                     time_passed = 0.0
                     pbar.update(1)
@@ -288,7 +262,7 @@ class StickyBoomerangSampler(BoomerangSampler):
 
         print("Time passed: " + str(self.Time[self.iteration - 1]))
         pbar.close()
-
+    
     def _default_temperature(self, t, T_min=0.1):
         """
         Exponential ramp for tempering:
