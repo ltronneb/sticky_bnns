@@ -1,6 +1,6 @@
 import numpy as np
 
-def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100):
+def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100, diagnostics=True):
     """
     Given a function f, and an interval [a,b], find arg min f(x) for x in [a,b]
     Parameters:
@@ -20,6 +20,8 @@ def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100):
 
     x = w = v = a + (b - a) / 2
     f_x = f_w = f_v = f(x)
+    
+    n_rate_evals = 1
 
     # Now for the algorithm itself
     iteration = 0
@@ -41,6 +43,7 @@ def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100):
                 u = x - (b - x) / phi
         # Evaluate f at u
         f_u = f(u)
+        n_rate_evals += 1 
 
         # Update the interval
         if f_u < f_x:
@@ -68,6 +71,11 @@ def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100):
         iteration += 1
         if iteration > maxiter:
             break
+    if diagnostics:
+        stats = {
+            'rate_evals': n_rate_evals,
+        }
+        return x, stats
     return x
 
 

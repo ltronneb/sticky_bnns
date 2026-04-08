@@ -6,18 +6,18 @@ from scipy.linalg import cholesky
 import autograd.numpy as anp
 from tqdm import tqdm
 
-from sazz.utils.utils import brent
+import pandas as pd
+
+from sazz.utils.linear_envelope import piecewise_thinning
 from sazz.samplers.boomerang_sampler.BoomerangSampler import BoomerangSampler
 
-# --------- More efficient sampling of thawing times --------- #
 
-
-class StickyBoomerangSampler_New(BoomerangSampler):
+class StickyBoomerangSampler_pli(BoomerangSampler):
     """
     Sticky Boomerang sampler
     """
     def __init__(self, E, N:int, D:int, grad_target, kappa=1.0,
-                 refresh_rate=1.0, t_max: float = 0.5,
+                 refresh_rate=0.1, t_max: float = 0.5,
                  ):
         super().__init__(
             E=E, N=N, D=D, grad_target=grad_target,
@@ -128,6 +128,14 @@ class StickyBoomerangSampler_New(BoomerangSampler):
         i_min = frozen_idx[np.argmin(self.thaw_deadline[frozen_idx])]
         return self.thaw_deadline[i_min], i_min
 
+    def rate_func(self, t, x, v):
+        """
+        Boomerang negative rate
+        """
+        x_t, v_t = self.trajectory_sticky(t, x, v)
+        inner = anp.dot(v_t, self.gradU(x_t))
+        return inner
+    
     def sample_auto(self):
         self.Position[0, :] = np.random.normal(0, 1, size=self.D)
         self.Velocity[0, :] = self.Sigma_sqrt @ np.random.randn(self.D)
@@ -138,6 +146,11 @@ class StickyBoomerangSampler_New(BoomerangSampler):
 
         time_passed = 0.0
         pbar = tqdm(total=self.N, desc="Sticky Boomerang time", unit="iter")
+        
+        diag_log = []
+        event_counts = {'bounce': 0, 'freeze': 0, 'thaw': 0, 'refresh': 0, 'max_iter': 0}
+        grad_evals = 0
+        
         while self.iteration < self.N:
             n = self.iteration
             pos, vel = self.trajectory_sticky(
@@ -152,46 +165,43 @@ class StickyBoomerangSampler_New(BoomerangSampler):
             if dt_thaw < 0:
                 dt_thaw = 0.0  # safety clamp
 
-            horizon = min(self.t_max, dt_refresh, dt_hit, dt_thaw)
+            #horizon = min(self.t_max, dt_refresh, dt_hit, dt_thaw)
+            horizon = min(dt_refresh, dt_hit, dt_thaw)
+            rate_fn = partial(self.rate_func, x=pos, v=vel)
 
-            rate_time = partial(self.neg_rate, x=pos, v=vel)
-            x_star = brent(rate_time, 0, horizon)
-            lambda_max = max(-rate_time(x_star), 0.0)
+            tau_star, stats = piecewise_thinning(rate_fn, horizon)
+            
+            grad_evals += stats['rate_evals']
 
-            regular_event_proposal = False
+            n_frozen = self.frozen_mask.sum()
+            n_active = self.D - n_frozen
 
-            if lambda_max <= 1e-14:
-                tau_star = np.inf
-            else:
-                tau_star = -np.log(np.random.rand()) / lambda_max
+            stats['horizon'] = horizon
+            stats['n_frozen'] = n_frozen
+            stats['n_active'] = n_active
+            stats['sparsity'] = n_frozen / self.D
+            stats['time'] = self.current_time
 
             if tau_star < horizon:  # Regular event (bounce proposal)
-                u = np.random.random()
-                lambda_star = max(-rate_time(tau_star), 0.0)
-                p = lambda_star / lambda_max
+                stats['event_type'] = 'bounce'
+                event_counts['bounce'] += 1
+                # Accepted bounce
+                self.current_time += tau_star
+                pos_prop, vel_prop = self.trajectory_sticky(
+                    time_passed + tau_star,
+                    self.Position[n - 1, :],
+                    self.Velocity[n - 1, :],
+                )
+                self.Position[n, :] = pos_prop
+                self.Velocity[n, :] = self.reflect_velocity_sticky(
+                    vel_prop, self.gradU(pos_prop)
+                )
+                self.Time[n] = self.Time[n - 1] + time_passed + tau_star
 
-                if u <= p:
-                    # Accepted bounce
-                    self.current_time += tau_star
-                    pos_prop, vel_prop = self.trajectory_sticky(
-                        time_passed + tau_star,
-                        self.Position[n - 1, :],
-                        self.Velocity[n - 1, :],
-                    )
-                    self.Position[n, :] = pos_prop
-                    self.Velocity[n, :] = self.reflect_velocity_sticky(
-                        vel_prop, self.gradU(pos_prop)
-                    )
-                    self.Time[n] = self.Time[n - 1] + time_passed + tau_star
-
-                    self.iteration += 1
-                    time_passed = 0.0
-                    dt_refresh -= tau_star
-                    pbar.update(1)
-                else:
-                    time_passed += tau_star
-                    self.current_time += tau_star
-                    dt_refresh -= tau_star
+                self.iteration += 1
+                time_passed = 0.0
+                dt_refresh -= tau_star
+                pbar.update(1)
 
             else:  # horizon fired: freeze, thaw, or refresh
                 time_passed += horizon
@@ -202,6 +212,9 @@ class StickyBoomerangSampler_New(BoomerangSampler):
 
                 if abs(horizon - dt_hit) < tol and i_hit is not None:
                     # --- Freeze: draw thaw deadline here ---
+                    stats['event_type'] = 'freeze'
+                    stats['frozen_coord'] = i_hit
+                    event_counts['freeze'] += 1
                     pos_now, vel_now = self.trajectory_sticky(
                         time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
                     )
@@ -218,6 +231,9 @@ class StickyBoomerangSampler_New(BoomerangSampler):
                     pbar.update(1)
 
                 elif abs(horizon - dt_thaw) < tol and i_thaw is not None:
+                    stats['event_type'] = 'thaw'
+                    stats['thawed_coord'] = i_thaw
+                    event_counts['thaw'] += 1
                     # --- Thaw: just clear the deadline ---
                     pos_now, vel_now = self.trajectory_sticky(
                         time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
@@ -234,6 +250,8 @@ class StickyBoomerangSampler_New(BoomerangSampler):
                     pbar.update(1)
 
             if dt_refresh <= 1e-14:
+                stats['event_type'] = 'refresh'
+                event_counts['refresh'] += 1
                 if self.iteration < self.N:
                     n = self.iteration
                     pos_ref, _ = self.trajectory_sticky(
@@ -259,6 +277,31 @@ class StickyBoomerangSampler_New(BoomerangSampler):
                     pbar.update(1)
                 dt_refresh = np.random.exponential(1.0 / self.refresh_rate)
             pbar.set_postfix_str(f"time={self.current_time:.3f}", refresh=False)
+            
+            diag_log.append(stats)
+            
+        df = pd.DataFrame(diag_log)
+        print("\n=== Sampler Diagnostics ===")
+        print(f"Events: {event_counts}")
+        print(f"Total gradient evals: {grad_evals}")
+        print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
+        print(f"Mean sparsity (fraction frozen): {df['sparsity'].mean():.3f}")
+        print(f"Max simultaneous frozen: {df['n_frozen'].max()} / {self.D}")
+
+        print("\n=== Thinning Diagnostics ===")
+        print(f"Bound violations: {df['bound_violations'].sum()} across {(df['bound_violations']>0).sum()} calls")
+        print(f"Max ratio: {df['max_ratio'].max():.4f}")
+        print(f"Rate evals/call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
+
+        print("\n=== Event-type breakdown ===")
+        for etype in ['bounce', 'freeze', 'thaw', 'refresh']:
+            sub = df[df['event_type'] == etype]
+            if len(sub) > 0:
+                print(f"  {etype:8s}: {len(sub):5d} events, "
+                    f"mean horizon={sub['horizon'].mean():.4f}, "
+                    f"mean proposals={sub['proposals'].mean():.1f}")
+
+        self.diagnostics_df = df
 
         print("Time passed: " + str(self.Time[self.iteration - 1]))
         pbar.close()
