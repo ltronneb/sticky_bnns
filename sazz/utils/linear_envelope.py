@@ -141,6 +141,7 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None, R=2.0, max_it
     if diagnostics:
         stats = {
             'accepted': result < np.inf,
+            'rejected': result == np.inf,
             'proposals': n_proposals,
             'rate_evals': n_rate_evals,
             'max_ratio': max_ratio,
@@ -149,3 +150,5 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None, R=2.0, max_it
         }
         return result, stats
     return result
+
+

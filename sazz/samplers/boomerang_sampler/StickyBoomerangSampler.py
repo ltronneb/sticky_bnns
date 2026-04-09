@@ -5,6 +5,7 @@ from scipy.optimize import minimize
 from scipy.linalg import cholesky
 import autograd.numpy as anp
 from tqdm import tqdm
+import time as _time
 
 import pandas as pd
 
@@ -19,7 +20,7 @@ class StickyBoomerangSampler(BoomerangSampler):
     Sticky Boomerang sampler
     """
     def __init__(self, E, N:int, D:int, grad_target, kappa=1.0,
-                 refresh_rate=0.1, t_max: float = 0.5,
+                 refresh_rate=0.1, t_max: float = 1.0,
                  ):
         super().__init__(
             E=E, N=N, D=D, grad_target=grad_target,
@@ -130,6 +131,14 @@ class StickyBoomerangSampler(BoomerangSampler):
         i_min = frozen_idx[np.argmin(self.thaw_deadline[frozen_idx])]
         return self.thaw_deadline[i_min], i_min
 
+    def neg_rate_sticky(self, t, x, v):
+        """
+        Boomerang negative rate
+        """
+        x_t, v_t = self.trajectory_sticky(t, x, v)
+        inner = anp.dot(v_t, self.gradU(x_t))
+        return -inner
+
     def sample_auto(self, diagnostics=True):
         self.Position[0, :] = np.random.normal(0, 1, size=self.D)
         self.Velocity[0, :] = self.Sigma_sqrt @ np.random.randn(self.D)
@@ -142,10 +151,10 @@ class StickyBoomerangSampler(BoomerangSampler):
         pbar = tqdm(total=self.N, desc="Sticky Boomerang time", unit="iter")
         
         diag_log = []
-        event_counts = {'bounce': 0, 'freeze': 0, 'thaw': 0, 'refresh': 0, 'max_iter': 0}
-        grad_evals, accept, reject = 0, 0, 0
+        grad_evals = 0
         
         while self.iteration < self.N:
+            _iter_start = _time.perf_counter()
             n = self.iteration
             pos, vel = self.trajectory_sticky(
                 time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
@@ -161,7 +170,7 @@ class StickyBoomerangSampler(BoomerangSampler):
 
             horizon = min(self.t_max, dt_refresh, dt_hit, dt_thaw)
 
-            rate_time = partial(self.neg_rate, x=pos, v=vel)
+            rate_time = partial(self.neg_rate_sticky, x=pos, v=vel)
             x_star, stats = brent(rate_time, 0, horizon, diagnostics=diagnostics)
             lambda_max = max(-rate_time(x_star), 0.0)
 
@@ -173,27 +182,33 @@ class StickyBoomerangSampler(BoomerangSampler):
                 tau_star = -np.log(np.random.rand()) / lambda_max
                 
             grad_evals += stats['rate_evals']
-                
+
             n_frozen = self.frozen_mask.sum()
             n_active = self.D - n_frozen
 
-            stats['horizon'] = horizon
-            stats['n_frozen'] = n_frozen
-            stats['n_active'] = n_active
-            stats['sparsity'] = n_frozen / self.D
-            stats['time'] = self.current_time
+            row = {
+                'rate_evals': stats['rate_evals'],
+                'horizon': horizon,
+                'time': self.current_time,
+                'event_type': None,
+                'accepted': None,
+                'n_frozen': n_frozen,
+                'n_active': n_active,
+                'sparsity': n_frozen / self.D,
+                'wall_seconds': None,
+            }
 
             if tau_star < horizon:  # Regular event (bounce proposal)
-                stats['event_type'] = 'bounce'
-                event_counts['bounce'] += 1
+                row['event_type'] = 'bounce'
                 u = np.random.random()
                 lambda_star = max(-rate_time(tau_star), 0.0)
                 p = lambda_star / lambda_max
                 
                 grad_evals += 1
+                row['rate_evals'] += 1
 
                 if u <= p:
-                    accept += 1
+                    row['accepted'] = True
                     # Accepted bounce
                     self.current_time += tau_star
                     pos_prop, vel_prop = self.trajectory_sticky(
@@ -208,13 +223,14 @@ class StickyBoomerangSampler(BoomerangSampler):
                     self.Time[n] = self.Time[n - 1] + time_passed + tau_star
                     
                     grad_evals += 1
+                    row['rate_evals'] += 1
 
                     self.iteration += 1
                     time_passed = 0.0
                     dt_refresh -= tau_star
                     pbar.update(1)
                 else:
-                    reject += 1
+                    row['accepted'] = False
                     time_passed += tau_star
                     self.current_time += tau_star
                     dt_refresh -= tau_star
@@ -227,9 +243,9 @@ class StickyBoomerangSampler(BoomerangSampler):
                 tol = 1e-12
 
                 if abs(horizon - dt_hit) < tol and i_hit is not None:
-                    stats['event_type'] = 'freeze'
-                    stats['frozen_coord'] = i_hit
-                    event_counts['freeze'] += 1
+                    row['event_type'] = 'freeze'
+                    row['accepted'] = None
+                    row['frozen_coord'] = i_hit
                     # --- Freeze: draw thaw deadline here ---
                     pos_now, vel_now = self.trajectory_sticky(
                         time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
@@ -247,9 +263,9 @@ class StickyBoomerangSampler(BoomerangSampler):
                     pbar.update(1)
 
                 elif abs(horizon - dt_thaw) < tol and i_thaw is not None:
-                    stats['event_type'] = 'thaw'
-                    stats['thawed_coord'] = i_thaw
-                    event_counts['thaw'] += 1
+                    row['event_type'] = 'thaw'
+                    row['accepted'] = None
+                    row['thawed_coord'] = i_thaw
                     # --- Thaw: just clear the deadline ---
                     pos_now, vel_now = self.trajectory_sticky(
                         time_passed, self.Position[n - 1, :], self.Velocity[n - 1, :]
@@ -266,8 +282,20 @@ class StickyBoomerangSampler(BoomerangSampler):
                     pbar.update(1)
 
             if dt_refresh <= 1e-14:
-                stats['event_type'] = 'refresh'
-                event_counts['refresh'] += 1
+                row['wall_seconds'] = _time.perf_counter() - _iter_start
+                diag_log.append(row)
+
+                refresh_row = {
+                    'rate_evals': 0,
+                    'horizon': 0.0,
+                    'time': self.current_time,
+                    'event_type': 'refresh',
+                    'accepted': None,
+                    'n_frozen': self.frozen_mask.sum(),
+                    'n_active': self.D - self.frozen_mask.sum(),
+                    'sparsity': self.frozen_mask.sum() / self.D,
+                    'wall_seconds': 0.0,
+                }
                 if self.iteration < self.N:
                     n = self.iteration
                     pos_ref, _ = self.trajectory_sticky(
@@ -292,32 +320,42 @@ class StickyBoomerangSampler(BoomerangSampler):
                     time_passed = 0.0
                     pbar.update(1)
                 dt_refresh = np.random.exponential(1.0 / self.refresh_rate)
+                diag_log.append(refresh_row)
+                pbar.set_postfix_str(f"time={self.current_time:.3f}", refresh=False)
+                continue
+
+            row['wall_seconds'] = _time.perf_counter() - _iter_start
             pbar.set_postfix_str(f"time={self.current_time:.3f}", refresh=False)
-            diag_log.append(stats)
+            diag_log.append(row)
 
         df = pd.DataFrame(diag_log)
+        self.diagnostics_df = df
+
+        n_accept = df[(df['event_type'] == 'bounce') & (df['accepted'] == True)].shape[0]
+        n_reject = df[(df['event_type'] == 'bounce') & (df['accepted'] == False)].shape[0]
+
         print("\n=== Sampler Diagnostics ===")
-        print(f"Events: {event_counts}")
         print(f"Total gradient evals: {grad_evals}")
         print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
         print(f"Mean sparsity (fraction frozen): {df['sparsity'].mean():.3f}")
         print(f"Max simultaneous frozen: {df['n_frozen'].max()} / {self.D}")
 
         print("\n=== Thinning Diagnostics ===")
-        print(f"Brent gradient per call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
-        print(f"Accept/Reject: {accept}/{reject}")
+        print(f"Rate evals per Brent call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
+        print(f"Accept/Reject: {n_accept}/{n_reject}")
 
         print("\n=== Event-type breakdown ===")
-        for etype in ['bounce', 'freeze', 'thaw', 'refresh']:
+        for etype in ['bounce', 'freeze', 'thaw', 'refresh', 'no_event']:
             sub = df[df['event_type'] == etype]
             if len(sub) > 0:
-                print(f"  {etype:8s}: {len(sub):5d} events, "
-                    f"mean horizon={sub['horizon'].mean():.4f}, "
-                    )
+                print(f"  {etype:10s}: {len(sub):5d} events, "
+                    f"mean horizon={sub['horizon'].mean():.4f}")
 
-        self.diagnostics_df = df
-        
-        print("Time passed: " + str(self.Time[self.iteration - 1]))
+        print("\n=== Timing ===")
+        print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
+        print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
+
+        print(f"\nTime passed: {self.Time[self.iteration - 1]}")
         pbar.close()
     
     def _default_temperature(self, t, T_min=0.1):

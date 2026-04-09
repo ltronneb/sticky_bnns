@@ -5,6 +5,7 @@ from scipy.optimize import minimize
 from scipy.linalg import cholesky
 import autograd.numpy as anp
 from tqdm import tqdm
+import time as _time
 
 import pandas as pd
 
@@ -14,8 +15,8 @@ class BoomerangSampler:
     """
     Boomerang sampler
     """
-    def __init__(self, E, N:int, D:int, grad_target, refresh_rate=1.0, 
-                 t_max: float = 0.5,
+    def __init__(self, E, N:int, D:int, grad_target, refresh_rate=0.1, 
+                 t_max: float = 1.0,
                  gamma: float = 0.01,
                  temper: bool=False, temperature=None,
                  t0: float = 100.0):
@@ -131,11 +132,14 @@ class BoomerangSampler:
         time_passed = 0.0
         pbar = tqdm(total=self.N, desc="Boomerang time", unit="iter")
         
+        # diag_log = []
+        # event_counts = {'bounce': 0, 'refresh': 0, 'max_iter': 0}
+        # grad_evals, accept, reject = 0, 0, 0
         diag_log = []
-        event_counts = {'bounce': 0, 'refresh': 0, 'max_iter': 0}
-        grad_evals, accept, reject = 0, 0, 0
+        grad_evals = 0
         
         while self.iteration < self.N:
+            _iter_start = _time.perf_counter()
             n = self.iteration
             pos, vel = self.trajectory(time_passed, self.Position[(n-1), :], self.Velocity[(n-1), :])
             horizon = min(self.t_max, dt_refresh) # Need this for refreshments
@@ -152,27 +156,33 @@ class BoomerangSampler:
                 
             grad_evals += stats['rate_evals']
 
-            stats['horizon'] = horizon
-            stats['time'] = self.current_time
+            row = {
+                'rate_evals': stats['rate_evals'],
+                'horizon': horizon,
+                'time': self.current_time,
+                'event_type': None,
+                'accepted': None,
+                'wall_seconds': None,
+            }
                 
             if tau_star >= horizon:
-                stats['event_type'] = 'no_event'
-                # No proposal in this window
+                row['event_type'] = 'no_event'
+                row['accepted'] = False
                 time_passed += horizon
                 self.current_time += horizon
                 dt_refresh -= horizon
             else:
-                stats['event_type'] = 'bounce'
-                event_counts['bounce'] += 1
+                row['event_type'] = 'bounce'
                 # Proposal happened
                 u = np.random.random()
                 lambda_star = max(-rate_time(tau_star), 0.0)
                 p = lambda_star / lambda_max
                 
                 grad_evals += 1
+                row['rate_evals'] += 1
 
                 if u <= p:
-                    accept += 1
+                    row['accepted'] = True
                     # Accepted velocity bounce
                     self.current_time += tau_star
                     
@@ -186,13 +196,14 @@ class BoomerangSampler:
                     self.Time[n] = self.Time[(n-1)] + time_passed + tau_star
                     
                     grad_evals += 1
+                    row['rate_evals'] += 1
                     
                     self.iteration += 1
                     time_passed = 0.0
                     dt_refresh -= tau_star
                     pbar.update(1)
                 else:
-                    reject += 1
+                    row['accepted'] = False
                     # Rejected — advance by tau_star
                     time_passed += tau_star
                     self.current_time += tau_star
@@ -200,8 +211,16 @@ class BoomerangSampler:
  
             # Refresh velocity regularly
             if dt_refresh <= 1e-14:
-                stats['event_type'] = 'refresh'
-                event_counts['refresh'] += 1
+                row['wall_seconds'] = _time.perf_counter() - _iter_start
+                diag_log.append(row)
+                refresh_row = {
+                    'rate_evals': 0,
+                    'horizon': 0.0,
+                    'time': self.current_time,
+                    'event_type': 'refresh',
+                    'accepted': None,
+                    'wall_seconds': 0.0,
+                }
                 if self.iteration < self.N:
                     n = self.iteration
                     pos_ref, _ = self.trajectory(
@@ -216,32 +235,45 @@ class BoomerangSampler:
                     time_passed = 0.0
                     pbar.update(1)
                 dt_refresh = np.random.exponential(1.0 / self.refresh_rate)
+                diag_log.append(refresh_row)
+                pbar.set_postfix_str((f"time={self.current_time:.3f}"), refresh=False)
             
-            pbar.set_postfix_str((f"time={self.current_time:.3f}"),refresh=False)
-            diag_log.append(stats)
+            # pbar.set_postfix_str((f"time={self.current_time:.3f}"),refresh=False)
+            # diag_log.append(stats)
+            row['wall_seconds'] = _time.perf_counter() - _iter_start
+            pbar.set_postfix_str((f"time={self.current_time:.3f}"), refresh=False)
+            diag_log.append(row)
 
         df = pd.DataFrame(diag_log)
+        self.diagnostics_df = df
+
+        n_accept = df[(df['event_type'] == 'bounce') & (df['accepted'] == True)].shape[0]
+        n_reject = df[(df['event_type'] == 'bounce') & (df['accepted'] == False)].shape[0]
+
         print("\n=== Sampler Diagnostics ===")
-        print(f"Events: {event_counts}")
         print(f"Total gradient evals: {grad_evals}")
         print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
 
         print("\n=== Thinning Diagnostics ===")
-        print(f"Brent gradient per call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
-        print(f"Accept/Reject: {accept}/{reject}")
+        bounce_df = df[df['event_type'] == 'bounce']
+        if len(bounce_df) > 0:
+            print(f"Rate evals per Brent call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
+        print(f"Accept/Reject: {n_accept}/{n_reject}")
 
         print("\n=== Event-type breakdown ===")
-        for etype in ['bounce', 'refresh']:
+        for etype in ['bounce', 'no_event', 'refresh']:
             sub = df[df['event_type'] == etype]
             if len(sub) > 0:
-                print(f"  {etype:8s}: {len(sub):5d} events, "
-                    f"mean horizon={sub['horizon'].mean():.4f}, "
-                    )
+                print(f"  {etype:10s}: {len(sub):5d} events, "
+                    f"mean horizon={sub['horizon'].mean():.4f}")
 
-        self.diagnostics_df = df
-        
-        print("Time passed: " + str(self.Time[n]))
+        print("\n=== Timing ===")
+        print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
+        print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
+
+        print(f"\nTime passed: {self.Time[self.iteration - 1]}")
         pbar.close()
+
 
     def _default_temperature(self, t, T_min=0.1):
         """
