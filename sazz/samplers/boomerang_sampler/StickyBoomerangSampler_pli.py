@@ -13,7 +13,7 @@ from sazz.utils.linear_envelope import piecewise_thinning
 from sazz.samplers.boomerang_sampler.BoomerangSampler import BoomerangSampler
 
 
-class StickyBoomerangSampler_pli(BoomerangSampler):
+class StickyBoomerangSampler_PLI(BoomerangSampler):
     """
     Sticky Boomerang sampler
     """
@@ -137,7 +137,7 @@ class StickyBoomerangSampler_pli(BoomerangSampler):
         inner = anp.dot(v_t, self.gradU(x_t))
         return inner
     
-    def sample_auto(self):
+    def sample_auto(self, diagnostics=True):
         self.Position[0, :] = np.random.normal(0, 1, size=self.D)
         self.Velocity[0, :] = self.Sigma_sqrt @ np.random.randn(self.D)
         self.Time[0] = 0.0
@@ -170,7 +170,7 @@ class StickyBoomerangSampler_pli(BoomerangSampler):
             horizon = min(dt_refresh, dt_hit, dt_thaw)
             rate_fn = partial(self.rate_func, x=pos, v=vel)
 
-            tau_star, stats = piecewise_thinning(rate_fn, horizon)
+            tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=diagnostics)
             
             grad_evals += stats['rate_evals']
 
@@ -323,7 +323,7 @@ class StickyBoomerangSampler_pli(BoomerangSampler):
         print(f"Max simultaneous frozen: {df['n_frozen'].max()} / {self.D}")
 
         print("\n=== Thinning Diagnostics (PLI) ===")
-        print(f"Bound violations: {df['bound_violations'].sum()} across {(df['bound_violations'] > 0).sum()} calls")
+        print(f"Bound violations: {df['bound_violations'].sum()} across {self.N:.1f} calls")
         print(f"Max ratio: {df['max_ratio'].max():.4f}")
         print(f"Rate evals per call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
         print(f"Proposals per call: {df['proposals'].mean():.1f} mean, {df['proposals'].max()} max")
