@@ -101,6 +101,7 @@ class BoomerangSampler:
         v_t = -(x - self.x_ref) * anp.sin(t) + v * anp.cos(t)
         return x_t, v_t
 
+
     def neg_rate(self, t, x, v):
         """
         Boomerang negative rate

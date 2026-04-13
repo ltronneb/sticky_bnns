@@ -18,7 +18,7 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
     Sticky Boomerang sampler
     """
     def __init__(self, E, N:int, D:int, grad_target, kappa=1.0,
-                 refresh_rate=0.1, t_max: float = 1.0,
+                 refresh_rate=0.1, t_max: float = 1.0, cold_start_threshold=None
                  ):
         super().__init__(
             E=E, N=N, D=D, grad_target=grad_target,
@@ -32,6 +32,7 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
         self.frozen_mask = np.zeros(D, dtype=bool)
         self.frozen_velocity = np.zeros(D, dtype=float)
         self.thaw_deadline = np.full(D, np.inf)
+        self.cold_start_threshold = cold_start_threshold
 
 
     # --- Sticky specific dynamics ---
@@ -150,6 +151,19 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
         
         diag_log = []
         grad_evals = 0
+        
+        if hasattr(self, 'cold_start_threshold') and self.cold_start_threshold is not None:
+            for i in range(self.D):
+                if abs(self.x_ref[i]) < self.cold_start_threshold and self.kappa[i] < 1e5:
+                    v_draw = abs(self.Sigma_sqrt[i, i] * np.random.randn())
+                    rate_i = self.kappa[i] * v_draw
+                    if rate_i < 1e-14:
+                        continue  # don't freeze — can't guarantee finite thaw
+                    self.Position[0, i] = 0.0
+                    self.Velocity[0, i] = 0.0
+                    self.frozen_mask[i] = True
+                    self.frozen_velocity[i] = 0.0
+                    self.thaw_deadline[i] = np.random.exponential(1.0 / rate_i)
         
         while self.iteration < self.N:
             _iter_start = _time.perf_counter()

@@ -19,6 +19,8 @@
 *.rar
 *.tar
 *.zip
+*.csv
+*.npy
 
 # Logs and databases #
 ######################
