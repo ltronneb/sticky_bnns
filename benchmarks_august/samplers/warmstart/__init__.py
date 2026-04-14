@@ -1,17 +1,9 @@
-"""
-Warmstart strategies. Each strategy takes a Target and returns
-{"x_ref": ndarray, "Sigma_inv": ndarray}. The dispatcher attaches
-the result to the Target so preprocess(method='manual') can consume it.
-
-Add a new strategy:
-  1. Write a module in samplers/warmstart/ (e.g. logreg.py) with a function
-     `some_name(target, **kwargs) -> {'x_ref', 'Sigma_inv'}`
-  2. Register it in WARMSTARTS below under a unique key.
-"""
-from . import bnn
+from . import bnn_classification_warmstart, bnn_regression_warmstart
+from .warm_reference import warmup_reference
 
 WARMSTARTS = {
-    "bnn_adam_fisher": bnn.adam_fisher,
+    "bnn_adam_fisher": bnn_classification_warmstart.adam_fisher,
+    "bnn_regression_adam_fisher": bnn_regression_warmstart.adam_fisher_regression,
     # "logreg_laplace": logreg.laplace,
     # "linreg_mle":     linreg.mle,
 }

@@ -21,6 +21,7 @@
 *.zip
 *.csv
 *.npy
+*.xlsx
 
 # Logs and databases #
 ######################
@@ -47,3 +48,4 @@ __pycache__/
 
 # Directories #
 personal/
+datasets/

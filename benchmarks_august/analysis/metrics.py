@@ -17,7 +17,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import warnings
 
-
+# ── 0. ESS ────────────────────────────────────────────────
 def _ess_batch_means(chain, n_batches=50):
     """Batch-means ESS, matching Bierkens et al. convention."""
     n = len(chain)
@@ -39,29 +39,47 @@ def _ess_batch_means(chain, n_batches=50):
     # ESS = n * var_total / (batch_size * var_bm)
     return float(n * var_total / (batch_size * var_bm))
 
-
-def _ess_1d(chain):
-    """Batch-means ESS for a 1-d chain."""
-    n = len(chain)
-    if n < 4:
-        return n
-    # autocorrelation via FFT
-    x = chain - chain.mean()
-    f = np.fft.rfft(x, n=2 * n)
-    acf = np.fft.irfft(f * np.conj(f))[:n] / (np.var(x) * n)
-    # Geyer's initial positive sequence truncation
-    tau = 1.0
-    for k in range(1, n // 2):
-        rho = acf[2 * k - 1] + acf[2 * k]
-        if rho < 0:
-            break
-        tau += 2 * rho
-    return max(1.0, n / tau)
-
-
 def _ess(samples):
     """ESS per coordinate, returns array of length D."""
-    return np.array([_ess_1d(samples[:, i]) for i in range(samples.shape[1])])
+    return np.array([_ess_batch_means(samples[:, i]) for i in range(samples.shape[1])])
+
+def sticky_ess(samples, burnin_frac=0.1):
+    """
+    ESS that respects stickiness: 
+    - Inclusion ESS: ESS of the binary indicator (is coordinate active?)
+    - Active ESS: ESS of coordinate values conditional on being nonzero
+    - Model size ESS: ESS of the number of active coordinates
+    """
+    n_burn = int(len(samples) * burnin_frac)
+    post = samples[n_burn:]
+    D = post.shape[1]
+    
+    # Inclusion indicators: gamma_i = 1 if beta_i != 0
+    gamma = (np.abs(post) > 1e-10).astype(float)
+    
+    # ESS of inclusion indicators per coordinate
+    inclusion_ess = np.array([_ess_batch_means(gamma[:, i]) for i in range(D)])
+    
+    # ESS of model size (total number of active coordinates)
+    model_size = gamma.sum(axis=1)
+    model_size_ess = _ess_batch_means(model_size)
+    
+    # ESS of active-only values per coordinate
+    active_ess = np.zeros(D)
+    for i in range(D):
+        active_mask = np.abs(post[:, i]) > 1e-10
+        if active_mask.sum() > 10:
+            active_ess[i] = _ess_batch_means(post[active_mask, i])
+        else:
+            active_ess[i] = np.nan
+    
+    return {
+        'inclusion_ess': inclusion_ess,
+        'active_ess': active_ess, 
+        'model_size_ess': model_size_ess,
+        'mean_inclusion_ess': np.mean(inclusion_ess),
+        'mean_active_ess': np.nanmean(active_ess),
+    }
 
 
 # ── 1. Sample quality ────────────────────────────────────────────────
@@ -129,7 +147,7 @@ def sample_quality(samples, sklearn_coefs=None, label="Sampler",
 
     fig.suptitle(f"{label}  |  n={len(post)}  (burn-in {n_burn})", fontsize=13)
     plt.tight_layout()
-    return fig
+    #return fig
 
 def sampler_efficiency(samplers_dict):
     """
@@ -220,6 +238,7 @@ def logreg_performance(X_train, y_train, X_test, y_test,
 
         print(f"{name:<25s} {acc_train:>8.3f} {acc_test:>8.3f} "
               f"{nll:>8.4f} {brier:>8.4f} {ece:>8.4f} {ess_pc1:>8.0f} {sp_str}")      
+        
         
 # ── 3. BNN performance ───────────────────────────────────────────────
 def bnn_performance(X_train, y_train, X_test, y_test,
@@ -328,8 +347,87 @@ def bnn_trace(samples, label="BNN", burnin_frac=0.1):
     ax.set_xlabel("sample index")
     ax.set_title(f"{label}  |  trace of first 3 principal components")
     plt.tight_layout()
-    return fig
+    #return fig
 
+def bnn_regression_performance(X_train, y_train, X_test, y_test, y_std,
+                               samples_dict, shapes, slices, tau=1.0,
+                               weight_mask=None, burnin_frac=0.1,
+                               n_posterior=500):
+    """
+    BNN regression metrics on held-out data.
+
+    Parameters
+    ----------
+    samples_dict : dict {name: (n_samples, D) array}
+    shapes, slices : architecture info from target.meta
+    tau : noise precision (1/sigma_noise^2)
+    weight_mask : bool array, for sparsity reporting
+    n_posterior : number of posterior samples to use for predictions
+    """
+    from sklearn.decomposition import PCA
+
+    def _forward_np(theta, X):
+        h = X
+        for l in range(len(shapes) - 1):
+            w_sl, b_sl = slices[l]
+            W = theta[w_sl].reshape(shapes[l][0])
+            b = theta[b_sl]
+            h = np.tanh(h @ W + b)
+        w_sl, b_sl = slices[-1]
+        W = theta[w_sl].reshape(shapes[-1][0])
+        b = theta[b_sl]
+        return (h @ W + b).ravel()
+
+    def _predict_bnn(X, post_samples):
+        idx = np.linspace(0, len(post_samples) - 1, n_posterior, dtype=int)
+        all_preds = np.array([_forward_np(post_samples[i], X) for i in idx])
+        mean_pred = all_preds.mean(axis=0)
+        var_pred = all_preds.var(axis=0) + 1.0 / tau   # epistemic + aleatoric
+        return mean_pred, var_pred
+
+    def _gaussian_nll(y, mean, var):
+        return np.mean(0.5 * np.log(2 * np.pi * var)
+                       + 0.5 * (y - mean) ** 2 / var)
+
+    header = (f"{'Sampler':<25s} {'RMSE(tr)':>9s} "
+              f"{'RMSE(te)':>9s} {'NLL(te)':>9s} {'ESS_PC1':>8s} {'Sparsity':>9s}")
+    print(header)
+    print("─" * len(header))
+
+    for name, samples in samples_dict.items():
+        n_burn = int(len(samples) * burnin_frac)
+        post = samples[n_burn:]
+
+        mean_tr, var_tr = _predict_bnn(X_train, post)
+        mean_te, var_te = _predict_bnn(X_test, post)
+
+        mse_train = np.mean((mean_tr - y_train) ** 2)
+        mse_test  = np.mean((mean_te - y_test) ** 2)
+        rmse_train = np.sqrt(mse_train)
+        rmse_test = np.sqrt(mse_test)
+        nll_test  = _gaussian_nll(y_test, mean_te, var_te)
+
+        # ESS on first principal component
+        if len(post) > 1:
+            pca = PCA(n_components=1).fit(post)
+            pc1 = post @ pca.components_[0]
+            ess_pc1 = _ess_batch_means(pc1)
+        else:
+            ess_pc1 = 1.0
+
+        # Sparsity
+        if weight_mask is not None:
+            sparsity = np.mean([
+                np.mean(np.abs(post[i][weight_mask]) < 1e-10)
+                for i in np.linspace(0, len(post)-1, n_posterior, dtype=int)
+            ])
+            sp_str = f"{sparsity:>8.1%}"
+        else:
+            sp_str = f"{'n/a':>9s}"
+
+        print(f"{name:<25s} {rmse_train*y_std:>9.4f} "
+              f"{rmse_test*y_std:>9.4f} {nll_test:>9.4f} {ess_pc1:>8.0f} {sp_str}")
+        
 
 # ── 4. refreshment rate ───────────────────────────────────────────────
 def refresh_diagnostic(sampler):

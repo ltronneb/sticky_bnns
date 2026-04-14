@@ -124,7 +124,8 @@ class BoomerangSampler:
         """
         Automatic Boomerang sampler
         """
-        self.Position[0,:] = np.random.normal(0,1,size=self.D)
+        #self.Position[0,:] = np.random.normal(0,1,size=self.D)
+        self.Position[0, :] = self.x_ref + self.Sigma_sqrt @ np.random.randn(self.D)
         self.Velocity[0,:] = self.Sigma_sqrt @ np.random.randn(self.D)
         self.Time[0] = 0.0
  
@@ -146,7 +147,8 @@ class BoomerangSampler:
             horizon = min(self.t_max, dt_refresh) # Need this for refreshments
             
             rate_time = partial(self.neg_rate, x=pos, v=vel)
-            x_star, stats = brent(rate_time, 0, horizon, diagnostics=diagnostics)
+
+            x_star, stats = brent(rate_time, 0, horizon, diagnostics=True)
             
             lambda_max = max(-rate_time(x_star), 0.0) 
             
@@ -250,27 +252,27 @@ class BoomerangSampler:
 
         n_accept = df[(df['event_type'] == 'bounce') & (df['accepted'] == True)].shape[0]
         n_reject = df[(df['event_type'] == 'bounce') & (df['accepted'] == False)].shape[0]
+        if diagnostics:
+            print("\n=== Sampler Diagnostics ===")
+            print(f"Total gradient evals: {grad_evals}")
+            print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
 
-        print("\n=== Sampler Diagnostics ===")
-        print(f"Total gradient evals: {grad_evals}")
-        print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
+            print("\n=== Thinning Diagnostics ===")
+            bounce_df = df[df['event_type'] == 'bounce']
+            if len(bounce_df) > 0:
+                print(f"Rate evals per Brent call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
+            print(f"Accept/Reject: {n_accept}/{n_reject}")
 
-        print("\n=== Thinning Diagnostics ===")
-        bounce_df = df[df['event_type'] == 'bounce']
-        if len(bounce_df) > 0:
-            print(f"Rate evals per Brent call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
-        print(f"Accept/Reject: {n_accept}/{n_reject}")
+            print("\n=== Event-type breakdown ===")
+            for etype in ['bounce', 'no_event', 'refresh']:
+                sub = df[df['event_type'] == etype]
+                if len(sub) > 0:
+                    print(f"  {etype:10s}: {len(sub):5d} events, "
+                        f"mean horizon={sub['horizon'].mean():.4f}")
 
-        print("\n=== Event-type breakdown ===")
-        for etype in ['bounce', 'no_event', 'refresh']:
-            sub = df[df['event_type'] == etype]
-            if len(sub) > 0:
-                print(f"  {etype:10s}: {len(sub):5d} events, "
-                    f"mean horizon={sub['horizon'].mean():.4f}")
-
-        print("\n=== Timing ===")
-        print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
-        print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
+            print("\n=== Timing ===")
+            print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
+            print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
 
         print(f"\nTime passed: {self.Time[self.iteration - 1]}")
         pbar.close()
@@ -282,4 +284,14 @@ class BoomerangSampler:
         Starts flat (T_min) and increase to 1.0
         """
         return 1.0 - (1.0 - T_min) * np.exp(-t / self.t0)
- 
+
+
+    def reset(self, N=None):
+        if N is not None:
+            self.N = N
+        self.iteration = 1
+        self.current_time = 0.0
+        self.Position = np.zeros((self.N, self.D))
+        self.Velocity = np.zeros((self.N, self.D))
+        self.Time = np.zeros(self.N)
+        

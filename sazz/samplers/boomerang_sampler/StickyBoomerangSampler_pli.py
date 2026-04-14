@@ -139,7 +139,8 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
         return inner
     
     def sample_auto(self, diagnostics=True):
-        self.Position[0, :] = np.random.normal(0, 1, size=self.D)
+        #self.Position[0, :] = np.random.normal(0, 1, size=self.D)
+        self.Position[0,:] = self.x_ref + self.Sigma_sqrt @ np.random.randn(self.D)
         self.Velocity[0, :] = self.Sigma_sqrt @ np.random.randn(self.D)
         self.Time[0] = 0.0
         self.thaw_deadline[:] = np.inf  # reset schedule
@@ -184,7 +185,7 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
             horizon = min(dt_refresh, dt_hit, dt_thaw)
             rate_fn = partial(self.rate_func, x=pos, v=vel)
 
-            tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=diagnostics)
+            tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=True)
             
             grad_evals += stats['rate_evals']
 
@@ -324,35 +325,36 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
             row['wall_seconds'] = _time.perf_counter() - _iter_start
             pbar.set_postfix_str(f"time={self.current_time:.3f}", refresh=False)
             diag_log.append(row)
-            
+        
         df = pd.DataFrame(diag_log)
         self.diagnostics_df = df
 
         n_accept = df[(df['event_type'] == 'bounce') & (df['accepted'] == True)].shape[0]
 
-        print("\n=== Sampler Diagnostics ===")
-        print(f"Total gradient evals: {grad_evals}")
-        print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
-        print(f"Mean sparsity (fraction frozen): {df['sparsity'].mean():.3f}")
-        print(f"Max simultaneous frozen: {df['n_frozen'].max()} / {self.D}")
+        if diagnostics:
+            print("\n=== Sampler Diagnostics ===")
+            print(f"Total gradient evals: {grad_evals}")
+            print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
+            print(f"Mean sparsity (fraction frozen): {df['sparsity'].mean():.3f}")
+            print(f"Max simultaneous frozen: {df['n_frozen'].max()} / {self.D}")
 
-        print("\n=== Thinning Diagnostics (PLI) ===")
-        print(f"Bound violations: {df['bound_violations'].sum()} across {self.N:.1f} calls")
-        print(f"Max ratio: {df['max_ratio'].max():.4f}")
-        print(f"Rate evals per call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
-        print(f"Proposals per call: {df['proposals'].mean():.1f} mean, {df['proposals'].max()} max")
-        print(f"Accepted bounces: {n_accept}")
+            print("\n=== Thinning Diagnostics (PLI) ===")
+            print(f"Bound violations: {df['bound_violations'].sum()} across {self.N:.1f} calls")
+            print(f"Max ratio: {df['max_ratio'].max():.4f}")
+            print(f"Rate evals per call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
+            print(f"Proposals per call: {df['proposals'].mean():.1f} mean, {df['proposals'].max()} max")
+            print(f"Accepted bounces: {n_accept}")
 
-        print("\n=== Event-type breakdown ===")
-        for etype in ['bounce', 'freeze', 'thaw', 'refresh', 'no_event']:
-            sub = df[df['event_type'] == etype]
-            if len(sub) > 0:
-                print(f"  {etype:10s}: {len(sub):5d} events, "
-                    f"mean horizon={sub['horizon'].mean():.4f}")
+            print("\n=== Event-type breakdown ===")
+            for etype in ['bounce', 'freeze', 'thaw', 'refresh', 'no_event']:
+                sub = df[df['event_type'] == etype]
+                if len(sub) > 0:
+                    print(f"  {etype:10s}: {len(sub):5d} events, "
+                        f"mean horizon={sub['horizon'].mean():.4f}")
 
-        print("\n=== Timing ===")
-        print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
-        print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
+            print("\n=== Timing ===")
+            print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
+            print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
 
         print(f"\nTime passed: {self.Time[self.iteration - 1]}")
         pbar.close()
@@ -364,3 +366,9 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
         """
         return 1.0 - (1.0 - T_min) * np.exp(-t / self.t0)
  
+    def reset(self, N=None):
+        super().reset(N=N)
+        self.frozen_mask = np.zeros(self.D, dtype=bool)
+        self.frozen_velocity = np.zeros(self.D, dtype=float)
+        self.thaw_deadline = np.full(self.D, np.inf)
+        

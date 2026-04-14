@@ -1,0 +1,34 @@
+seed: 1
+N: 5000
+out_dir: results
+
+target:
+  name: bnn_regression
+  kwargs:
+    # X, y supplied programmatically or via datasets/ module
+    layer_sizes: [5, 10, 1]       # Boston: 13 features, 50 hidden, 1 output
+    prior:
+      kind: layered_gaussian
+      sigma_w_layers: [1.0, 1.0]
+      sigma_b_layers: [1.0, 1.0]
+
+warmstart:
+  kind: bnn_adam_fisher
+  kwargs:
+    n_epochs: 3000
+    lr: 0.003
+    l2_weight: 0.001
+    n_fisher: 500
+    verbose: false
+
+sampler:
+  name: sticky_boomerang
+  kwargs: {}
+
+kappa:
+  kind: masked
+  gamma_prior: 0.2
+  kappa_unmasked: 1.0e6
+
+preprocess:
+  method: manual

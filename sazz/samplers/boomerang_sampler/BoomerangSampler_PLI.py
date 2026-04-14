@@ -29,7 +29,8 @@ class BoomerangSampler_PLI(BoomerangSampler):
         """
         Automatic Boomerang sampler
         """
-        self.Position[0,:] = np.random.normal(0,1,size=self.D)
+        #self.Position[0,:] = np.random.normal(0,1,size=self.D)
+        self.Position[0,:] = self.x_ref + self.Sigma_sqrt @ np.random.randn(self.D)
         self.Velocity[0,:] = self.Sigma_sqrt @ np.random.randn(self.D)
         self.Time[0] = 0.0
  
@@ -53,7 +54,7 @@ class BoomerangSampler_PLI(BoomerangSampler):
             horizon = dt_refresh
             rate_fn = partial(self.rate_func, x=pos, v=vel)
 
-            tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=diagnostics)
+            tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=True)
             
             grad_evals += stats['rate_evals']
 
@@ -139,29 +140,29 @@ class BoomerangSampler_PLI(BoomerangSampler):
         self.diagnostics_df = df
 
         n_accept = df[(df['event_type'] == 'bounce') & (df['accepted'] == True)].shape[0]
-        n_reject = df[(df['event_type'] == 'bounce') & (df['accepted'] == False)].shape[0]
+        
+        if diagnostics:
+            print("\n=== Sampler Diagnostics ===")
+            print(f"Total gradient evals: {grad_evals}")
+            print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
 
-        print("\n=== Sampler Diagnostics ===")
-        print(f"Total gradient evals: {grad_evals}")
-        print(f"Grad evals per skeleton point: {grad_evals / self.N:.1f}")
+            print("\n=== Thinning Diagnostics (PLI) ===")
+            print(f"Bound violations: {df['bound_violations'].sum()} across {self.N:.1f} calls")
+            print(f"Max ratio: {df['max_ratio'].max():.4f}")
+            print(f"Rate evals per call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
+            print(f"Proposals per call: {df['proposals'].mean():.1f} mean, {df['proposals'].max()} max")
+            print(f"Accepted bounces: {n_accept}")
 
-        print("\n=== Thinning Diagnostics (PLI) ===")
-        print(f"Bound violations: {df['bound_violations'].sum()} across {self.N:.1f} calls")
-        print(f"Max ratio: {df['max_ratio'].max():.4f}")
-        print(f"Rate evals per call: {df['rate_evals'].mean():.1f} mean, {df['rate_evals'].max()} max")
-        print(f"Proposals per call: {df['proposals'].mean():.1f} mean, {df['proposals'].max()} max")
-        print(f"Accepted bounces: {n_accept}")
+            print("\n=== Event-type breakdown ===")
+            for etype in ['bounce', 'no_event', 'refresh']:
+                sub = df[df['event_type'] == etype]
+                if len(sub) > 0:
+                    print(f"  {etype:10s}: {len(sub):5d} events, "
+                        f"mean horizon={sub['horizon'].mean():.4f}")
 
-        print("\n=== Event-type breakdown ===")
-        for etype in ['bounce', 'no_event', 'refresh']:
-            sub = df[df['event_type'] == etype]
-            if len(sub) > 0:
-                print(f"  {etype:10s}: {len(sub):5d} events, "
-                    f"mean horizon={sub['horizon'].mean():.4f}")
-
-        print("\n=== Timing ===")
-        print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
-        print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
+            print("\n=== Timing ===")
+            print(f"Mean wall-seconds per iteration: {df['wall_seconds'].mean():.6f}")
+            print(f"Total wall-seconds: {df['wall_seconds'].sum():.2f}")
 
         print(f"\nTime passed: {self.Time[self.iteration - 1]}")
         pbar.close()
