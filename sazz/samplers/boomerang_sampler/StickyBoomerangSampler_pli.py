@@ -328,6 +328,7 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
         
         df = pd.DataFrame(diag_log)
         self.diagnostics_df = df
+        self.gradient_evals = grad_evals
 
         n_accept = df[(df['event_type'] == 'bounce') & (df['accepted'] == True)].shape[0]
 

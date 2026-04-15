@@ -20,7 +20,6 @@ class BoomerangSampler:
                  gamma: float = 0.01,
                  temper: bool=False, temperature=None,
                  t0: float = 100.0):
-        self.E = E
         self.N = N
         self.D = D
         self.Position = np.zeros((N,D))
@@ -43,12 +42,15 @@ class BoomerangSampler:
         
         # --- Boomerang specific ---
         self.refresh_rate = refresh_rate
-        
+        self.E = E
         self.hessE = hessian(E)
         self.x_ref = None
         self.Sigma_inv = None
         self.Sigma = None
         self.Sigma_sqrt = None
+        
+        # --- Track gradient evals ---
+        self.gradient_evals = 0
 
     # Preprocessing
     def preprocess(self, x0=None, method="diagonal", x_ref=None, Sigma_inv=None, jitter=1e-8):
@@ -249,6 +251,7 @@ class BoomerangSampler:
 
         df = pd.DataFrame(diag_log)
         self.diagnostics_df = df
+        self.gradient_evals = grad_evals
 
         n_accept = df[(df['event_type'] == 'bounce') & (df['accepted'] == True)].shape[0]
         n_reject = df[(df['event_type'] == 'bounce') & (df['accepted'] == False)].shape[0]
