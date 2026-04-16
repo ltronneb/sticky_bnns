@@ -9,7 +9,7 @@ import time as _time
 
 import pandas as pd
 
-from sazz.utils.linear_envelope import piecewise_thinning
+from sazz.utils.linear_envelope import piecewise_thinning, piecewise_thinning_midpoint
 from sazz.samplers.boomerang_sampler.BoomerangSampler import BoomerangSampler
 
 class BoomerangSampler_PLI(BoomerangSampler):
@@ -54,7 +54,7 @@ class BoomerangSampler_PLI(BoomerangSampler):
             horizon = dt_refresh
             rate_fn = partial(self.rate_func, x=pos, v=vel)
 
-            tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=True)
+            tau_star, stats = piecewise_thinning_midpoint(rate_fn, horizon, diagnostics=True)
             
             grad_evals += stats['rate_evals']
 

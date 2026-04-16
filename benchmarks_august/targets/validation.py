@@ -1,55 +1,84 @@
 """
-Validation targets with known marginals.
+Continuous validation targets with known marginals.
 
-Three factories:
-  - beta_binomial(D, ...)   : D independent Beta-Binomial posteriors on log-odds
-  - neals_funnel(D, ...)    : Neal's funnel distribution
-  - rosenbrock_banana(a=1)  : 2-D banana-shaped distribution
+Three factories, each parameterized to cover multiple stress regimes:
+  - gaussian(D, cov=...)         : diagonal | AR(1) | random-PD covariance
+  - gaussian_mixture(D, preset=..): bimodal | heavy-tailed | skewed 1-D marginals
+  - banana(D, a=..., stacked=...) : 2-D Rosenbrock or stacked bananas
 
-Each target carries a `marginal_pdf` dict in target.meta so that downstream
-plotting can overlay the true density on sample histograms.
+Each target carries a `marginal_grids` dict in target.meta for plot overlays.
 """
 import numpy as np
 import autograd.numpy as anp
 from autograd import grad
-from scipy import special, integrate
+from scipy import integrate
 
 from .base import Target
 
+
 # =====================================================================
-# 0. Gaussian (reference measure sanity check)
+# 1. Gaussian (diagonal / correlated)
 # =====================================================================
 
-def gaussian_sanity_check(D=5, seed=42):
-    """
-    Multivariate Gaussian target where E(beta) = 0.5 * beta^T Sigma_inv beta,
-    i.e. the target IS the reference measure.
-
-    If the sampler is correct, U(beta) = 0 everywhere, the switching rate is
-    identically zero, and no bounces should occur. All skeleton points should
-    come from velocity refreshments alone.
-    """
+def _build_covariance(D, cov, seed):
+    """Return (Sigma, Sigma_inv) for the requested covariance structure."""
     rng = np.random.default_rng(seed)
-    # Random diagonal precision so it's not just the identity
-    diag_prec = rng.uniform(0.5, 3.0, size=D)
-    Sigma_inv = np.diag(diag_prec)
-    Sigma_diag = 1.0 / diag_prec
+
+    if cov == "diagonal":
+        diag_prec = rng.uniform(0.5, 3.0, size=D)
+        Sigma = np.diag(1.0 / diag_prec)
+        Sigma_inv = np.diag(diag_prec)
+
+    elif cov == "ar1":
+        # AR(1) with rho = 0.9, unit marginal variance
+        rho = 0.9
+        idx = np.arange(D)
+        Sigma = rho ** np.abs(idx[:, None] - idx[None, :])
+        Sigma_inv = np.linalg.inv(Sigma)
+
+    elif cov == "random":
+        # Random positive-definite; normalise to ~unit marginal variance
+        A = rng.normal(size=(D, D))
+        Sigma = A @ A.T / D + 0.1 * np.eye(D)
+        d = np.sqrt(np.diag(Sigma))
+        Sigma = Sigma / np.outer(d, d)
+        Sigma_inv = np.linalg.inv(Sigma)
+
+    else:
+        raise ValueError(f"Unknown cov: {cov!r}. Use 'diagonal' | 'ar1' | 'random'.")
+
+    return Sigma, Sigma_inv
+
+
+def gaussian(D=5, cov="diagonal", seed=42):
+    """
+    Multivariate Gaussian target E(beta) = 0.5 * beta^T Sigma_inv beta.
+
+    cov:
+      "diagonal" : independent coords (reference-measure sanity check when
+                   the sampler uses Sigma_inv as the reference measure).
+      "ar1"      : AR(1) correlation, rho=0.9. Tests reflection + preconditioning.
+      "random"   : random positive-definite with moderate off-diagonal mass.
+
+    Marginals are N(0, Sigma_ii) for every coordinate.
+    """
+    Sigma, Sigma_inv = _build_covariance(D, cov, seed)
+    Sigma_inv_anp = anp.array(Sigma_inv)
 
     def E(beta):
-        return 0.5 * anp.sum(anp.array(diag_prec) * beta**2)
+        return 0.5 * beta @ Sigma_inv_anp @ beta
 
     gradE_fn = grad(E)
 
-    # Marginals are independent normals
     marginal_grids = {}
     for i in range(D):
-        sd = np.sqrt(Sigma_diag[i])
+        sd = np.sqrt(Sigma[i, i])
         grid = np.linspace(-4 * sd, 4 * sd, 500)
-        pdf = np.exp(-0.5 * grid**2 / Sigma_diag[i]) / np.sqrt(2 * np.pi * Sigma_diag[i])
+        pdf = np.exp(-0.5 * grid**2 / Sigma[i, i]) / np.sqrt(2 * np.pi * Sigma[i, i])
         marginal_grids[i] = {"grid": grid, "pdf": pdf, "label": f"$\\beta_{{{i+1}}}$"}
 
     return Target(
-        name=f"gaussian_refcheck_D{D}",
+        name=f"gaussian_{cov}_D{D}",
         task_type="validation",
         D=D,
         E=E,
@@ -57,141 +86,8 @@ def gaussian_sanity_check(D=5, seed=42):
         x_ref=np.zeros(D),
         Sigma_inv=Sigma_inv,
         meta={
-            "Sigma_diag": Sigma_diag,
-            "marginal_grids": marginal_grids,
-            "preprocess_method": "manual",
-        },
-    )
-
-# =====================================================================
-# 1. Beta-Binomial on log-odds scale
-# =====================================================================
-
-def _bb_energy(a_post, b_post):
-    a_post = anp.array(a_post, dtype=float)
-    b_post = anp.array(b_post, dtype=float)
-
-    def E(theta):
-        return anp.sum(
-            a_post * anp.log(1 + anp.exp(-theta))
-            + b_post * theta
-            + b_post * anp.log(1 + anp.exp(-theta))
-        )
-    return E
-
-
-def _bb_marginal_pdf(theta, a_j, b_j):
-    sigma = 1.0 / (1.0 + np.exp(-theta))
-    return sigma**a_j * (1 - sigma)**b_j / special.beta(a_j, b_j)
-
-
-def beta_binomial(D=5, n_obs=None, x_obs=None, a_prior=2.0, b_prior=2.0, seed=42):
-    """
-    D independent Beta-Binomial posteriors, parameterized on the log-odds scale.
-
-    If n_obs/x_obs are not provided, synthetic data is generated.
-    """
-    if n_obs is None or x_obs is None:
-        rng = np.random.default_rng(seed)
-        n_obs = rng.integers(20, 80, size=D)
-        p_true = rng.beta(a_prior, b_prior, size=D)
-        x_obs = rng.binomial(n_obs, p_true)
-
-    n_obs = np.asarray(n_obs)
-    x_obs = np.asarray(x_obs)
-    a_posterior = np.full(D, a_prior) + x_obs
-    b_posterior = np.full(D, b_prior) + (n_obs - x_obs)
-
-    E = _bb_energy(a_posterior, b_posterior)
-    gradE = grad(E)
-
-    # Pre-compute marginal pdfs for each coordinate
-    marginal_grids = {}
-    for i in range(D):
-        grid = np.linspace(-5, 7, 500)
-        pdf = _bb_marginal_pdf(grid, a_posterior[i], b_posterior[i])
-        marginal_grids[i] = {"grid": grid, "pdf": pdf, "label": f"$\\theta_{{{i+1}}}$"}
-
-    return Target(
-        name=f"beta_binomial_D{D}",
-        task_type="validation",
-        D=D,
-        E=E,
-        gradE=gradE,
-        data={"n_obs": n_obs, "x_obs": x_obs},
-        meta={
-            "a_posterior": a_posterior,
-            "b_posterior": b_posterior,
-            "marginal_grids": marginal_grids,
-        },
-    )
-
-
-# =====================================================================
-# 2. Neal's Funnel
-# =====================================================================
-
-def _funnel_energy(sigma_v, D):
-    def E(theta):
-        v = theta[0]
-        x = theta[1:]
-        nll_v = 0.5 * v**2 / sigma_v**2 + 0.5 * (D - 1) * v
-        nll_x = anp.sum(0.5 * x**2 * anp.exp(-v))
-        return nll_v + nll_x
-    return E
-
-
-def _funnel_marginal_v(v_val, sigma_v):
-    return np.exp(-0.5 * v_val**2 / sigma_v**2) / np.sqrt(2 * np.pi * sigma_v**2)
-
-
-def _funnel_marginal_x(x_val, sigma_v):
-    def integrand(v):
-        log_p_v = -0.5 * v**2 / sigma_v**2 - 0.5 * np.log(2 * np.pi * sigma_v**2)
-        log_p_x = -0.5 * x_val**2 * np.exp(-v) - 0.5 * v - 0.5 * np.log(2 * np.pi)
-        return np.exp(log_p_v + log_p_x)
-    result, _ = integrate.quad(integrand, -10 * sigma_v, 10 * sigma_v)
-    return result
-
-
-def neals_funnel(D=4, sigma_v=3.0):
-    """
-    Neal's funnel: v ~ N(0, sigma_v^2), x_i | v ~ N(0, exp(v)).
-
-    The funnel requires manual preprocessing because the geometry is
-    far from Gaussian. x_ref and Sigma_inv are provided in the target.
-    """
-    E = _funnel_energy(sigma_v, D)
-    gradE = grad(E)
-
-    # Reference: center at zero, match marginal variances
-    x_ref = np.zeros(D)
-    Sigma_inv = np.eye(D)
-    Sigma_inv[0, 0] = 1.0 / sigma_v**2
-
-    # Pre-compute marginal pdfs
-    grid_v = np.linspace(-12, 12, 500)
-    pdf_v = _funnel_marginal_v(grid_v, sigma_v)
-
-    grid_x = np.linspace(-30, 30, 500)
-    pdf_x = np.array([_funnel_marginal_x(xi, sigma_v) for xi in grid_x])
-
-    marginal_grids = {
-        0: {"grid": grid_v, "pdf": pdf_v, "label": "$v$"},
-    }
-    for i in range(1, D):
-        marginal_grids[i] = {"grid": grid_x, "pdf": pdf_x, "label": f"$x_{{{i}}}$"}
-
-    return Target(
-        name=f"neals_funnel_D{D}",
-        task_type="validation",
-        D=D,
-        E=E,
-        gradE=gradE,
-        x_ref=x_ref,
-        Sigma_inv=Sigma_inv,
-        meta={
-            "sigma_v": sigma_v,
+            "cov_kind": cov,
+            "Sigma": Sigma,
             "marginal_grids": marginal_grids,
             "preprocess_method": "manual",
         },
@@ -199,72 +95,206 @@ def neals_funnel(D=4, sigma_v=3.0):
 
 
 # =====================================================================
-# 3. Rosenbrock Banana
+# 2. Gaussian mixture (multimodal / heavy-tailed / skewed)
 # =====================================================================
 
-def _banana_energy(a):
+# Each preset specifies a 1-D mixture applied independently to every coord.
+_MIXTURE_PRESETS = {
+    # Two well-separated modes at +/- 3, equal weight.
+    "bimodal":      dict(weights=[0.5, 0.5],
+                         locs=[-3.0, 3.0],
+                         scales=[1.0, 1.0]),
+    # Narrow core + wide component: smooth stand-in for heavy tails.
+    "heavy_tailed": dict(weights=[0.9, 0.1],
+                         locs=[0.0, 0.0],
+                         scales=[1.0, 5.0]),
+    # Asymmetric mixture: skewed marginal with nonzero mean.
+    "skewed":       dict(weights=[0.7, 0.3],
+                         locs=[0.0, 3.0],
+                         scales=[1.0, 1.5]),
+}
+
+
+def _mixture_energy(weights, locs, scales):
+    """E = -sum_i logsumexp_k (log w_k - 0.5*z_ik^2 - log s_k)."""
+    log_w = anp.log(anp.array(weights))
+    locs_a = anp.array(locs)
+    scales_a = anp.array(scales)
+    log_scales = anp.log(scales_a)
+
     def E(beta):
-        return 0.5 * (beta[0]**2 + (beta[1] - a * beta[0]**2)**2)
+        beta_col = beta[:, None]
+        z = (beta_col - locs_a[None, :]) / scales_a[None, :]
+        log_comp = log_w[None, :] - 0.5 * z**2 - log_scales[None, :]
+        m = anp.max(log_comp, axis=1, keepdims=True)
+        lse = m.squeeze(1) + anp.log(anp.sum(anp.exp(log_comp - m), axis=1))
+        return -anp.sum(lse)
+
     return E
 
 
-def _banana_marginals(a, grid_0, grid_1):
+def _mixture_marginal_pdf(grid, weights, locs, scales):
+    pdf = np.zeros_like(grid)
+    for w, mu, s in zip(weights, locs, scales):
+        pdf += w * np.exp(-0.5 * (grid - mu)**2 / s**2) / (s * np.sqrt(2 * np.pi))
+    return pdf
+
+
+def gaussian_mixture(D=2, preset="bimodal", weights=None, locs=None, scales=None):
+    """
+    Independent mixture-of-Gaussians marginals, identical across coordinates.
+
+    Use a preset or pass explicit (weights, locs, scales) 1-D arrays.
+
+    presets: "bimodal", "heavy_tailed", "skewed".
+    """
+    if weights is None:
+        if preset not in _MIXTURE_PRESETS:
+            raise ValueError(f"Unknown preset: {preset!r}. "
+                             f"Known: {list(_MIXTURE_PRESETS)}")
+        spec = _MIXTURE_PRESETS[preset]
+        weights, locs, scales = spec["weights"], spec["locs"], spec["scales"]
+
+    weights = np.asarray(weights, dtype=float)
+    locs = np.asarray(locs, dtype=float)
+    scales = np.asarray(scales, dtype=float)
+    if not np.isclose(weights.sum(), 1.0):
+        raise ValueError("Mixture weights must sum to 1.")
+
+    E = _mixture_energy(weights, locs, scales)
+    gradE_fn = grad(E)
+
+    lo = float(np.min(locs - 5 * scales))
+    hi = float(np.max(locs + 5 * scales))
+    grid = np.linspace(lo, hi, 500)
+    pdf = _mixture_marginal_pdf(grid, weights, locs, scales)
+    marginal_grids = {
+        i: {"grid": grid, "pdf": pdf, "label": f"$\\beta_{{{i+1}}}$"}
+        for i in range(D)
+    }
+
+    return Target(
+        name=f"gaussian_mixture_{preset}_D{D}",
+        task_type="validation",
+        D=D,
+        E=E,
+        gradE=gradE_fn,
+        meta={
+            "preset": preset,
+            "weights": weights,
+            "locs": locs,
+            "scales": scales,
+            "marginal_grids": marginal_grids,
+        },
+    )
+
+
+# =====================================================================
+# 3. Rosenbrock banana (2-D or stacked to higher D)
+# =====================================================================
+ 
+def _banana_energy_stacked(a, scale, D):
+    """
+    D=2 : classic 2-D banana, with b0-axis rescaled by `scale`.
+    D>2 : stacked independent 2-D bananas on pairs (b_1,b_2), (b_3,b_4), ...
+          (requires even D).
+ 
+    E(b0, b1) = 0.5 * (b0 / scale)^2 + 0.5 * (b1 - a * (b0 / scale)^2)^2
+    """
+    s2 = scale**2
+ 
+    if D == 2:
+        def E(beta):
+            u = beta[0] / scale
+            return 0.5 * u**2 + 0.5 * (beta[1] - a * u**2)**2
+    else:
+        if D % 2 != 0:
+            raise ValueError("Stacked banana requires even D.")
+ 
+        def E(beta):
+            u = beta[0::2] / scale
+            b1 = beta[1::2]
+            return 0.5 * anp.sum(u**2 + (b1 - a * u**2)**2)
+ 
+    return E
+ 
+def _banana_marginals_2d(a, scale, grid_0, grid_1):
+    """
+    With E(b0, b1) = 0.5 (b0/s)^2 + 0.5 (b1 - a (b0/s)^2)^2, the joint is
+        p(b0, b1) = p(b0) * N(b1 | a*(b0/s)^2, 1),   p(b0) = N(0, s^2).
+    So Z = scale * 2*pi exactly, and the b0 marginal IS N(0, s^2). Only the
+    b1 marginal needs numerical integration.
+    """
+    Z = scale * 2 * np.pi
+ 
+    # b0 marginal is analytic: N(0, scale^2)
+    marginal_0 = np.exp(-0.5 * grid_0**2 / scale**2) / (scale * np.sqrt(2 * np.pi))
+ 
+    # b1 marginal: integrate out b0 numerically. Integrand decays like a
+    # Gaussian in b0 (width = scale), so [-8*scale, 8*scale] is safe.
+    b0_lim = 8 * scale
+ 
     def unnorm_joint(b0, b1):
-        return np.exp(-0.5 * (b0**2 + (b1 - a * b0**2)**2))
-
-    Z, _ = integrate.dblquad(unnorm_joint, -8, 8, -8, 8)
-
-    marginal_0 = np.zeros_like(grid_0)
-    for i, b0 in enumerate(grid_0):
-        val, _ = integrate.quad(lambda b1: unnorm_joint(b0, b1), -8, 8)
-        marginal_0[i] = val / Z
-
+        u = b0 / scale
+        return np.exp(-0.5 * u**2 - 0.5 * (b1 - a * u**2)**2)
+ 
     marginal_1 = np.zeros_like(grid_1)
     for i, b1 in enumerate(grid_1):
-        val, _ = integrate.quad(lambda b0: unnorm_joint(b0, b1), -8, 8)
+        val, _ = integrate.quad(lambda b0: unnorm_joint(b0, b1), -b0_lim, b0_lim)
         marginal_1[i] = val / Z
-
+ 
     return marginal_0, marginal_1
-
-
-def rosenbrock_banana(a=1.0):
+ 
+def banana(D=2, a=1.0, scale=1.0):
     """
-    2-D Rosenbrock banana: E(x1, x2) = 0.5 * x1^2 + 0.5 * (x2 - a*x1^2)^2.
-
-    x1 marginal is N(0,1). x2 marginal requires numerical integration.
+    Rosenbrock banana with anisotropic rescaling of the b0 axis:
+        E(b0, b1) = 0.5 * (b0 / scale)^2 + 0.5 * (b1 - a * (b0 / scale)^2)^2.
+ 
+    - `a`     : curvature. Larger => tighter bend.
+    - `scale` : standard deviation of the b0 marginal. Combined with `a` this
+                gives an independent knob on curvature + scale mismatch.
+ 
+    D=2 gives the classic 2-D banana; even D>2 gives stacked independent
+    bananas on coordinate pairs. Each pair has the same two marginals
+    (b0-type on even indices, b1-type on odd).
     """
-    E = _banana_energy(a)
-    gradE = grad(E)
-
-    grid_0 = np.linspace(-4, 4, 300)
-    grid_1 = np.linspace(-2, 6, 300)
-    marg_0, marg_1 = _banana_marginals(a, grid_0, grid_1)
-
-    marginal_grids = {
-        0: {"grid": grid_0, "pdf": marg_0, "label": "$x_1$"},
-        1: {"grid": grid_1, "pdf": marg_1, "label": "$x_2$"},
-    }
-
+    E = _banana_energy_stacked(a, scale, D)
+    gradE_fn = grad(E)
+ 
+    grid_0 = np.linspace(-4 * scale, 4 * scale, 500)
+    # b1 support: conditional mean a*(b0/s)^2 ranges from 0 to ~16a over b0
+    # grid, plus N(0,1) fluctuation. The right tail needs the full envelope.
+    grid_1 = np.linspace(-4, 4 + 16 * a, 500)
+    marg_0, marg_1 = _banana_marginals_2d(a, scale, grid_0, grid_1)
+ 
+    marginal_grids = {}
+    for i in range(D):
+        if i % 2 == 0:
+            marginal_grids[i] = {"grid": grid_0, "pdf": marg_0,
+                                 "label": f"$\\beta_{{{i+1}}}$"}
+        else:
+            marginal_grids[i] = {"grid": grid_1, "pdf": marg_1,
+                                 "label": f"$\\beta_{{{i+1}}}$"}
+ 
     return Target(
-        name=f"rosenbrock_banana_a{a}",
+        name=f"banana_D{D}_a{a}_s{scale}",
         task_type="validation",
-        D=2,
+        D=D,
         E=E,
-        gradE=gradE,
+        gradE=gradE_fn,
         meta={
             "a": a,
+            "scale": scale,
             "marginal_grids": marginal_grids,
         },
     )
-
 
 # =====================================================================
 # Registry
 # =====================================================================
 
 VALIDATION_TARGETS = {
-    "gaussian": gaussian_sanity_check,
-    "beta_binomial": beta_binomial,
-    "neals_funnel": neals_funnel,
-    "rosenbrock_banana": rosenbrock_banana,
+    "gaussian":         gaussian,
+    "gaussian_mixture": gaussian_mixture,
+    "banana":           banana,
 }
