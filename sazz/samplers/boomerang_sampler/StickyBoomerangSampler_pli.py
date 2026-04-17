@@ -9,7 +9,7 @@ import time as _time
 
 import pandas as pd
 
-from sazz.utils.linear_envelope import piecewise_thinning
+from sazz.utils.linear_envelope import piecewise_thinning, piecewise_thinning_midpoint, piecewise_thinning_sinusoidal, piecewise_thinning_sinusoidal_second_order
 from sazz.samplers.boomerang_sampler.BoomerangSampler import BoomerangSampler
 
 
@@ -185,7 +185,8 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
             horizon = min(dt_refresh, dt_hit, dt_thaw)
             rate_fn = partial(self.rate_func, x=pos, v=vel)
 
-            tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=True)
+            # tau_star, stats = piecewise_thinning(rate_fn, horizon, diagnostics=True)
+            tau_star, stats = piecewise_thinning_sinusoidal_second_order(rate_fn, horizon, diagnostics=True, second_harmonic=True, R=1.5, alpha=2.0)
             
             grad_evals += stats['rate_evals']
 
@@ -322,6 +323,7 @@ class StickyBoomerangSampler_PLI(BoomerangSampler):
                 dt_refresh = np.random.exponential(1.0 / self.refresh_rate)
                 diag_log.append(refresh_row)
                 pbar.set_postfix_str(f"time={self.current_time:.3f}", refresh=False)
+                continue
             row['wall_seconds'] = _time.perf_counter() - _iter_start
             pbar.set_postfix_str(f"time={self.current_time:.3f}", refresh=False)
             diag_log.append(row)
