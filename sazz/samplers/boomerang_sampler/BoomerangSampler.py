@@ -9,7 +9,7 @@ import time as _time
 
 import pandas as pd
 
-from sazz.utils.utils import brent
+from sazz.utils.bounding import brent
 
 class BoomerangSampler:
     """

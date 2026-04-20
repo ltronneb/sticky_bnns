@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from sazz.utils.utils import brent, sample_trajectory_at_regular_intervals
+from sazz.utils.bounding import brent, sample_trajectory_at_regular_intervals
 
 
 class AutomaticZigZagSampler:

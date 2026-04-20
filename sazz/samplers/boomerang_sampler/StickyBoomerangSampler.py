@@ -9,7 +9,7 @@ import time as _time
 
 import pandas as pd
 
-from sazz.utils.utils import brent
+from sazz.utils.bounding import brent
 from sazz.samplers.boomerang_sampler.BoomerangSampler import BoomerangSampler
 
 # --------- More efficient sampling of thawing times --------- #

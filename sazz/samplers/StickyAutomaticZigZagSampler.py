@@ -4,7 +4,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 from sazz.samplers.AutomaticZigZagSampler import AutomaticZigZagSampler
-from sazz.utils.utils import brent
+from sazz.utils.bounding import brent
 
 
 class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
