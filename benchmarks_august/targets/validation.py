@@ -282,6 +282,8 @@ def banana(D=2, a=1.0, scale=1.0):
         D=D,
         E=E,
         gradE=gradE_fn,
+        x_ref=np.array([0.0, 1.0]),
+        Sigma_inv = np.diag([1.0, 1.0/3.0]),
         meta={
             "a": a,
             "scale": scale,

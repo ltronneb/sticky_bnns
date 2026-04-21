@@ -1,32 +1,111 @@
+"""
+utils/warmup.py
+
+Two ways to find a reference (x_ref, Sigma_inv) for the sampler:
+
+1. find_reference : Adam-based MAP + diagonal Fisher. 
+                    No sampler needed, cheap.
+2. warmup         : Iterative pilot runs with the sampler itself.
+                    Refines an existing reference using samples from 
+                    the target.
+
+Typical pipeline:
+    target = make_bnn_regression(X, y, ...)   # calls find_reference internally
+    sampler = AutomaticBoomerangSampler(...)
+    warmup(sampler, target=target, n_rounds=3)  # refines further
+    result = sampler.sample(N=...)
+"""
+
 import numpy as np
 import torch
-from .sampling import resample_pdmp_path
+from torch import Tensor
 
-def warmup(sampler, n_rounds=3, n_pilot=500,
-                     target=None, tune_refresh=False):
+
+def find_reference(
+    energy_fn,
+    D: int,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device = torch.device("cpu"),
+    n_steps: int = 2000,
+    lr: float = 1e-2,
+    n_samples_fisher: int = 50,
+    prec_min: float = 1.0,
+    prec_max: float = 1e4,
+) -> tuple[Tensor, Tensor]:
     """
-    Iterative warm-up: run short pilots, update (x_ref, Sigma_inv)
-    from resampled path moments.
+    Run Adam to find the MAP, then estimate a diagonal precision matrix
+    from squared gradients at the MAP (empirical Fisher approximation).
+
+    Parameters
+    ----------
+    energy_fn : callable
+        Takes a parameter tensor of shape [D], returns scalar negative
+        log posterior.
+    D : int
+        Dimension of the parameter vector.
+    n_steps : int
+        Number of Adam steps.
+    lr : float
+        Adam learning rate.
+    n_samples_fisher : int
+        Number of gradient evaluations for the Fisher estimate. Using >1
+        only helps if energy_fn has stochastic components (e.g. minibatch).
+    prec_min, prec_max : float
+        Clipping bounds on the diagonal precision. prec_min=1.0 prevents
+        unbounded variance from flat directions.
+    """
+    beta = torch.randn(D, dtype=dtype, device=device) * 0.01
+    beta.requires_grad_(True)
+    optimizer = torch.optim.Adam([beta], lr=lr)
+
+    for _ in range(n_steps):
+        optimizer.zero_grad()
+        loss = energy_fn(beta)
+        loss.backward()
+        optimizer.step()
+
+    x_ref = beta.detach().clone()
+
+    grad_sq = torch.zeros(D, dtype=dtype, device=device)
+    for _ in range(max(n_samples_fisher, 1)):
+        b = x_ref.clone().requires_grad_(True)
+        E = energy_fn(b)
+        g, = torch.autograd.grad(E, b)
+        grad_sq += g ** 2
+    grad_sq /= max(n_samples_fisher, 1)
+
+    diag_prec = grad_sq.clamp(min=prec_min, max=prec_max)
+    Sigma_inv = torch.diag(diag_prec)
+
+    return x_ref, Sigma_inv
+
+def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
+    """
+    Refine (x_ref, Sigma_inv) from short pilot runs of the sampler.
+
+    Works for both regular and sticky samplers. For sticky, only updates
+    coordinates that are active often enough for reliable moment estimation.
     """
     dtype = sampler.dtype
     device = sampler.device
     D = sampler.D
 
-    # --- Round 0: initial reference ---
-    if target is not None and target.x_ref is not None:
-        sampler.preprocess(
-            x_ref=target.x_ref.to(dtype=dtype, device=device),
-            Sigma_inv=target.Sigma_inv.to(dtype=dtype, device=device),
-        )
-    else:
-        # No reference available — start with prior-like defaults
-        sampler.preprocess(
-            x_ref=torch.zeros(D, dtype=dtype, device=device),
-            Sigma_inv=torch.eye(D, dtype=dtype, device=device),
-        )
+    is_sticky = hasattr(sampler, "frozen_mask")
 
-    # --- Iterative refinement ---
-    for i in range(n_rounds):
+    # Round 0: initial reference (from target, or default)
+    if sampler.x_ref is None:
+        if target is not None and target.x_ref is not None:
+            sampler.preprocess(
+                x_ref=target.x_ref.to(dtype=dtype, device=device),
+                Sigma_inv=target.Sigma_inv.to(dtype=dtype, device=device),
+            )
+        else:
+            sampler.preprocess(
+                x_ref=torch.zeros(D, dtype=dtype, device=device),
+                Sigma_inv=torch.eye(D, dtype=dtype, device=device),
+            )
+
+    for _ in range(n_rounds):
         result = sampler.sample(N=n_pilot, diagnostics=False)
 
         pos_np = result["positions"].cpu().numpy()
@@ -34,61 +113,82 @@ def warmup(sampler, n_rounds=3, n_pilot=500,
         tim_np = result["times"].cpu().numpy()
         x_ref_np = sampler.x_ref.cpu().numpy()
 
-        samples = resample_pdmp_path(
-            pos_np, vel_np, tim_np, x_ref_np,
-            N_resample=n_pilot, burnin_frac=0.0,
-        )
+        if is_sticky:
+            from .sampling import resample_pdmp_path_sticky as rsm
+        else:
+            from .sampling import resample_pdmp_path as rsm
 
-        x_ref_new = np.mean(samples, axis=0)
-        var_diag = np.clip(np.var(samples, axis=0), 1e-8, None)
-        Sigma_inv_new = np.diag(1.0 / var_diag)
+        samples = rsm(pos_np, vel_np, tim_np, x_ref_np,
+                      N_resample=n_pilot, burnin_frac=0.0)
+
+        # Only update coordinates with enough active samples
+        if is_sticky:
+            frac_active = np.mean(np.abs(samples) > zero_tol, axis=0)
+            update_mask = frac_active > 0.1
+        else:
+            update_mask = np.ones(D, dtype=bool)
+
+        Sigma_inv_diag = np.diag(sampler.Sigma_inv.cpu().numpy()).copy()
+        x_ref_new = x_ref_np.copy()
+
+        if update_mask.any():
+            active_samples = samples[:, update_mask]
+            x_ref_new[update_mask] = active_samples.mean(axis=0)
+            var_diag = np.clip(active_samples.var(axis=0), 1e-8, None)
+            Sigma_inv_diag[update_mask] = 1.0 / var_diag
 
         sampler.preprocess(
             x_ref=torch.tensor(x_ref_new, dtype=dtype, device=device),
-            Sigma_inv=torch.tensor(Sigma_inv_new, dtype=dtype, device=device),
+            Sigma_inv=torch.tensor(np.diag(Sigma_inv_diag), dtype=dtype, device=device),
         )
 
-    # if tune_refresh:
-    #     _tune_refresh_rate(sampler, n_pilot)
+# def warmup(sampler, n_rounds=3, n_pilot=500,
+#                      target=None, tune_refresh=False):
+#     """
+#     Iterative warm-up: run short pilots, update (x_ref, Sigma_inv)
+#     from resampled path moments.
+#     """
+#     dtype = sampler.dtype
+#     device = sampler.device
+#     D = sampler.D
+
+#     # --- Round 0: initial reference ---
+#     if target is not None and target.x_ref is not None:
+#         sampler.preprocess(
+#             x_ref=target.x_ref.to(dtype=dtype, device=device),
+#             Sigma_inv=target.Sigma_inv.to(dtype=dtype, device=device),
+#         )
+#     else:
+#         # No reference available — start with prior-like defaults
+#         sampler.preprocess(
+#             x_ref=torch.zeros(D, dtype=dtype, device=device),
+#             Sigma_inv=torch.eye(D, dtype=dtype, device=device),
+#         )
+
+#     # --- Iterative refinement ---
+#     for i in range(n_rounds):
+#         result = sampler.sample(N=n_pilot, diagnostics=False)
+
+#         pos_np = result["positions"].cpu().numpy()
+#         vel_np = result["velocities"].cpu().numpy()
+#         tim_np = result["times"].cpu().numpy()
+#         x_ref_np = sampler.x_ref.cpu().numpy()
+
+#         samples = resample_pdmp_path(
+#             pos_np, vel_np, tim_np, x_ref_np,
+#             N_resample=n_pilot, burnin_frac=0.0,
+#         )
+
+#         x_ref_new = np.mean(samples, axis=0)
+#         var_diag = np.clip(np.var(samples, axis=0), 1e-8, None)
+#         Sigma_inv_new = np.diag(1.0 / var_diag)
+
+#         sampler.preprocess(
+#             x_ref=torch.tensor(x_ref_new, dtype=dtype, device=device),
+#             Sigma_inv=torch.tensor(Sigma_inv_new, dtype=dtype, device=device),
+#         )
+
+#     # if tune_refresh:
+#     #     _tune_refresh_rate(sampler, n_pilot)
         
         
-# ===========================================================================
-# PDMP path resampling (uniform-in-time)
-# ===========================================================================
-
-# def resample_pdmp_path(positions, velocities, times, x_ref, N_resample, burnin_frac=0.1):
-#     """
-#     Given skeleton (positions, velocities, times), resample N_resample
-#     points uniformly in trajectory time using the Boomerang dynamics:
-#         x(t) = x_ref + (x_k - x_ref)*cos(t - t_k) + v_k*sin(t - t_k)
-
-#     All inputs are numpy arrays.
-#     """
-#     N, D = positions.shape
-#     n_burn = int(burnin_frac * N)
-#     pos = positions[n_burn:]
-#     vel = velocities[n_burn:]
-#     tim = times[n_burn:]
-
-#     T_start = float(tim[0])
-#     T_end = float(tim[-1])
-#     if T_end <= T_start:
-#         raise ValueError("Skeleton times are not increasing after burnin.")
-
-#     sample_times = np.random.uniform(T_start, T_end, size=N_resample)
-#     sample_times.sort()
-
-#     # For each sample time, find the skeleton interval it falls in
-#     # tim[idx-1] <= t < tim[idx]
-#     indices = np.searchsorted(tim, sample_times, side="right") - 1
-#     indices = np.clip(indices, 0, len(tim) - 2)
-
-#     samples = np.empty((N_resample, D))
-#     for j in range(N_resample):
-#         k = indices[j]
-#         dt = sample_times[j] - tim[k]
-#         dx = pos[k] - x_ref
-#         samples[j] = x_ref + dx * np.cos(dt) + vel[k] * np.sin(dt)
-
-#     return samples
-

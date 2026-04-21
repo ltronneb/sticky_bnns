@@ -12,13 +12,15 @@ import matplotlib.pyplot as plt
 
 class TorchTarget:
     """Minimal container matching what the sampler needs."""
-    def __init__(self, name, D, grad_target, x_ref, Sigma_inv, marginal_grids=None):
+    def __init__(self, name, D, grad_target, x_ref, Sigma_inv, 
+                 marginal_grids=None, meta=None):
         self.name = name
         self.D = D
         self.grad_target = grad_target        # callable: Tensor -> Tensor
         self.x_ref = x_ref                    # Tensor [D]
         self.Sigma_inv = Sigma_inv            # Tensor [D,D]
         self.marginal_grids = marginal_grids  # dict[int, {grid, pdf, label}]
+        self.meta = meta or {}
 
 
 # ---- 1. Multivariate Gaussian -------------------------------------------
