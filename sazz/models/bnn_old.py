@@ -3,15 +3,27 @@ models/bnn.py
 
 Functional BNN targets for the Boomerang and Sticky Boomerang samplers.
 
-Prior structure
----------------
-Weights and biases get separate Gaussian priors:
-    W ~ N(0, sigma_w^2)     with optional fan-in scaling
-    b ~ N(0, sigma_b^2)
+Two factories:
+    make_bnn_regression      — Gaussian likelihood, any architecture
+    make_bnn_classification  — Categorical/Bernoulli likelihood, any architecture
 
-Fan-in scaling sets sigma_w^(l) = prior_std_weight / sqrt(n_in^(l)),
-which is the standard Glorot/He-style scaling that keeps pre-activations
-O(1). Set fan_in_scaling=False to get a single global sigma_w = prior_std_weight.
+Both return a TorchTarget with:
+    .grad_target : (beta: Tensor[D]) -> Tensor[D]
+    .x_ref       : Tensor[D]   (from Adam warm-start)
+    .Sigma_inv   : Tensor[D,D] (diagonal, from empirical Fisher or Hessian diag)
+
+Architecture is specified as layer_sizes = [d_in, h1, ..., h_L, d_out].
+
+Usage
+-----
+    target = make_bnn_regression(X_train, y_train, layer_sizes=[8, 32, 32, 1])
+    # or
+    target = make_bnn_classification(X_train, y_train, layer_sizes=[8, 32, 32, 3])
+
+    sampler = AutomaticBoomerangSampler(
+        grad_target=target.grad_target, D=target.D, ...
+    )
+    sampler.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
 """
 
 from typing import List, Optional
@@ -19,73 +31,54 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from .smoke_test import TorchTarget
+from .smoke_test import TorchTarget      # reuse the same container
+#from ..utils.warmup import find_reference
 from ..utils.bnn_utils import (
     get_activation,
     count_params,
     unflatten_params,
-    layer_shapes,
     find_reference_bnn,
-    layer_slices_from_sizes,
+    layer_slices_from_sizes
 )
 
-
 # ===========================================================================
-# Prior precision vector builder
+# Forward pass (functional, no nn.Module)
 # ===========================================================================
 
-def _build_prior_precision(
+def _forward(
+    beta: Tensor,
+    X: Tensor,
     layer_sizes: List[int],
-    prior_std_weight: float,
-    prior_std_bias: float,
-    fan_in_scaling: bool,
-    dtype: torch.dtype,
-    device: torch.device,
+    activation,
 ) -> Tensor:
     """
-    Build a per-coordinate prior precision vector matching the flatten
-    convention in unflatten_params / layer_slices_from_sizes.
+    Forward pass of a fully-connected network.
 
-    Layout (per layer): weights first, biases second.
+    Parameters
+    ----------
+    beta : Tensor [D]
+        Flat parameter vector.
+    X : Tensor [N, d_in]
+        Input data.
+    layer_sizes : list[int]
+        e.g. [d_in, h1, h2, d_out]
+    activation : callable
+        Applied after every hidden layer (not the output layer).
+
+    Returns
+    -------
+    Tensor [N, d_out]  — raw logits / predictions (no final activation).
     """
-    D = count_params(layer_sizes)
-    prec = torch.empty(D, dtype=dtype, device=device)
-    offset = 0
-
-    for layer_idx, (W_shape, b_shape) in enumerate(layer_shapes(layer_sizes)):
-        n_W = W_shape[0] * W_shape[1]
-        n_b = b_shape[0]
-        n_in = layer_sizes[layer_idx]   # fan-in for this layer
-
-        if fan_in_scaling:
-            sigma_w_l = prior_std_weight / (n_in ** 0.5)
-        else:
-            sigma_w_l = prior_std_weight
-
-        prec[offset : offset + n_W] = 1.0 / sigma_w_l ** 2
-        offset += n_W
-        prec[offset : offset + n_b] = 1.0 / prior_std_bias ** 2
-        offset += n_b
-
-    return prec
-
-
-# ===========================================================================
-# Forward pass (unchanged)
-# ===========================================================================
-
-def _forward(beta, X, layer_sizes, activation):
     params = unflatten_params(beta, layer_sizes)
     h = X
     for i, (W, b) in enumerate(params):
         h = h @ W.T + b
-        if i < len(params) - 1:
+        if i < len(params) - 1:       # hidden layers only
             h = activation(h)
-    return h
-
+    return h                           # [N, d_out]
 
 # ===========================================================================
-# Negative log-posterior (now takes per-coord prior_precision)
+# Negative log-posterior and its gradient
 # ===========================================================================
 
 def _neg_log_posterior_regression(
@@ -94,12 +87,19 @@ def _neg_log_posterior_regression(
     y: Tensor,
     layer_sizes: List[int],
     activation,
-    prior_precision: Tensor,
+    prior_std: float,
     noise_std: float,
 ) -> Tensor:
-    preds = _forward(beta, X, layer_sizes, activation).squeeze(-1)
+    """
+    E(beta) = -log p(y|beta,X) - log p(beta)
+            = (1/2 noise_std^2) ||y - f(X;beta)||^2
+            + (1/2 prior_std^2) ||beta||^2
+            + const
+    """
+    preds = _forward(beta, X, layer_sizes, activation).squeeze(-1)  # [N]
+    n = X.shape[0]
     log_lik = -0.5 * ((y - preds) ** 2).sum() / noise_std ** 2
-    log_prior = -0.5 * (prior_precision * beta ** 2).sum()
+    log_prior = -0.5 * (beta ** 2).sum() / prior_std ** 2
     return -(log_lik + log_prior)
 
 
@@ -109,36 +109,42 @@ def _neg_log_posterior_classification(
     y: Tensor,
     layer_sizes: List[int],
     activation,
-    prior_precision: Tensor,
+    prior_std: float,
     n_classes: int,
 ) -> Tensor:
-    logits = _forward(beta, X, layer_sizes, activation)
+    """
+    E(beta) = -log p(y|beta,X) - log p(beta)
+
+    Binary  (n_classes=2): Bernoulli likelihood with sigmoid output.
+    Multi   (n_classes>2): Categorical likelihood with softmax output.
+    """
+    logits = _forward(beta, X, layer_sizes, activation)   # [N, d_out]
 
     if n_classes == 2:
-        log_odds = logits.squeeze(-1)
+        # logits: [N, 1] or [N, 2] — use first output as log-odds
+        log_odds = logits.squeeze(-1)                      # [N]
         log_lik = -F.binary_cross_entropy_with_logits(
             log_odds, y.float(), reduction="sum"
         )
     else:
         log_lik = -F.cross_entropy(logits, y.long(), reduction="sum")
 
-    log_prior = -0.5 * (prior_precision * beta ** 2).sum()
+    log_prior = -0.5 * (beta ** 2).sum() / prior_std ** 2
     return -(log_lik + log_prior)
 
-
 # ===========================================================================
-# Gradient wrapper (unchanged)
+# Gradient of the energy w.r.t. beta
 # ===========================================================================
 
 def _make_grad_target(energy_fn):
     def grad_target(beta: Tensor) -> Tensor:
+        # Always compute gradient regardless of outer no_grad context
         with torch.enable_grad():
             beta_ = beta.detach().requires_grad_(True)
             E = energy_fn(beta_)
             g, = torch.autograd.grad(E, beta_)
         return g
     return grad_target
-
 
 # ===========================================================================
 # Factories
@@ -149,9 +155,7 @@ def make_bnn_regression(
     y: Tensor,
     layer_sizes: Optional[List[int]] = None,
     activation: str = "tanh",
-    prior_std_weight: float = 1.0,
-    prior_std_bias: float = 1.0,
-    fan_in_scaling: bool = True,
+    prior_std: float = 1.0,
     noise_std: float = 0.1,
     dtype: torch.dtype = torch.float64,
     device: torch.device = torch.device("cpu"),
@@ -161,14 +165,20 @@ def make_bnn_regression(
     """
     Bayesian neural network regression target.
 
-    Priors
-    ------
-    Weights: N(0, (prior_std_weight / sqrt(fan_in))^2) if fan_in_scaling,
-             else N(0, prior_std_weight^2).
-    Biases:  N(0, prior_std_bias^2).
-
-    prior_std_weight=1.0 with fan_in_scaling=True corresponds to
-    standard Glorot-style initialisation variance.
+    Parameters
+    ----------
+    X : Tensor [N, d_in]
+    y : Tensor [N]
+    layer_sizes : list[int] | None
+        e.g. [d_in, 32, 32, 1]. If None, defaults to [d_in, 32, 1].
+    activation : str
+        "relu" or "tanh" (or any key in bnn_utils.get_activation).
+    prior_std : float
+        Standard deviation of the isotropic Gaussian prior on weights.
+    noise_std : float
+        Observation noise standard deviation.
+    adam_steps : int
+        Number of Adam steps to find the reference point.
     """
     X = X.to(dtype=dtype, device=device)
     y = y.to(dtype=dtype, device=device)
@@ -183,19 +193,17 @@ def make_bnn_regression(
     act = get_activation(activation)
     D = count_params(layer_sizes)
 
-    prior_precision = _build_prior_precision(
-        layer_sizes, prior_std_weight, prior_std_bias,
-        fan_in_scaling, dtype, device,
-    )
-
     def energy_fn(beta):
         return _neg_log_posterior_regression(
-            beta, X, y, layer_sizes, act, prior_precision, noise_std
+            beta, X, y, layer_sizes, act, prior_std, noise_std
         )
 
     grad_target = _make_grad_target(energy_fn)
 
     print(f"Finding reference for regression BNN (D={D}, {adam_steps} Adam steps)...")
+    prior_precision = torch.full(
+        (D,), 1.0 / prior_std**2, dtype=dtype, device=device
+    )
     x_ref, Sigma_inv = find_reference_bnn(
         energy_fn, D,
         layer_slices=layer_slices_from_sizes(layer_sizes),
@@ -203,6 +211,10 @@ def make_bnn_regression(
         dtype=dtype, device=device,
         n_steps=adam_steps, lr=adam_lr,
     )
+    # x_ref, Sigma_inv = find_reference_bnn(
+    #     energy_fn, D, dtype=dtype, device=device, #layer_slices=layer_slices_from_sizes(layer_sizes),
+    #     n_steps=adam_steps, lr=adam_lr,
+    # )
 
     return TorchTarget(
         name=f"bnn_regression_{'x'.join(str(s) for s in layer_sizes)}_{activation}",
@@ -213,13 +225,10 @@ def make_bnn_regression(
         meta={
             "layer_sizes": layer_sizes,
             "activation": activation,
-            "prior_std_weight": prior_std_weight,
-            "prior_std_bias": prior_std_bias,
-            "fan_in_scaling": fan_in_scaling,
-            "prior_precision": prior_precision,
+            "prior_std": prior_std,
             "noise_std": noise_std,
             "task": "regression",
-            "energy_fn": energy_fn,
+            "energy_fn": energy_fn,   # kept for prediction
         },
     )
 
@@ -229,9 +238,7 @@ def make_bnn_classification(
     y: Tensor,
     layer_sizes: Optional[List[int]] = None,
     activation: str = "tanh",
-    prior_std_weight: float = 1.0,
-    prior_std_bias: float = 1.0,
-    fan_in_scaling: bool = True,
+    prior_std: float = 1.0,
     dtype: torch.dtype = torch.float64,
     device: torch.device = torch.device("cpu"),
     adam_steps: int = 2000,
@@ -240,7 +247,17 @@ def make_bnn_classification(
     """
     Bayesian neural network classification target.
 
-    Priors same convention as make_bnn_regression.
+    Handles binary (n_classes=2) and multi-class (n_classes>2).
+    For binary: output layer has 1 unit, Bernoulli likelihood.
+    For multi-class: output layer has n_classes units, Categorical likelihood.
+
+    Parameters
+    ----------
+    X : Tensor [N, d_in]
+    y : Tensor [N]    — integer class labels starting at 0
+    layer_sizes : list[int] | None
+        e.g. [d_in, 32, 32, n_classes].
+        If None, inferred from data: [d_in, 32, n_classes].
     """
     X = X.to(dtype=dtype, device=device)
     y = y.to(device=device)
@@ -262,20 +279,18 @@ def make_bnn_classification(
     act = get_activation(activation)
     D = count_params(layer_sizes)
 
-    prior_precision = _build_prior_precision(
-        layer_sizes, prior_std_weight, prior_std_bias,
-        fan_in_scaling, dtype, device,
-    )
-
     def energy_fn(beta):
         return _neg_log_posterior_classification(
-            beta, X, y, layer_sizes, act, prior_precision, n_classes
+            beta, X, y, layer_sizes, act, prior_std, n_classes
         )
 
     grad_target = _make_grad_target(energy_fn)
 
     print(f"Finding reference for classification BNN "
           f"(D={D}, {n_classes} classes, {adam_steps} Adam steps)...")
+    prior_precision = torch.full(
+        (D,), 1.0 / prior_std**2, dtype=dtype, device=device
+    )
     x_ref, Sigma_inv = find_reference_bnn(
         energy_fn, D,
         layer_slices=layer_slices_from_sizes(layer_sizes),
@@ -283,6 +298,10 @@ def make_bnn_classification(
         dtype=dtype, device=device,
         n_steps=adam_steps, lr=adam_lr,
     )
+    # x_ref, Sigma_inv = find_reference_bnn(
+    #     energy_fn, D, dtype=dtype, device=device, layer_slices=layer_slices_from_sizes(layer_sizes),
+    #     n_steps=adam_steps, lr=adam_lr,
+    # )
 
     return TorchTarget(
         name=(f"bnn_classification_{'x'.join(str(s) for s in layer_sizes)}"
@@ -294,17 +313,12 @@ def make_bnn_classification(
         meta={
             "layer_sizes": layer_sizes,
             "activation": activation,
-            "prior_std_weight": prior_std_weight,
-            "prior_std_bias": prior_std_bias,
-            "fan_in_scaling": fan_in_scaling,
-            "prior_precision": prior_precision,
+            "prior_std": prior_std,
             "n_classes": n_classes,
             "task": "classification",
             "energy_fn": energy_fn,
         },
     )
-    
-    
 
 # ===========================================================================
 # Prediction utilities

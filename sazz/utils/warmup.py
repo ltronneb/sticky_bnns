@@ -20,64 +20,116 @@ import numpy as np
 import torch
 from torch import Tensor
 
-
-def find_reference(
+def find_reference_glm(
     energy_fn,
     D: int,
     dtype: torch.dtype = torch.float64,
     device: torch.device = torch.device("cpu"),
-    n_steps: int = 2000,
+    n_steps: int = 1000,
     lr: float = 1e-2,
-    n_samples_fisher: int = 50,
-    prec_min: float = 1.0,
-    prec_max: float = 1e4,
+    prec_min: float = 1e-6,
+    prec_max: float = 1e8,
+    diagonal_only: bool = False,
+    jitter: float = 1e-8,
 ) -> tuple[Tensor, Tensor]:
     """
-    Run Adam to find the MAP, then estimate a diagonal precision matrix
-    from squared gradients at the MAP (empirical Fisher approximation).
+    MAP via Adam + Hessian at the MAP.
+
+    Exact Laplace-approximation precision for convex, smooth,
+    deterministic energies. Use for GLMs (linreg, logreg,
+    Poisson/Gamma) and similar low-to-moderate dimensional
+    closed-form targets.
 
     Parameters
     ----------
-    energy_fn : callable
-        Takes a parameter tensor of shape [D], returns scalar negative
-        log posterior.
-    D : int
-        Dimension of the parameter vector.
-    n_steps : int
-        Number of Adam steps.
-    lr : float
-        Adam learning rate.
-    n_samples_fisher : int
-        Number of gradient evaluations for the Fisher estimate. Using >1
-        only helps if energy_fn has stochastic components (e.g. minibatch).
-    prec_min, prec_max : float
-        Clipping bounds on the diagonal precision. prec_min=1.0 prevents
-        unbounded variance from flat directions.
+    diagonal_only : bool
+        If True, return diag(Hessian). If False (default), return
+        the full D×D Hessian. For D up to ~few hundred the full
+        matrix is cheap and captures off-diagonal correlations
+        that matter for multinomial logreg, correlated features,
+        etc.
+    jitter : float
+        Added to the Hessian diagonal before returning, to guard
+        against numerical non-PD.
     """
+    # MAP via Adam
     beta = torch.randn(D, dtype=dtype, device=device) * 0.01
     beta.requires_grad_(True)
     optimizer = torch.optim.Adam([beta], lr=lr)
-
     for _ in range(n_steps):
         optimizer.zero_grad()
         loss = energy_fn(beta)
         loss.backward()
         optimizer.step()
-
     x_ref = beta.detach().clone()
 
-    grad_sq = torch.zeros(D, dtype=dtype, device=device)
-    for _ in range(max(n_samples_fisher, 1)):
-        b = x_ref.clone().requires_grad_(True)
-        E = energy_fn(b)
-        g, = torch.autograd.grad(E, b)
-        grad_sq += g ** 2
-    grad_sq /= max(n_samples_fisher, 1)
-
-    diag_prec = grad_sq.clamp(min=prec_min, max=prec_max)
-    Sigma_inv = torch.diag(diag_prec)
+    if diagonal_only:
+        # Old behaviour: Hessian diagonal only
+        diag_H = torch.zeros(D, dtype=dtype, device=device)
+        for i in range(D):
+            b = x_ref.clone().requires_grad_(True)
+            g, = torch.autograd.grad(energy_fn(b), b, create_graph=True)
+            hi, = torch.autograd.grad(g[i], b, retain_graph=False)
+            diag_H[i] = hi[i]
+        diag_prec = diag_H.clamp(min=prec_min, max=prec_max)
+        Sigma_inv = torch.diag(diag_prec)
+    else:
+        # Full Hessian via torch.autograd.functional.hessian
+        H = torch.autograd.functional.hessian(energy_fn, x_ref)
+        # Symmetrise and add jitter
+        H = 0.5 * (H + H.T) + jitter * torch.eye(D, dtype=dtype, device=device)
+        Sigma_inv = H
 
     return x_ref, Sigma_inv
+
+# def find_reference_glm(
+#     energy_fn,
+#     D: int,
+#     dtype: torch.dtype = torch.float64,
+#     device: torch.device = torch.device("cpu"),
+#     n_steps: int = 1000,
+#     lr: float = 1e-2,
+#     prec_min: float = 1e-6,
+#     prec_max: float = 1e8,
+# ) -> tuple[Tensor, Tensor]:
+#     """
+#     MAP via Adam + diagonal Hessian at the MAP.
+
+#     Exact Laplace-approximation precision for convex, smooth,
+#     deterministic energies. Use for GLMs (linreg, logreg,
+#     Poisson/Gamma) and similar low-to-moderate dimensional
+#     closed-form targets.
+
+#     Returns
+#     -------
+#     x_ref : Tensor [D]
+#         MAP estimate.
+#     Sigma_inv : Tensor [D, D]
+#         Diagonal matrix whose entries are the Hessian diagonal at the MAP,
+#         clipped to [prec_min, prec_max].
+#     """
+#     # MAP via Adam
+#     beta = torch.randn(D, dtype=dtype, device=device) * 0.01
+#     beta.requires_grad_(True)
+#     optimizer = torch.optim.Adam([beta], lr=lr)
+#     for _ in range(n_steps):
+#         optimizer.zero_grad()
+#         loss = energy_fn(beta)
+#         loss.backward()
+#         optimizer.step()
+#     x_ref = beta.detach().clone()
+
+#     # Diagonal of the Hessian via D Hessian-vector products
+#     diag_H = torch.zeros(D, dtype=dtype, device=device)
+#     for i in range(D):
+#         b = x_ref.clone().requires_grad_(True)
+#         g, = torch.autograd.grad(energy_fn(b), b, create_graph=True)
+#         hi, = torch.autograd.grad(g[i], b, retain_graph=False)
+#         diag_H[i] = hi[i]
+
+#     diag_prec = diag_H.clamp(min=prec_min, max=prec_max)
+#     Sigma_inv = torch.diag(diag_prec)
+#     return x_ref, Sigma_inv
 
 def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
     """

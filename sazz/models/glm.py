@@ -38,7 +38,7 @@ import torch
 from torch import Tensor
 
 from .smoke_test import TorchTarget
-from .bnn import find_reference   # reuse the Adam warm-start
+from ..utils.warmup import find_reference_glm   # reuse the Adam warm-start
 
 
 # ===========================================================================
@@ -101,6 +101,7 @@ def make_linear_regression(
     device: torch.device = torch.device("cpu"),
     adam_steps: int = 1000,
     adam_lr: float = 1e-2,
+    diagonal_only: bool = True
 ) -> TorchTarget:
     """
     Bayesian linear regression with Gaussian prior.
@@ -136,8 +137,8 @@ def make_linear_regression(
         return grad_lik + grad_prior
 
     print(f"Finding reference for linear regression (D={D}, {adam_steps} Adam steps)...")
-    x_ref, Sigma_inv = find_reference(
-        energy_fn, D, dtype=dtype, device=device,
+    x_ref, Sigma_inv = find_reference_glm(
+        energy_fn, D, dtype=dtype, device=device, diagonal_only=diagonal_only,
         n_steps=adam_steps, lr=adam_lr,
     )
 
@@ -174,6 +175,7 @@ def make_logistic_regression(
     device: torch.device = torch.device("cpu"),
     adam_steps: int = 1000,
     adam_lr: float = 1e-2,
+    diagonal_only: bool = True
 ) -> TorchTarget:
     """
     Bayesian logistic regression. Binary if y has 2 classes,
@@ -254,8 +256,8 @@ def make_logistic_regression(
 
     print(f"Finding reference for logistic regression "
           f"(D={D}, {n_classes} classes, {adam_steps} Adam steps)...")
-    x_ref, Sigma_inv = find_reference(
-        energy_fn, D, dtype=dtype, device=device,
+    x_ref, Sigma_inv = find_reference_glm(
+        energy_fn, D, dtype=dtype, device=device, diagonal_only=diagonal_only,
         n_steps=adam_steps, lr=adam_lr,
     )
 
@@ -361,7 +363,7 @@ def make_glm(
         raise ValueError(f"Unknown family '{family}'. Use 'poisson' or 'gamma'.")
 
     print(f"Finding reference for {family} GLM (D={D}, {adam_steps} Adam steps)...")
-    x_ref, Sigma_inv = find_reference(
+    x_ref, Sigma_inv = find_reference_glm(
         energy_fn, D, dtype=dtype, device=device,
         n_steps=adam_steps, lr=adam_lr,
     )
