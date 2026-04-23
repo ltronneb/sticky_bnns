@@ -131,142 +131,21 @@ def unflatten_params(
         params.append((W, b))
     return params
 
-
-def flatten_params(params: List[tuple]) -> Tensor:
-    """
-    Concatenate a list of (W, b) tuples into a single flat vector.
-    Inverse of unflatten_params.
-    """
-    parts = []
-    for W, b in params:
-        parts.append(W.reshape(-1))
-        parts.append(b.reshape(-1))
-    return torch.cat(parts)
-
 # ---------------------------------------------------------------------------
-# Find reference BNNs
+# Kappa for weights and biases in different layers
 # ---------------------------------------------------------------------------
 
-def find_reference_bnn(
-    energy_fn,
-    D: int,
-    layer_slices: Optional[Sequence[slice]] = None,
-    prior_precision: Optional[Tensor] = None,
-    dtype: torch.dtype = torch.float64,
-    device: torch.device = torch.device("cpu"),
-    n_steps: int = 4000,
-    lr: float = 1e-2,
-    n_samples_fisher: int = 100,
-    #prec_min: float = 1e-3,
-    #prec_max: float = 1e4,
-    per_layer_clip: bool = True,
-) -> tuple[Tensor, Tensor]:
-    """
-    Adam-based MAP + diagonal empirical Fisher, with optional per-layer
-    normalisation and clipping.
 
-    Parameters
-    ----------
-    layer_slices : list of slice, optional
-        Index ranges for each parameter group (e.g. [slice(0, 784*32),
-        slice(784*32, 784*32+32), ...] for a weight/bias split per layer).
-        If None, falls back to a single global group (old behaviour).
-    prior_precision : Tensor [D], optional
-        Per-coordinate prior precision (1 / prior_std^2). If provided,
-        used as the per-coordinate floor on the diagonal precision,
-        so posterior precision is never below prior precision.
-    per_layer_normalise : bool
-        If True, divide each layer's precisions by the layer median before
-        clipping, so clip bounds are interpreted relative to each layer's
-        typical curvature rather than absolute.
-    per_layer_clip : bool
-        If True, clip after normalisation (if used). If False, only the
-        normalisation is applied and no clipping is done.
-    """
-    # --- MAP via Adam ---
-    beta = torch.randn(D, dtype=dtype, device=device) * 0.01
-    beta.requires_grad_(True)
-    optimizer = torch.optim.Adam([beta], lr=lr)
-    for _ in range(n_steps):
-        optimizer.zero_grad()
-        loss = energy_fn(beta)
-        loss.backward()
-        optimizer.step()
-    x_ref = beta.detach().clone()
-
-    # --- Empirical Fisher diagonal ---
-    grad_sq = torch.zeros(D, dtype=dtype, device=device)
-    for _ in range(max(n_samples_fisher, 1)):
-        b = x_ref.clone().requires_grad_(True)
-        E = energy_fn(b)
-        g, = torch.autograd.grad(E, b)
-        grad_sq += g ** 2
-    grad_sq /= max(n_samples_fisher, 1)
-
-    # --- Default to single global group if no slices given ---
-    if layer_slices is None:
-        layer_slices = [slice(0, D)]
-
-    diag_prec = grad_sq.clone()
-
-    #--- Per-layer processing ---
-    for sl in layer_slices:
-        block = diag_prec[sl]
-        if block.numel() == 0:
-            continue
-        med = block.median().clamp(min=1e-12)
-
-        if per_layer_clip:
-            #if prior_precision is not None:
-            #    floor = prior_precision[sl].to(block.dtype).to(block.device)
-            #    block = torch.maximum(block, floor).clamp(max=1e5)
-            #else:
-            block = block.clamp(min=1.0, max=1e5)
-
-        diag_prec[sl] = block
-
-    Sigma_inv = torch.diag(diag_prec)
-    return x_ref, Sigma_inv
-
-
-def layer_slices_from_sizes(layer_sizes: Sequence[int]) -> list[slice]:
-    """
-    Helper: build layer_slices for a standard FFN with weights then biases
-    per layer, matching the flattening convention used by make_kappa_vector.
-
-    Returns one slice per parameter group (weights of layer 1, biases of
-    layer 1, weights of layer 2, ...).
-    """
-    slices = []
-    offset = 0
-    for i in range(len(layer_sizes) - 1):
-        n_in, n_out = layer_sizes[i], layer_sizes[i + 1]
-        n_W = n_in * n_out
-        n_b = n_out
-        slices.append(slice(offset, offset + n_W))
-        offset += n_W
-        slices.append(slice(offset, offset + n_b))
-        offset += n_b
-    return slices
-
-# ---------------------------------------------------------------------------
-# Freeze only weights
-# ---------------------------------------------------------------------------
-def make_kappa_vector(
-    layer_sizes: List[int],
-    kappa_weights: float = 1.0,
-    kappa_biases: float = 1e6,
-    dtype: torch.dtype = torch.float64,
-    device: torch.device = torch.device("cpu"),
-) -> torch.Tensor:
-    kappas = []
-    for (W_shape, b_shape) in layer_shapes(layer_sizes):
-        n_weights = W_shape[0] * W_shape[1]
-        n_biases  = b_shape[0]
-        kappas.append(torch.full((n_weights,), kappa_weights, dtype=dtype, device=device))
-        kappas.append(torch.full((n_biases,),  kappa_biases,  dtype=dtype, device=device))
-    return torch.cat(kappas)
-
+def _broadcast_per_layer(val, n_layers: int, name: str) -> List[float]:
+    if isinstance(val, (int, float)):
+        return [float(val)] * n_layers
+    val = list(val)
+    if len(val) != n_layers:
+        raise ValueError(
+            f"{name} must be a scalar or a sequence of length "
+            f"{n_layers} (got length {len(val)})."
+        )
+    return [float(v) for v in val]
 
 def make_kappa_vector_bnn(
     layer_sizes: List[int],
@@ -300,13 +179,27 @@ def make_kappa_vector_bnn(
     return torch.cat(kappas)
 
 
-def _broadcast_per_layer(val, n_layers: int, name: str) -> List[float]:
-    if isinstance(val, (int, float)):
-        return [float(val)] * n_layers
-    val = list(val)
-    if len(val) != n_layers:
-        raise ValueError(
-            f"{name} must be a scalar or a sequence of length "
-            f"{n_layers} (got length {len(val)})."
-        )
-    return [float(v) for v in val]
+# ---------------------------------------------------------------------------
+# Find reference BNNs
+# ---------------------------------------------------------------------------
+
+
+# def layer_slices_from_sizes(layer_sizes: Sequence[int]) -> list[slice]:
+#     """
+#     Helper: build layer_slices for a standard FFN with weights then biases
+#     per layer, matching the flattening convention used by make_kappa_vector.
+
+#     Returns one slice per parameter group (weights of layer 1, biases of
+#     layer 1, weights of layer 2, ...).
+#     """
+#     slices = []
+#     offset = 0
+#     for i in range(len(layer_sizes) - 1):
+#         n_in, n_out = layer_sizes[i], layer_sizes[i + 1]
+#         n_W = n_in * n_out
+#         n_b = n_out
+#         slices.append(slice(offset, offset + n_W))
+#         offset += n_W
+#         slices.append(slice(offset, offset + n_b))
+#         offset += n_b
+#     return slices

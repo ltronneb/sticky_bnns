@@ -19,8 +19,8 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from .smoke_test import TorchTarget
-from ..utils.bnn_utils import (
+from ..smoke_test import TorchTarget
+from ...utils.bnn_utils import (
     get_activation,
     count_params,
     unflatten_params,

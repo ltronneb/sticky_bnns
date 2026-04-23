@@ -19,7 +19,7 @@ Typical pipeline:
 import numpy as np
 import torch
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Literal, Sequence
 from ..models.models_torch import BayesianModel
 
 def find_reference_glm(
@@ -71,54 +71,77 @@ def find_reference_glm(
 
     return x_ref, Sigma_inv
 
-# def find_reference_glm(
-#     energy_fn,
-#     D: int,
-#     dtype: torch.dtype = torch.float64,
-#     device: torch.device = torch.device("cpu"),
-#     n_steps: int = 1000,
-#     lr: float = 1e-2,
-#     prec_min: float = 1e-6,
-#     prec_max: float = 1e8,
-# ) -> tuple[Tensor, Tensor]:
-#     """
-#     MAP via Adam + diagonal Hessian at the MAP.
 
-#     Exact Laplace-approximation precision for convex, smooth,
-#     deterministic energies. Use for GLMs (linreg, logreg,
-#     Poisson/Gamma) and similar low-to-moderate dimensional
-#     closed-form targets.
+def find_reference_bnn(
+    energy_fn,
+    D: int,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device = torch.device("cpu"),
+    n_steps: int = 4000,
+    lr: float = 1e-2,
+    model: Optional["BayesianModel"] = None,
+    reference: Literal["prior", "fisher"] = "prior",
+    layer_slices: Optional[Sequence[slice]] = None,
+    n_samples_fisher: int = 100,
+    per_layer_clip: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """
+    MAP via Adam + choice of reference precision for BNNs.
 
-#     Returns
-#     -------
-#     x_ref : Tensor [D]
-#         MAP estimate.
-#     Sigma_inv : Tensor [D, D]
-#         Diagonal matrix whose entries are the Hessian diagonal at the MAP,
-#         clipped to [prec_min, prec_max].
-#     """
-#     # MAP via Adam
-#     beta = torch.randn(D, dtype=dtype, device=device) * 0.01
-#     beta.requires_grad_(True)
-#     optimizer = torch.optim.Adam([beta], lr=lr)
-#     for _ in range(n_steps):
-#         optimizer.zero_grad()
-#         loss = energy_fn(beta)
-#         loss.backward()
-#         optimizer.step()
-#     x_ref = beta.detach().clone()
+    Parameters
+    ----------
+    reference : {"prior", "fisher"}
+        "prior"  — use the prior precision as Sigma_inv. Requires `model`
+                   with a prior exposing precision_diag(). This is the
+                   recommended default for BNNs: it gives orbits matched
+                   to the prior scale and requires no tuning.
+        "fisher" — empirical Fisher diagonal with per-layer clipping.
+                   Historical behaviour, kept for reproducibility.
+    """
+    fn = model.energy if model is not None else energy_fn
 
-#     # Diagonal of the Hessian via D Hessian-vector products
-#     diag_H = torch.zeros(D, dtype=dtype, device=device)
-#     for i in range(D):
-#         b = x_ref.clone().requires_grad_(True)
-#         g, = torch.autograd.grad(energy_fn(b), b, create_graph=True)
-#         hi, = torch.autograd.grad(g[i], b, retain_graph=False)
-#         diag_H[i] = hi[i]
+    # --- MAP via Adam ---
+    beta = torch.randn(D, dtype=dtype, device=device) * 0.01
+    beta.requires_grad_(True)
+    optimizer = torch.optim.Adam([beta], lr=lr)
+    for _ in range(n_steps):
+        optimizer.zero_grad()
+        loss = fn(beta)
+        loss.backward()
+        optimizer.step()
+    x_ref = beta.detach().clone()
 
-#     diag_prec = diag_H.clamp(min=prec_min, max=prec_max)
-#     Sigma_inv = torch.diag(diag_prec)
-#     return x_ref, Sigma_inv
+    if reference == "prior":
+        if model is None:
+            raise ValueError("reference='prior' requires a model argument.")
+        prec = model.prior.precision_diag().to(dtype=dtype, device=device)
+        Sigma_inv = torch.diag(prec)
+
+    elif reference == "fisher":
+        grad_sq = torch.zeros(D, dtype=dtype, device=device)
+        for _ in range(max(n_samples_fisher, 1)):
+            b = x_ref.clone().requires_grad_(True)
+            g, = torch.autograd.grad(fn(b), b)
+            grad_sq += g ** 2
+        grad_sq /= max(n_samples_fisher, 1)
+
+        if layer_slices is None:
+            layer_slices = [slice(0, D)]
+
+        diag_prec = grad_sq.clone()
+        if per_layer_clip:
+            for sl in layer_slices:
+                block = diag_prec[sl]
+                if block.numel() == 0:
+                    continue
+                diag_prec[sl] = block.clamp(min=1.0, max=1e5)
+        Sigma_inv = torch.diag(diag_prec)
+
+    else:
+        raise ValueError(f"Unknown reference type: {reference}")
+
+    return x_ref, Sigma_inv
+
 
 def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
     """
@@ -182,6 +205,7 @@ def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
             x_ref=torch.tensor(x_ref_new, dtype=dtype, device=device),
             Sigma_inv=torch.tensor(np.diag(Sigma_inv_diag), dtype=dtype, device=device),
         )
+
 
 # def warmup(sampler, n_rounds=3, n_pilot=500,
 #                      target=None, tune_refresh=False):
