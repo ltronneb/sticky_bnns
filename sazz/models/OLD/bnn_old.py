@@ -31,9 +31,9 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
-from .smoke_test import TorchTarget      # reuse the same container
+from ..smoke_test import TorchTarget      # reuse the same container
 #from ..utils.warmup import find_reference
-from ..utils.bnn_utils import (
+from ...utils.bnn_utils import (
     get_activation,
     count_params,
     unflatten_params,

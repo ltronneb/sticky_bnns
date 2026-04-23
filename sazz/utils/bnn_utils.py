@@ -59,6 +59,42 @@ def count_params(layer_sizes: List[int]) -> int:
     )
 
 
+def _build_prior_precision(
+    layer_sizes: List[int],
+    prior_std_weight: float,
+    prior_std_bias: float,
+    fan_in_scaling: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    """
+    Build a per-coordinate prior precision vector matching the flatten
+    convention in unflatten_params / layer_slices_from_sizes.
+
+    Layout (per layer): weights first, biases second.
+    """
+    D = count_params(layer_sizes)
+    prec = torch.empty(D, dtype=dtype, device=device)
+    offset = 0
+
+    for layer_idx, (W_shape, b_shape) in enumerate(layer_shapes(layer_sizes)):
+        n_W = W_shape[0] * W_shape[1]
+        n_b = b_shape[0]
+        n_in = layer_sizes[layer_idx]   # fan-in for this layer
+
+        if fan_in_scaling:
+            sigma_w_l = prior_std_weight / (n_in ** 0.5)
+        else:
+            sigma_w_l = prior_std_weight
+
+        prec[offset : offset + n_W] = 1.0 / sigma_w_l ** 2
+        offset += n_W
+        prec[offset : offset + n_b] = 1.0 / prior_std_bias ** 2
+        offset += n_b
+
+    return prec
+
+
 # ---------------------------------------------------------------------------
 # Flat vector <-> list of (W, b) tensors
 # ---------------------------------------------------------------------------
@@ -118,12 +154,11 @@ def find_reference_bnn(
     prior_precision: Optional[Tensor] = None,
     dtype: torch.dtype = torch.float64,
     device: torch.device = torch.device("cpu"),
-    n_steps: int = 2000,
+    n_steps: int = 4000,
     lr: float = 1e-2,
-    n_samples_fisher: int = 50,
+    n_samples_fisher: int = 100,
     #prec_min: float = 1e-3,
     #prec_max: float = 1e4,
-    per_layer_normalise: bool = False,
     per_layer_clip: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """
@@ -174,24 +209,19 @@ def find_reference_bnn(
 
     diag_prec = grad_sq.clone()
 
-    # --- Per-layer processing ---
+    #--- Per-layer processing ---
     for sl in layer_slices:
         block = diag_prec[sl]
         if block.numel() == 0:
             continue
         med = block.median().clamp(min=1e-12)
-        if per_layer_normalise:
-            # Median-based normalisation is robust to outlier gradients
-            #med = block.median().clamp(min=1e-12)
-            block = block / med
-            # After normalisation, the block is dimensionless and centred on 1
 
         if per_layer_clip:
-            if prior_precision is not None:
-                floor = prior_precision[sl].to(block.dtype).to(block.device)
-                block = torch.maximum(block, floor).clamp(max=1e5)
-            else:
-                block = block.clamp(min=1.0, max=1e5)
+            #if prior_precision is not None:
+            #    floor = prior_precision[sl].to(block.dtype).to(block.device)
+            #    block = torch.maximum(block, floor).clamp(max=1e5)
+            #else:
+            block = block.clamp(min=1.0, max=1e5)
 
         diag_prec[sl] = block
 

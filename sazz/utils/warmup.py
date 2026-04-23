@@ -19,6 +19,8 @@ Typical pipeline:
 import numpy as np
 import torch
 from torch import Tensor
+from typing import Optional
+from ..models.models_torch import BayesianModel
 
 def find_reference_glm(
     energy_fn,
@@ -31,52 +33,39 @@ def find_reference_glm(
     prec_max: float = 1e8,
     diagonal_only: bool = False,
     jitter: float = 1e-8,
+    model: Optional["BayesianModel"] = None,
 ) -> tuple[Tensor, Tensor]:
     """
     MAP via Adam + Hessian at the MAP.
 
-    Exact Laplace-approximation precision for convex, smooth,
-    deterministic energies. Use for GLMs (linreg, logreg,
-    Poisson/Gamma) and similar low-to-moderate dimensional
-    closed-form targets.
-
-    Parameters
-    ----------
-    diagonal_only : bool
-        If True, return diag(Hessian). If False (default), return
-        the full D×D Hessian. For D up to ~few hundred the full
-        matrix is cheap and captures off-diagonal correlations
-        that matter for multinomial logreg, correlated features,
-        etc.
-    jitter : float
-        Added to the Hessian diagonal before returning, to guard
-        against numerical non-PD.
+    If `model` is provided, uses model.energy for MAP finding and can
+    exploit model.prior.precision_diag() for the prior contribution.
+    Otherwise falls back to energy_fn.
     """
+    fn = model.energy if model is not None else energy_fn
+
     # MAP via Adam
     beta = torch.randn(D, dtype=dtype, device=device) * 0.01
     beta.requires_grad_(True)
     optimizer = torch.optim.Adam([beta], lr=lr)
     for _ in range(n_steps):
         optimizer.zero_grad()
-        loss = energy_fn(beta)
+        loss = fn(beta)
         loss.backward()
         optimizer.step()
     x_ref = beta.detach().clone()
 
     if diagonal_only:
-        # Old behaviour: Hessian diagonal only
         diag_H = torch.zeros(D, dtype=dtype, device=device)
         for i in range(D):
             b = x_ref.clone().requires_grad_(True)
-            g, = torch.autograd.grad(energy_fn(b), b, create_graph=True)
+            g, = torch.autograd.grad(fn(b), b, create_graph=True)
             hi, = torch.autograd.grad(g[i], b, retain_graph=False)
             diag_H[i] = hi[i]
         diag_prec = diag_H.clamp(min=prec_min, max=prec_max)
         Sigma_inv = torch.diag(diag_prec)
     else:
-        # Full Hessian via torch.autograd.functional.hessian
-        H = torch.autograd.functional.hessian(energy_fn, x_ref)
-        # Symmetrise and add jitter
+        H = torch.autograd.functional.hessian(fn, x_ref)
         H = 0.5 * (H + H.T) + jitter * torch.eye(D, dtype=dtype, device=device)
         Sigma_inv = H
 
@@ -171,7 +160,7 @@ def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
             from .sampling import resample_pdmp_path as rsm
 
         samples = rsm(pos_np, vel_np, tim_np, x_ref_np,
-                      N_resample=n_pilot, burnin_frac=0.0)
+                      N_resample=n_pilot, burnin_frac=0.2)
 
         # Only update coordinates with enough active samples
         if is_sticky:

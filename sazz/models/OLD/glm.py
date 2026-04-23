@@ -37,8 +37,8 @@ from typing import Optional, Literal
 import torch
 from torch import Tensor
 
-from .smoke_test import TorchTarget
-from ..utils.warmup import find_reference_glm   # reuse the Adam warm-start
+from ..smoke_test import TorchTarget
+from ...utils.warmup import find_reference_glm   # reuse the Adam warm-start
 
 
 # ===========================================================================
