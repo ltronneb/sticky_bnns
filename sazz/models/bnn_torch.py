@@ -32,15 +32,6 @@ class BNNLikelihood(Likelihood):
         self.layer_sizes = layer_sizes
         self.activation = activation
 
-    # def forward_net(self, beta: Tensor) -> Tensor:
-    #     """Run the BNN forward pass from a flat parameter vector."""
-    #     params = unflatten_params(beta, self.layer_sizes)
-    #     h = self.X
-    #     for i, (W, b) in enumerate(params):
-    #         h = h @ W.T + b
-    #         if i < len(params) - 1:
-    #             h = self.activation(h)
-    #     return h
     def forward_net(self, beta: Tensor) -> Tensor:
         return self.predict(beta, self.X)
 
@@ -102,6 +93,7 @@ class BNNCategoricalLikelihood(BNNLikelihood):
 def make_bnn_regression(X, y, layer_sizes, activation="tanh",
                        prior_std_weight=1.0, prior_std_bias=1.0,
                        fan_in_scaling=True, noise_std=0.1,
+                       covariance_reference="prior",
                        adam_steps=1000, adam_lr=1e-2,
                        dtype=torch.float64, device="cpu"):
     X = X.to(dtype=dtype, device=device)
@@ -119,6 +111,7 @@ def make_bnn_regression(X, y, layer_sizes, activation="tanh",
     x_ref, Sigma_inv = find_reference_bnn(model.energy, D, 
                                           model=model, dtype=dtype,
                                           device=device,
+                                          reference=covariance_reference,
                                           n_steps=adam_steps, lr=adam_lr)
 
     return TorchTarget(
