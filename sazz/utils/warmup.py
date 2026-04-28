@@ -18,6 +18,7 @@ Typical pipeline:
 
 import numpy as np
 import torch
+import math
 from torch import Tensor
 from typing import Optional, Literal, Sequence
 from ..models.models_torch import BayesianModel
@@ -80,35 +81,64 @@ def find_reference_bnn(
     n_steps: int = 4000,
     lr: float = 1e-2,
     model: Optional["BayesianModel"] = None,
-    reference: Literal["prior", "fisher", "hessian"] = "prior",
-    layer_slices: Optional[Sequence[slice]] = None,
-    n_samples_fisher: int = 100,
-    per_layer_clip: bool = False,
-    jitter: float = 1e-6,
+    reference: Literal["prior", "laplace_diag", "adam"] = "laplace_diag",
+    n_fisher_batch: int = 64,
+    floor_eps: float = 1e-8,
 ) -> tuple[Tensor, Tensor]:
     """
-    MAP via Adam + choice of reference precision for BNNs.
+    MAP via Adam + choice of diagonal reference precision for BNNs.
+
+    All three options return a *diagonal* Sigma_inv. The full-Hessian
+    branches were removed: for BNNs the full Hessian is both expensive
+    and unreliable (near-singular directions from symmetry, locality
+    around a single mode), and the right object — the diagonal posterior
+    precision — is what the dynamics actually use for per-coordinate
+    velocity scaling.
 
     Parameters
     ----------
-    reference : {"prior", "fisher", "hessian"}
-        "prior"   — use the prior precision as Sigma_inv. Requires `model`
-                    with a prior exposing precision_diag(). Recommended
-                    default for moderate-to-large BNNs: orbits matched to
-                    prior scale, no tuning needed.
-        "fisher"  — empirical Fisher diagonal with optional per-layer
-                    clipping. Historical behaviour, kept for reproducibility.
-        "hessian" — full Hessian of the energy at the MAP, symmetrised and
-                    jittered. Gives a posterior-matched Sigma_inv that
-                    captures correlations. Suitable for small BNNs (D up
-                    to a few hundred) where the D x D Hessian is cheap
-                    and the posterior is approximately Gaussian around
-                    the MAP.
-    jitter : float
-        Diagonal jitter added to the Hessian for numerical positive-
-        definiteness. Only used when reference="hessian".
+    reference : {"prior", "laplace_diag", "adam"}
+        "prior"        — ignore the data; use the diagonal prior precision
+                         as Sigma_inv. Robust, no tuning, and a sensible
+                         baseline for highly overparameterised BNNs where
+                         most coordinates are barely informed by the data.
+
+        "laplace_diag" — diagonal Laplace approximation. Adds the prior
+                         precision and the diagonal empirical Fisher at
+                         the MAP:
+                             Sigma_inv_ii = prior_prec_i
+                                          + (1/N) * sum_n (d log p(y_n|...) / d beta_i)^2
+                         This is the principled choice: each term has a
+                         clear meaning, the result is positive by
+                         construction, and it reduces to "prior" when the
+                         data is uninformative. Recommended default.
+
+        "adam"         — heuristic. Uses Adam's bias-corrected second-
+                         moment estimate v_hat as a per-coordinate
+                         precision proxy, floored by the prior. Not a
+                         principled estimator of any well-defined
+                         quantity, but works well in practice as a
+                         per-coordinate scaling and is essentially free
+                         (already maintained by the optimiser).
+
+    n_fisher_batch : int
+        Number of data points used to estimate the empirical Fisher
+        diagonal. Only used when reference="laplace_diag". The Fisher
+        is averaged over this many independent data points (sampled
+        without replacement from the likelihood's stored data).
+
+    floor_eps : float
+        Numerical safety floor on the precision diagonal. Should
+        essentially never bind in practice (the prior contribution is
+        already strictly positive).
     """
     fn = model.energy if model is not None else energy_fn
+
+    if reference != "adam" and model is None:
+        raise ValueError(
+            f"reference='{reference}' requires a model argument "
+            "(prior precision is needed)."
+        )
 
     # --- MAP via Adam ---
     beta = torch.randn(D, dtype=dtype, device=device) * 0.01
@@ -121,187 +151,82 @@ def find_reference_bnn(
         optimizer.step()
     x_ref = beta.detach().clone()
 
+    # --- Diagonal precision ---
     if reference == "prior":
-        if model is None:
-            raise ValueError("reference='prior' requires a model argument.")
-        prec = model.prior.precision_diag().to(dtype=dtype, device=device)
-        Sigma_inv = torch.diag(prec)
+        diag_prec = model.prior.precision_diag().to(dtype=dtype, device=device)
 
-    elif reference == "fisher":
-        grad_sq = torch.zeros(D, dtype=dtype, device=device)
-        for _ in range(max(n_samples_fisher, 1)):
-            b = x_ref.clone().requires_grad_(True)
-            g, = torch.autograd.grad(fn(b), b)
-            grad_sq += g ** 2
-        grad_sq /= max(n_samples_fisher, 1)
-
-        if layer_slices is None:
-            layer_slices = [slice(0, D)]
-
-        diag_prec = grad_sq.clone()
-        if per_layer_clip:
-            for sl in layer_slices:
-                block = diag_prec[sl]
-                if block.numel() == 0:
-                    continue
-                diag_prec[sl] = block.clamp(min=1.0, max=1e5)
-        Sigma_inv = torch.diag(diag_prec)
-
-    elif reference == "hessian_weights_only":
-        if model is None:
-            raise ValueError("reference='hessian_weights_only' requires a model.")
-        
-        # Full Hessian
-        H = torch.autograd.functional.hessian(fn, x_ref)
-        H = 0.5 * (H + H.T)
-        
-        # Build a mask for bias coordinates from the layer structure
-        # (Requires knowing which coordinates are biases — pass via model or layer_sizes)
+    elif reference == "laplace_diag":
         prior_prec = model.prior.precision_diag().to(dtype=dtype, device=device)
-        bias_mask = _make_bias_mask(model)  
-        
-        # Replace bias rows/cols with diagonal prior structure
-        for i in range(D):
-            if bias_mask[i]:
-                H[i, :] = 0.0
-                H[:, i] = 0.0
-                H[i, i] = prior_prec[i]
-        
-        H = H + jitter * torch.eye(D, dtype=dtype, device=device)
-        Sigma_inv = H
-        
-    elif reference == "hessian_prior_floor":
-        if model is None:
-            raise ValueError("requires a model.")
-        
-        H = torch.autograd.functional.hessian(fn, x_ref)
-        H = 0.5 * (H + H.T)
-        
-        prior_prec = model.prior.precision_diag().to(dtype=dtype, device=device)
-        
-        # Floor the diagonal: H_ii ← max(H_ii, prior_prec_i)
-        diag_current = H.diagonal()
-        diag_floored = torch.maximum(diag_current, prior_prec)
-        # Replace diagonal
-        H = H - torch.diag(diag_current) + torch.diag(diag_floored)
-        
-        Sigma_inv = H
-        
+        fisher_diag = _empirical_fisher_diag(
+            model, x_ref, n_fisher_batch, dtype, device
+        )
+        diag_prec = prior_prec + fisher_diag
+
     elif reference == "adam":
-        # Use Adam's running second-moment estimate as Sigma_inv diagonal
+        # Adam's bias-corrected second moment as a curvature proxy.
         state = optimizer.state[beta]
         v_hat = state["exp_avg_sq"].clone()
-        
-        # Bias correction (match Adam's internal computation)
         step = state["step"]
         if isinstance(step, torch.Tensor):
             step = step.item()
-        bias_correction = 1.0 - 0.999 ** step  # Adam's beta2
+        beta2 = optimizer.defaults["betas"][1]
+        bias_correction = 1.0 - beta2 ** step
         v_hat = v_hat / bias_correction
-        
-        # Floor by prior precision to avoid coordinates with near-zero gradient
+
+        # Floor by prior precision so flat directions inherit the prior
+        # scale rather than blowing up.
         if model is not None:
             prior_prec = model.prior.precision_diag().to(dtype=dtype, device=device)
-            diag_prec = torch.maximum(v_hat.sqrt(), prior_prec.sqrt()) ** 2
+            diag_prec = torch.maximum(v_hat, prior_prec)
         else:
-            diag_prec = v_hat.clamp(min=1e-4)
-        # diag_prec = v_hat.clamp(min=1e-4)
-        
-        Sigma_inv = torch.diag(diag_prec)
+            diag_prec = v_hat
 
     else:
-        raise ValueError(f"Unknown reference type: {reference}")
+        raise ValueError(
+            f"Unknown reference type: {reference!r}. "
+            "Choose from 'prior', 'laplace_diag', 'adam'."
+        )
 
+    diag_prec = diag_prec.clamp(min=floor_eps)
+    Sigma_inv = torch.diag(diag_prec)
     return x_ref, Sigma_inv
 
-# def find_reference_bnn(
-#     energy_fn,
-#     D: int,
-#     dtype: torch.dtype = torch.float64,
-#     device: torch.device = torch.device("cpu"),
-#     n_steps: int = 4000,
-#     lr: float = 1e-2,
-#     model: Optional["BayesianModel"] = None,
-#     reference: Literal["prior", "fisher"] = "prior",
-#     layer_slices: Optional[Sequence[slice]] = None,
-#     n_samples_fisher: int = 100,
-#     per_layer_clip: bool = False,
-# ) -> tuple[Tensor, Tensor]:
-#     """
-#     MAP via Adam + choice of reference precision for BNNs.
 
-#     Parameters
-#     ----------
-#     reference : {"prior", "fisher"}
-#         "prior"  — use the prior precision as Sigma_inv. Requires `model`
-#                    with a prior exposing precision_diag(). This is the
-#                    recommended default for BNNs: it gives orbits matched
-#                    to the prior scale and requires no tuning.
-#         "fisher" — empirical Fisher diagonal with per-layer clipping.
-#                    Historical behaviour, kept for reproducibility.
-#     """
-#     fn = model.energy if model is not None else energy_fn
+def _empirical_fisher_diag(
+    model: "BayesianModel",
+    x_ref: Tensor,
+    n_batch: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    """
+    Diagonal of the empirical Fisher information at x_ref.
 
-#     # --- MAP via Adam ---
-#     beta = torch.randn(D, dtype=dtype, device=device) * 0.01
-#     beta.requires_grad_(True)
-#     optimizer = torch.optim.Adam([beta], lr=lr)
-#     for _ in range(n_steps):
-#         optimizer.zero_grad()
-#         loss = fn(beta)
-#         loss.backward()
-#         optimizer.step()
-#     x_ref = beta.detach().clone()
+        F_ii = (1/N) * sum_n (d/dbeta_i log p(y_n | x_n, beta_ref))^2
 
-#     if reference == "prior":
-#         if model is None:
-#             raise ValueError("reference='prior' requires a model argument.")
-#         prec = model.prior.precision_diag().to(dtype=dtype, device=device)
-#         Sigma_inv = torch.diag(prec)
+    Uses the likelihood's stored (X, y) buffers. Subsamples n_batch
+    points without replacement. Returns a length-D tensor.
+    """
+    likelihood = model.likelihood
+    X = likelihood.X
+    y = likelihood.y
+    N = X.shape[0]
 
-#     elif reference == "fisher":
-#         grad_sq = torch.zeros(D, dtype=dtype, device=device)
-#         for _ in range(max(n_samples_fisher, 1)):
-#             b = x_ref.clone().requires_grad_(True)
-#             g, = torch.autograd.grad(fn(b), b)
-#             grad_sq += g ** 2
-#         grad_sq /= max(n_samples_fisher, 1)
+    # Subsample without replacement
+    n = min(n_batch, N)
+    idx = torch.randperm(N, device=device)[:n]
 
-#         if layer_slices is None:
-#             layer_slices = [slice(0, D)]
+    D = x_ref.shape[0]
+    fisher = torch.zeros(D, dtype=dtype, device=device)
 
-#         diag_prec = grad_sq.clone()
-#         if per_layer_clip:
-#             for sl in layer_slices:
-#                 block = diag_prec[sl]
-#                 if block.numel() == 0:
-#                     continue
-#                 diag_prec[sl] = block.clamp(min=1.0, max=1e5)
-#         Sigma_inv = torch.diag(diag_prec)
+    for i in idx:
+        b = x_ref.clone().requires_grad_(True)
+        log_p_n = likelihood.log_prob_single(b, X[i:i+1], y[i:i+1])
+        g, = torch.autograd.grad(log_p_n, b)
+        fisher += g.detach() ** 2
 
-#     else:
-#         raise ValueError(f"Unknown reference type: {reference}")
-
-#     return x_ref, Sigma_inv
-
-
-def _make_bias_mask(model) -> Tensor:
-    """Return a boolean mask [D] where True indicates a bias coordinate."""
-    layer_sizes = model.likelihood.layer_sizes
-    D = sum(layer_sizes[i+1] * layer_sizes[i] + layer_sizes[i+1]
-            for i in range(len(layer_sizes)-1))
-    mask = torch.zeros(D, dtype=torch.bool)
-    offset = 0
-    for i in range(len(layer_sizes) - 1):
-        n_W = layer_sizes[i+1] * layer_sizes[i]
-        n_b = layer_sizes[i+1]
-        # Weights: offset to offset+n_W → False
-        offset += n_W
-        # Biases: offset to offset+n_b → True
-        mask[offset:offset+n_b] = True
-        offset += n_b
-    return mask
-
+    fisher /= n
+    return fisher
 
 
 
@@ -389,7 +314,83 @@ def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
 
 
 
+def tune_refresh_rate(
+    sampler,
+    n_pilot: int = 500,
+    floor: float = 1.0 / math.pi,
+    target_ratio: float = 0.7812,
+):
+    """
+    Tune sampler.refresh_rate via a single pilot run.
 
+    Sets
+        lambda_r = max( target_ratio / (1 - target_ratio) * lambda_hat,
+                        floor )
+
+    where lambda_hat = (number of accepted reflections) / (final pilot time).
+
+    The target_ratio = 0.7812 figure is the BPS optimal refresh-to-event
+    ratio from Bouchard-Côté et al. (2018), borrowed here as a heuristic
+    for the Boomerang. The geometric floor 1/pi is Boomerang-specific:
+    refreshment must occur before the trajectory completes a half-orbit
+    (Section 5.4 of the docs), otherwise bounces within an orbit can
+    cancel and the sampler degenerates toward the reference measure.
+
+    Sticky-aware: freeze and thaw events are NOT counted as reflections.
+    Only velocity-flip events ('bounce' with accepted=True) contribute to
+    lambda_hat.
+
+    Parameters
+    ----------
+    sampler : an Automatic{Sticky}BoomerangSampler
+        Must already have x_ref / Sigma_inv set (call preprocess first).
+    n_pilot : int
+        Number of skeleton points in the pilot run.
+    floor : float
+        Lower bound on lambda_r. Default 1/pi.
+    target_ratio : float
+        Desired lambda_r / (lambda_r + lambda_hat). Default 0.7812.
+
+    Returns
+    -------
+    dict with keys:
+        "lambda_r_old"   : refresh rate before adaptation
+        "lambda_r_new"   : refresh rate after adaptation
+        "lambda_hat"     : empirical reflection rate
+        "n_bounces"      : number of accepted reflection events
+        "T_pilot"        : final simulation time of the pilot run
+        "floor_active"   : True if the geometric floor was hit
+    """
+    assert sampler.x_ref is not None, "Call preprocess() before tuning."
+
+    lambda_r_old = sampler.refresh_rate
+    result = sampler.sample(N=n_pilot, diagnostics=False)
+
+    # Count accepted reflections (NOT freeze, thaw, refresh, or rejected bounces)
+    diag = result["diagnostics"]
+    n_bounces = sum(
+        1 for row in diag
+        if row["event_type"] == "bounce" and row["accepted"] is True
+    )
+
+    T_pilot = float(result["times"][-1])
+    if T_pilot <= 0.0:
+        raise RuntimeError("Pilot run produced no simulation time.")
+
+    lambda_hat = n_bounces / T_pilot
+    lambda_bps = (target_ratio / (1.0 - target_ratio)) * lambda_hat
+    lambda_r_new = max(lambda_bps, floor)
+    floor_active = lambda_bps < floor
+
+    sampler.refresh_rate = lambda_r_new
+    return {
+        "lambda_r_old": lambda_r_old,
+        "lambda_r_new": lambda_r_new,
+        "lambda_hat": lambda_hat,
+        "n_bounces": n_bounces,
+        "T_pilot": T_pilot,
+        "floor_active": floor_active,
+    }
 
 
 # def warmup(sampler, n_rounds=3, n_pilot=500,

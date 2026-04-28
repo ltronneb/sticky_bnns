@@ -60,7 +60,7 @@ class BNNGaussianPrior(Prior):
 
     def precision_diag(self) -> Tensor:
         return self._precision
-
+    
 
 class BNNGaussianLikelihood(BNNLikelihood):
     """Regression: y | x, beta ~ N(f(x; beta), noise_std^2)."""
@@ -68,26 +68,70 @@ class BNNGaussianLikelihood(BNNLikelihood):
         super().__init__(X, y, layer_sizes, activation)
         self.noise_std = noise_std
 
-    def log_prob(self, beta: Tensor) -> Tensor:
-        preds = self.forward_net(beta).squeeze(-1)
+    def log_prob_single(self, beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
+        """Log-likelihood on an arbitrary (X_i, y_i) — used by the
+        empirical Fisher estimator in find_reference_bnn."""
+        preds = self.predict(beta, X_i).squeeze(-1)
         dist = Normal(preds, self.noise_std)
-        return dist.log_prob(self.y).sum()
+        return dist.log_prob(y_i).sum()
+
+    def log_prob(self, beta: Tensor) -> Tensor:
+        return self.log_prob_single(beta, self.X, self.y)
 
 
 class BNNBernoulliLikelihood(BNNLikelihood):
     """Binary classification: y | x, beta ~ Bernoulli(sigmoid(f(x; beta)))."""
-    def log_prob(self, beta: Tensor) -> Tensor:
-        logits = self.forward_net(beta).squeeze(-1)
+
+    def log_prob_single(self, beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
+        """Log-likelihood on an arbitrary (X_i, y_i) — used by the
+        empirical Fisher estimator in find_reference_bnn."""
+        logits = self.predict(beta, X_i).squeeze(-1)
         dist = Bernoulli(logits=logits)
-        return dist.log_prob(self.y.to(logits.dtype)).sum()
+        return dist.log_prob(y_i.to(logits.dtype)).sum()
+
+    def log_prob(self, beta: Tensor) -> Tensor:
+        return self.log_prob_single(beta, self.X, self.y)
 
 
 class BNNCategoricalLikelihood(BNNLikelihood):
     """Multiclass: y | x, beta ~ Categorical(softmax(f(x; beta)))."""
-    def log_prob(self, beta: Tensor) -> Tensor:
-        logits = self.forward_net(beta)
+
+    def log_prob_single(self, beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
+        """Log-likelihood on an arbitrary (X_i, y_i) — used by the
+        empirical Fisher estimator in find_reference_bnn."""
+        logits = self.predict(beta, X_i)
         dist = Categorical(logits=logits)
-        return dist.log_prob(self.y.long()).sum()
+        return dist.log_prob(y_i.long()).sum()
+
+    def log_prob(self, beta: Tensor) -> Tensor:
+        return self.log_prob_single(beta, self.X, self.y)
+    
+# class BNNGaussianLikelihood(BNNLikelihood):
+#     """Regression: y | x, beta ~ N(f(x; beta), noise_std^2)."""
+#     def __init__(self, X, y, layer_sizes, activation, noise_std: float = 0.1):
+#         super().__init__(X, y, layer_sizes, activation)
+#         self.noise_std = noise_std
+
+#     def log_prob(self, beta: Tensor) -> Tensor:
+#         preds = self.forward_net(beta).squeeze(-1)
+#         dist = Normal(preds, self.noise_std)
+#         return dist.log_prob(self.y).sum()
+
+
+# class BNNBernoulliLikelihood(BNNLikelihood):
+#     """Binary classification: y | x, beta ~ Bernoulli(sigmoid(f(x; beta)))."""
+#     def log_prob(self, beta: Tensor) -> Tensor:
+#         logits = self.forward_net(beta).squeeze(-1)
+#         dist = Bernoulli(logits=logits)
+#         return dist.log_prob(self.y.to(logits.dtype)).sum()
+
+
+# class BNNCategoricalLikelihood(BNNLikelihood):
+#     """Multiclass: y | x, beta ~ Categorical(softmax(f(x; beta)))."""
+#     def log_prob(self, beta: Tensor) -> Tensor:
+#         logits = self.forward_net(beta)
+#         dist = Categorical(logits=logits)
+#         return dist.log_prob(self.y.long()).sum()
     
     
 def make_bnn_regression(X, y, layer_sizes, activation="tanh",

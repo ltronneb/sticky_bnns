@@ -7,6 +7,7 @@ No nn.Module — everything operates on flat parameter vectors.
 
 from typing import List
 import torch
+import math
 from torch import Tensor
 from typing import Optional, Sequence, Union
 
@@ -178,6 +179,97 @@ def make_kappa_vector_bnn(
         )
     return torch.cat(kappas)
 
+
+def make_kappa_from_inclusion(
+    layer_sizes: List[int],
+    prior_std_weight: float,
+    prior_inclusion_weight: Union[float, Sequence[float]] = 0.5,
+    fan_in_scaling: bool = True,
+    bias_thaw: float = 1e6,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device = torch.device("cpu"),
+) -> Tensor:
+    """
+    Per-coordinate kappa vector for the sticky sampler, derived from a
+    spike-and-slab prior with Gaussian slabs.
+
+    For a spike-and-slab prior on weight i,
+        beta_i ~ w_i * delta_0 + (1 - w_i) * N(0, sigma_w_i^2),
+    the correct stickiness parameter is
+
+        kappa_w_i = (w_i / (1 - w_i)) * (1 / (sigma_w_i * sqrt(2*pi))).
+
+    Larger kappa = larger thaw rate = shorter freeze time = LESS sticky.
+
+    The slab std `sigma_w_l` is taken from `prior_std_weight` with the
+    same optional fan-in scaling used by `_build_prior_precision`, so the
+    slab in the prior and the slab in this formula are the *same object*
+    by construction.
+
+    Biases use a separate mechanism: there is typically no reason to
+    place a Dirac spike at zero on a bias, so they are kept effectively
+    never-sticky via `bias_thaw` (a numerical stand-in for kappa -> inf).
+    This is NOT the formula above evaluated at w_b = 1 — that would be
+    infinite — it is a separate modelling choice.
+
+    Parameters
+    ----------
+    layer_sizes : list of int
+        Network architecture, e.g. [d_in, h1, h2, d_out].
+    prior_std_weight : float
+        Slab std for weights. Must match what was passed to
+        BNNGaussianPrior.
+    prior_inclusion_weight : float or sequence of float
+        Prior probability that a weight is non-zero, w_l. Either a
+        scalar (same w across layers) or a sequence of length
+        len(layer_sizes) - 1 (one w per layer). Must be in (0, 1).
+        Default 0.5 = "no sparsity opinion".
+    fan_in_scaling : bool
+        If True, sigma_w_l = prior_std_weight / sqrt(d_in_l). Must
+        match the value used in BNNGaussianPrior.
+    bias_thaw : float
+        Thaw rate used for bias coordinates. Large values keep biases
+        effectively always active. Default 1e6.
+
+    Returns
+    -------
+    Tensor [D]
+        Flat kappa vector aligned with the (W_1, b_1, W_2, b_2, ...)
+        layout used by `unflatten_params`.
+    """
+    n_layers = len(layer_sizes) - 1
+    w = _broadcast_per_layer(
+        prior_inclusion_weight, n_layers, name="prior_inclusion_weight"
+    )
+    for w_l in w:
+        if not (0.0 < w_l < 1.0):
+            raise ValueError(
+                f"prior_inclusion_weight must be strictly in (0, 1); got {w_l}."
+            )
+
+    sqrt_2pi = math.sqrt(2.0 * math.pi)
+
+    kappas = []
+    for layer_idx, (W_shape, b_shape) in enumerate(layer_shapes(layer_sizes)):
+        n_weights = W_shape[0] * W_shape[1]
+        n_biases = b_shape[0]
+        n_in = layer_sizes[layer_idx]
+
+        sigma_w_l = (
+            prior_std_weight / (n_in ** 0.5) if fan_in_scaling else prior_std_weight
+        )
+
+        w_l = w[layer_idx]
+        kappa_w_l = (w_l / (1.0 - w_l)) * (1.0 / (sigma_w_l * sqrt_2pi))
+
+        kappas.append(
+            torch.full((n_weights,), kappa_w_l, dtype=dtype, device=device)
+        )
+        kappas.append(
+            torch.full((n_biases,), bias_thaw, dtype=dtype, device=device)
+        )
+
+    return torch.cat(kappas)
 
 # ---------------------------------------------------------------------------
 # Find reference BNNs

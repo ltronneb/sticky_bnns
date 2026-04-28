@@ -28,3 +28,4 @@ class BayesianModel(nn.Module):
             E = self.energy(b)
             g, = torch.autograd.grad(E, b)
         return g
+
