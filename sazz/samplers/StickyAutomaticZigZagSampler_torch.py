@@ -1,51 +1,69 @@
 """
-AutomaticStickyBoomerangSampler.py
+StickyAutomaticZigZagSampler.py
 
-Sticky Boomerang sampler in PyTorch, inheriting from AutomaticBoomerangSampler.
+Sticky Zig-Zag sampler in PyTorch, inheriting from AutomaticZigZagSampler.
 Merges the Brent and PLI sticky variants into a single class.
 
-Adds three mechanics on top of the base Boomerang:
-  - **Freeze**: when an active coordinate's trajectory hits x_i = 0,
-    that coordinate is frozen (set to zero with zero velocity) and a
-    thaw deadline is drawn from Exp(kappa_i * |v_i|).
-  - **Thaw**: when the thaw deadline fires, the coordinate is
-    reactivated with its stored pre-freeze velocity.
-  - **Active-subspace reflection & refresh**: reflections and velocity
-    refreshments act only on the unfrozen (active) coordinates.
+Adds three mechanics on top of the base Zig-Zag:
+  - **Freeze**: when an active coordinate's linear trajectory hits
+    x_i = 0, that coordinate is frozen (clamped to zero with zero
+    velocity) and a thaw deadline is drawn from Exp(kappa_i * |v_i|),
+    where v_i is the *pre-freeze* velocity (always +/- 1 for Zig-Zag).
+  - **Thaw**: when the deadline fires, the coordinate is reactivated
+    with its stored pre-freeze velocity.
+  - **Active-subspace flip**: events flip a single coordinate from the
+    active (unfrozen) set, sampled from the categorical proportional to
+    the per-coordinate switching rates restricted to active coords. The
+    gamma floor only applies to active coords (otherwise frozen coords
+    would carry rate gamma and could be picked).
 
 All freeze/thaw/hit-detection logic is OFF the computational graph
-(scheduling decisions).  The on-graph chain remains:
-    trajectory → gradU → reflect → store skeleton point.
+(scheduling decisions). The on-graph chain remains:
+    trajectory -> grad_target -> flip -> store skeleton point.
 
+Notes vs. sticky Boomerang
+--------------------------
+- Hitting time is the simplest possible: t_i = -x_i / v_i, taken over
+  active coords with v_i moving toward zero (sign(v_i) = -sign(x_i)).
+  No 2π wrap, no trig.
+- No reference measure, no velocity refresh clock. Cold start, when
+  enabled, freezes every coordinate with finite kappa at initialisation
+  rather than thresholding |x_ref| (since there is no x_ref).
+- A frozen coordinate is detected on the skeleton by v_i == 0 (active
+  Zig-Zag velocities are always exactly +/- 1).
 """
 
-import math
 import time as _time
 from functools import partial
 from typing import Optional, Literal
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch import Tensor
 from tqdm import tqdm
 
-from .AutomaticBoomerangSampler import AutomaticBoomerangSampler
+from sazz.utils.bounding import brent, piecewise_thinning
+
+from .AutomaticZigZagSampler_torch import AutomaticZigZagSampler
 
 
-class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
+class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
     """
-    Sticky Boomerang sampler with automatic rate bounding.
+    Sticky Zig-Zag sampler with automatic rate bounding.
 
     Parameters
     ----------
     kappa : float | Tensor
-        Stickiness parameter(s).  Scalar broadcasts to all coordinates;
+        Stickiness parameter(s). Scalar broadcasts to all coordinates;
         a 1-D tensor of length D gives per-coordinate stickiness.
-    cold_start_threshold : float | None
-        If set, coordinates with |x_ref_i| < threshold are frozen at
-        initialisation with a synthetic thaw deadline.
-    (all other parameters inherited from AutomaticBoomerangSampler)
+        Recall the convention: larger kappa = faster thawing = less
+        sticky. kappa = 0 means permanently frozen. To exempt a
+        coordinate (e.g. an intercept), set kappa_i to a large value
+        like 1e6 so it thaws instantly.
+    cold_start_threshold : bool | None
+        If True (or any truthy value), freeze all coordinates with
+        finite kappa at initialisation. Default None (off).
+    (all other parameters inherited from AutomaticZigZagSampler)
     """
 
     def __init__(
@@ -53,20 +71,22 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         grad_target,
         D: int,
         kappa: float = 1.0,
-        refresh_rate: float = 0.1,
-        thinning: Literal["brent", "pli"] = "pli",
         t_max: float = 1.0,
+        gamma: float = 0.01,
+        thinning: Literal["brent", "pli"] = "pli",
+        adapt_t_max: bool = False,
         pli_kwargs: Optional[dict] = None,
-        cold_start_threshold: Optional[float] = None,
+        cold_start_threshold: Optional[bool] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
     ):
         super().__init__(
             grad_target=grad_target,
             D=D,
-            refresh_rate=refresh_rate,
-            thinning=thinning,
             t_max=t_max,
+            gamma=gamma,
+            thinning=thinning,
+            adapt_t_max=adapt_t_max,
             pli_kwargs=pli_kwargs,
             dtype=dtype,
             device=device,
@@ -90,10 +110,9 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
     # ------------------------------------------------------------------
     def trajectory_sticky(self, t: float, x: Tensor, v: Tensor):
         """
-        Boomerang trajectory with frozen coordinates clamped to zero.
+        Linear Zig-Zag trajectory with frozen coords clamped to zero.
         """
         x_t, v_t = self.trajectory(t, x, v)
-        # Zero out frozen coords (detach-safe: in-place on clones)
         x_t = x_t.clone()
         v_t = v_t.clone()
         x_t[self.frozen_mask] = 0.0
@@ -105,7 +124,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _freeze(self, i: int, v: Tensor, current_time: float):
-        """Freeze coordinate i: record velocity, draw thaw deadline."""
+        """Freeze coord i: store its (pre-freeze) velocity, draw thaw deadline."""
         self.frozen_mask[i] = True
         self.frozen_velocity[i] = v[i].item()
         rate_i = self.kappa[i].item() * abs(v[i].item())
@@ -118,7 +137,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
 
     @torch.no_grad()
     def _thaw(self, i: int):
-        """Thaw coordinate i: clear mask and deadline."""
+        """Thaw coord i: clear mask and deadline."""
         self.frozen_mask[i] = False
         self.thaw_deadline[i] = float("inf")
 
@@ -128,42 +147,39 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
     @torch.no_grad()
     def _next_hitting_event(self, x: Tensor, v: Tensor):
         """
-        Find the earliest time an active coordinate's trajectory hits x_i = 0.
+        Find the earliest time an active coordinate's linear trajectory
+        hits x_i = 0.
 
-        Solves  a*cos(t) + b*sin(t) = c  per active coordinate, where
-            a = x_i - x_ref_i,  b = v_i,  c = -x_ref_i.
+        Solves  x_i + t * v_i = 0  =>  t_i = -x_i / v_i  per active coord,
+        keeping only positive solutions (i.e. coords moving toward zero).
 
-        Returns (dt_hit, i_hit).  dt_hit = inf if no hit exists.
+        Returns (dt_hit, i_hit). dt_hit = inf if no active coord is
+        moving toward zero.
         """
+        x_np = x.cpu().numpy()
+        v_np = v.cpu().numpy()
+        active_np = (~self.frozen_mask).cpu().numpy()
+
         t_hit = float("inf")
         i_hit = None
 
-        active_indices = torch.where(~self.frozen_mask)[0]
-        x_np = x.cpu().numpy()
-        v_np = v.cpu().numpy()
-        xref_np = self.x_ref.cpu().numpy()
+        for i in np.flatnonzero(active_np):
+            xi = float(x_np[i])
+            vi = float(v_np[i])
 
-        for idx in active_indices:
-            i = idx.item()
-            a = float(x_np[i] - xref_np[i])
-            b = float(v_np[i])
-            c = float(-xref_np[i])
-
-            R = math.hypot(a, b)
-            if R < 1e-14:
+            # Skip degenerate cases:
+            #   |v_i| ~ 0: not moving (shouldn't happen for active coords,
+            #              but guard anyway)
+            #   x_i ~ 0:   already at zero (would freeze instantly; the
+            #              previous skeleton point should have caught this)
+            if abs(vi) < 1e-14:
                 continue
-            if abs(c) > R + 1e-14:
-                continue  # no solution exists
+            if abs(xi) < 1e-14:
+                continue
 
-            phi = math.atan2(b, a)
-            delta = math.acos(max(-1.0, min(1.0, c / R)))
-
-            t_i = float("inf")
-            for base in (phi - delta, phi + delta):
-                candidate = base % (2.0 * math.pi)
-                if candidate < 1e-10:
-                    candidate += 2.0 * math.pi
-                t_i = min(t_i, candidate)
+            t_i = -xi / vi
+            if t_i <= 0.0:
+                continue  # moving away from zero
 
             if t_i < t_hit:
                 t_hit = t_i
@@ -187,67 +203,43 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         return dt_thaw, i_thaw
 
     # ------------------------------------------------------------------
-    # Active-subspace reflection — ON graph
-    # ------------------------------------------------------------------
-    def reflect_velocity_sticky(self, v: Tensor, grad: Tensor) -> Tensor:
-        """
-        Boomerang reflection restricted to the active (unfrozen) subspace.
-        Falls back to full reflection when nothing is frozen.
-        """
-        if not torch.any(self.frozen_mask):
-            return self.reflect_velocity(v, grad)
-
-        active = ~self.frozen_mask
-        v_new = v.clone()
-
-        v_a = v[active]
-        g_a = grad[active]
-        Sigma_a = self.Sigma[active][:, active]
-
-        rate = torch.dot(v_a, g_a)
-        Sigma_g = Sigma_a @ g_a
-        denom = torch.dot(g_a, Sigma_g)
-
-        if denom.item() <= 1e-14:
-            return v_new
-
-        v_new[active] = v_a - 2.0 * rate / denom * Sigma_g
-        v_new[self.frozen_mask] = 0.0
-        return v_new
-
-    # ------------------------------------------------------------------
-    # Active-subspace velocity refresh — OFF graph
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def _refresh_velocity_sticky(self) -> Tensor:
-        """Sample velocity from N(0, Sigma) on active coords only."""
-        v = torch.zeros(self.D, dtype=self.dtype, device=self.device)
-        active = ~self.frozen_mask
-
-        if torch.any(active):
-            n_active = int(active.sum().item())
-            Sigma_a = self.Sigma[active][:, active]
-            jitter = 1e-12 * torch.eye(n_active, dtype=self.dtype, device=self.device)
-            chol_a = torch.linalg.cholesky(Sigma_a + jitter)
-            z = torch.randn(n_active, dtype=self.dtype, device=self.device)
-            v[active] = chol_a @ z
-
-        return v
-
-    # ------------------------------------------------------------------
     # Rate function for sticky dynamics — OFF graph
     # ------------------------------------------------------------------
     def _rate_numpy_sticky(self, t: float, x_np: np.ndarray, v_np: np.ndarray) -> float:
         """
-        Rate along the sticky trajectory (frozen coords zeroed).
-        Used by the bounding utilities.
+        Total Zig-Zag switching rate at time t along the *sticky* linear
+        trajectory:
+            lambda(t) = sum_{i active} max(0, v_i * grad_i U(x + t v)) + gamma
+        Frozen coords contribute zero (their v_i and x_i are clamped via
+        trajectory_sticky); the gamma floor is applied only to the
+        active subset.
         """
         with torch.no_grad():
             x = torch.as_tensor(x_np, dtype=self.dtype, device=self.device)
             v = torch.as_tensor(v_np, dtype=self.dtype, device=self.device)
             x_t, v_t = self.trajectory_sticky(t, x, v)
-            inner = torch.dot(v_t, self.gradU(x_t))
-        return float(inner)
+            grad = self.grad_target(x_t)
+            per_coord = torch.clamp(v_t * grad, min=0.0) + self.gamma
+            # Restrict gamma floor to active coords
+            per_coord = per_coord * (~self.frozen_mask).to(self.dtype)
+            rate = per_coord.sum()
+        return float(rate)
+
+    def _per_coord_rates_numpy_sticky(
+        self, t: float, x_np: np.ndarray, v_np: np.ndarray
+    ) -> np.ndarray:
+        """
+        Per-coordinate rates (active coords only; frozen coords get 0)
+        used to draw which active coordinate to flip at an event.
+        """
+        with torch.no_grad():
+            x = torch.as_tensor(x_np, dtype=self.dtype, device=self.device)
+            v = torch.as_tensor(v_np, dtype=self.dtype, device=self.device)
+            x_t, v_t = self.trajectory_sticky(t, x, v)
+            grad = self.grad_target(x_t)
+            per_coord = torch.clamp(v_t * grad, min=0.0) + self.gamma
+            per_coord = per_coord * (~self.frozen_mask).to(self.dtype)
+        return per_coord.detach().cpu().numpy().astype(np.float64)
 
     # ------------------------------------------------------------------
     # Override: event-time finding uses sticky rate
@@ -271,17 +263,17 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
     def _brent_bound_sticky(
         self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
     ) -> tuple[float, dict]:
-        from sazz.utils.bounding import brent
-
         neg_rate_fn = lambda t: -max(self._rate_numpy_sticky(t, pos_np, vel_np), 0.0)
 
         x_star, stats = brent(neg_rate_fn, 0.0, horizon, diagnostics=True)
+        # if x_star > horizon:
+        #     x_star = horizon
         lambda_max = max(-neg_rate_fn(x_star), 0.0)
 
         if lambda_max <= 1e-14:
             tau_star = float("inf")
         else:
-            tau_star = -math.log(np.random.random()) / lambda_max
+            tau_star = -np.log(np.random.random()) / lambda_max
 
         stats["lambda_max"] = lambda_max
         stats["tau"] = tau_star
@@ -290,10 +282,8 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
     def _pli_bound_sticky(
         self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
     ) -> tuple[float, dict]:
-        from sazz.utils.bounding import piecewise_thinning_sinusoidal_second_order
-
         rate_fn = partial(self._rate_numpy_sticky, x_np=pos_np, v_np=vel_np)
-        tau, stats = piecewise_thinning_sinusoidal_second_order(
+        tau, stats = piecewise_thinning(
             rate_fn, horizon, diagnostics=True, **self.pli_kwargs
         )
         return tau, stats
@@ -308,7 +298,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         self.thaw_deadline.fill_(float("inf"))
 
     # ------------------------------------------------------------------
-    # Cold start: optionally freeze near-zero coordinates at init
+    # Cold start: optionally freeze all coords with finite kappa at init
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _apply_cold_start(self, positions, velocities):
@@ -329,25 +319,24 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
     # @torch.no_grad()
     # def _apply_cold_start(self, positions: Tensor, velocities: Tensor):
     #     """
-    #     Freeze coordinates whose x_ref is near zero, giving the sampler
-    #     a sparse initialisation.
+    #     Freeze every coordinate with kappa < 1e5 at initialisation.
+    #     Each frozen coord gets a thaw deadline drawn from
+    #     Exp(kappa_i * |v_i^(0)|) where v_i^(0) is the initial +/- 1
+    #     velocity that was just sampled.
     #     """
-    #     if self.cold_start_threshold is None:
+    #     if not self.cold_start_threshold:
     #         return
 
     #     for i in range(self.D):
-    #         if (
-    #             abs(self.x_ref[i].item()) < self.cold_start_threshold
-    #             and self.kappa[i].item() < 1e5
-    #         ):
-    #             v_draw = abs(self.Sigma_sqrt[i, i].item() * np.random.randn())
-    #             rate_i = self.kappa[i].item() * v_draw
+    #         if self.kappa[i].item() < 1e5:
+    #             v_init = float(velocities[0, i].item())
+    #             rate_i = self.kappa[i].item() * abs(v_init)
     #             if rate_i < 1e-14:
     #                 continue
     #             positions[0, i] = 0.0
     #             velocities[0, i] = 0.0
     #             self.frozen_mask[i] = True
-    #             self.frozen_velocity[i] = 0.0
+    #             self.frozen_velocity[i] = v_init
     #             self.thaw_deadline[i] = float(np.random.exponential(1.0 / rate_i))
 
     # ------------------------------------------------------------------
@@ -360,14 +349,12 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         diagnostics: bool = True,
     ) -> dict:
         """
-        Run the Sticky Boomerang sampler for N skeleton points.
+        Run the Sticky Zig-Zag sampler for N skeleton points.
 
         Returns dict with keys:
             "positions", "velocities", "times", "diagnostics",
             "gradient_evals", "frozen_mask_final"
         """
-        assert self.x_ref is not None, "Call preprocess() first."
-
         # --- Storage ---
         positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
         velocities = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
@@ -377,22 +364,24 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         self._reset_sticky_state()
 
         if x0 is None:
-            positions[0] = self.x_ref + self._refresh_velocity()
+            positions[0] = torch.randn(self.D, dtype=self.dtype, device=self.device)
         else:
             positions[0] = x0.to(dtype=self.dtype, device=self.device)
-        velocities[0] = self._refresh_velocity()
+        velocities[0] = self._initial_velocity()
         times[0] = 0.0
 
         # Optional cold start
         self._apply_cold_start(positions, velocities)
 
-        dt_refresh = float(np.random.exponential(1.0 / self.refresh_rate))
         time_passed = 0.0
         current_time = 0.0
         grad_evals = 0
         diag_log = []
 
-        pbar = tqdm(total=N, desc="Sticky Boomerang", unit="skel")
+        # Local working copy of t_max so adaptation doesn't mutate self.t_max
+        t_max = self.t_max
+
+        pbar = tqdm(total=N, desc=f"Sticky ZigZag[{self.thinning}]", unit="skel")
         pbar.update(1)
         iteration = 1
 
@@ -410,10 +399,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
             dt_hit, i_hit = self._next_hitting_event(pos, vel)
             dt_thaw, i_thaw = self._next_thaw_event(current_time)
 
-            if self.thinning == "brent":
-                horizon = min(self.t_max, dt_refresh, dt_hit, dt_thaw)
-            else:
-                horizon = min(dt_refresh, dt_hit, dt_thaw)
+            horizon = min(t_max, dt_hit, dt_thaw)
 
             # --- Find bounce event time (OFF graph) ---
             tau, stats = self._find_event_time(pos.detach(), vel.detach(), horizon)
@@ -461,7 +447,8 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
                         row["accepted"] = False
                         time_passed += tau
                         current_time += tau
-                        dt_refresh -= tau
+                        if self.adapt_t_max:
+                            t_max *= 1.01
                 else:  # PLI: returned event is already accepted
                     row["event_type"] = "bounce"
                     row["accepted"] = True
@@ -470,35 +457,55 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
             # ---- Materialise accepted bounce ON graph ----
             if event_accepted:
                 current_time += tau
+
+                # Re-evaluate trajectory ON graph at the accepted time
                 pos_prop, vel_prop = self.trajectory_sticky(
                     time_passed + tau, x_prev, v_prev
                 )
-                grad_at_prop = self.gradU(pos_prop)
-                vel_reflected = self.reflect_velocity_sticky(vel_prop, grad_at_prop)
 
-                positions[n] = pos_prop.detach()
-                velocities[n] = vel_reflected.detach()
-                times[n] = times[n - 1] + time_passed + tau
+                # Pick which active coord to flip from the categorical
+                # over per-coord rates at the event time. Off graph.
+                pos_np = pos_prop.detach().cpu().numpy()
+                vel_np = vel_prop.detach().cpu().numpy()
+                rates_i = self._per_coord_rates_numpy_sticky(0.0, pos_np, vel_np)
+                total = rates_i.sum()
+                if total <= 1e-14:
+                    # Degenerate fallback: uniform pick over active coords
+                    active_idx = np.flatnonzero(
+                        (~self.frozen_mask).cpu().numpy()
+                    )
+                    i_flip = int(np.random.choice(active_idx))
+                else:
+                    probs = rates_i / total
+                    i_flip = int(np.argmax(np.random.multinomial(1, probs)))
 
+                vel_flipped = self.flip_velocity(vel_prop, i_flip)
                 grad_evals += 1
                 row["rate_evals"] += 1
+                row["flipped_coord"] = i_flip
+
+                positions[n] = pos_prop.detach()
+                velocities[n] = vel_flipped.detach()
+                times[n] = times[n - 1] + time_passed + tau
 
                 iteration += 1
                 time_passed = 0.0
-                dt_refresh -= tau
                 pbar.update(1)
 
-            # ---- Horizon fired: freeze, thaw, or fall-through ----
+                if self.adapt_t_max:
+                    t_max *= 0.96
+
+            # ---- Horizon fired: freeze, thaw, or no_event ----
             elif tau >= horizon:
                 time_passed += horizon
                 current_time += horizon
-                dt_refresh -= horizon
 
                 tol = 1e-12
 
                 # --- Freeze event ---
                 if abs(horizon - dt_hit) < tol and i_hit is not None:
                     row["event_type"] = "freeze"
+                    row["frozen_coord"] = i_hit
                     with torch.no_grad():
                         pos_now, vel_now = self.trajectory_sticky(
                             time_passed, x_prev, v_prev
@@ -520,6 +527,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
                 # --- Thaw event ---
                 elif abs(horizon - dt_thaw) < tol and i_thaw is not None:
                     row["event_type"] = "thaw"
+                    #row["thawed_coord"] = i_thaw
                     with torch.no_grad():
                         pos_now, vel_now = self.trajectory_sticky(
                             time_passed, x_prev, v_prev
@@ -537,48 +545,11 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
                     pbar.update(1)
 
                 else:
-                    # No structural event — just time advance (no_event)
+                    # No structural event — t_max ran out without bounce
                     if row["event_type"] is None:
                         row["event_type"] = "no_event"
-
-            # ---- Velocity refresh ----
-            if dt_refresh <= 1e-14:
-                row["wall_seconds"] = _time.perf_counter() - _t0
-                diag_log.append(row)
-
-                refresh_row = {
-                    "rate_evals": 0,
-                    "horizon": 0.0,
-                    "time": current_time,
-                    "event_type": "refresh",
-                    "accepted": None,
-                    "n_frozen": int(self.frozen_mask.sum().item()),
-                    "n_active": self.D - int(self.frozen_mask.sum().item()),
-                    "sparsity": int(self.frozen_mask.sum().item()) / self.D,
-                    "wall_seconds": 0.0,
-                    "proposals": 0,
-                    "bound_violations": 0,
-                    "max_ratio": 0.0,
-                }
-
-                if iteration < N:
-                    n = iteration
-                    with torch.no_grad():
-                        pos_ref, _ = self.trajectory_sticky(
-                            time_passed, positions[n - 1], velocities[n - 1]
-                        )
-                    positions[n] = pos_ref
-                    velocities[n] = self._refresh_velocity_sticky()
-                    times[n] = times[n - 1] + time_passed
-
-                    iteration += 1
-                    time_passed = 0.0
-                    pbar.update(1)
-
-                dt_refresh = float(np.random.exponential(1.0 / self.refresh_rate))
-                diag_log.append(refresh_row)
-                pbar.set_postfix_str(f"t={current_time:.3f}", refresh=False)
-                continue
+                    if self.adapt_t_max:
+                        t_max *= 1.01
 
             row["wall_seconds"] = _time.perf_counter() - _t0
             pbar.set_postfix_str(f"t={current_time:.3f}", refresh=False)
@@ -637,7 +608,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
             print(f"Accepted bounces : {n_accept}")
 
         print("\n=== Event breakdown ===")
-        for etype in ["bounce", "freeze", "thaw", "refresh", "no_event"]:
+        for etype in ["bounce", "freeze", "thaw", "no_event"]:
             sub = df[df["event_type"] == etype]
             if len(sub) > 0:
                 print(

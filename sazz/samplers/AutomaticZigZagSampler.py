@@ -62,7 +62,7 @@ class AutomaticZigZagSampler:
             rate_time = partial(self.neg_rate,pos0=pos,vel=vel)
 
             # Optimize bound on rate
-            x_star = brent(rate_time,0,self.t_max) # Find time point at which rate is maximum
+            x_star, _ = brent(rate_time,0,self.t_max) # Find time point at which rate is maximum
             #print("x_star" + str(x_star))
             if (x_star > self.t_max):
                 x_star = self.t_max

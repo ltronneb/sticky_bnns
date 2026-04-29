@@ -265,9 +265,9 @@ def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
         x_ref_np = sampler.x_ref.cpu().numpy()
 
         if is_sticky:
-            from .sampling import resample_pdmp_path_sticky as rsm
+            from .sampling import resample_boomerang_path_sticky as rsm
         else:
-            from .sampling import resample_pdmp_path as rsm
+            from .sampling import resample_boomerang_path as rsm
 
         samples = rsm(pos_np, vel_np, tim_np, x_ref_np,
                       N_resample=n_pilot, burnin_frac=0.2)
