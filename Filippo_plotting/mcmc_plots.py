@@ -132,6 +132,7 @@ def better_pairs(
     figsize: tuple | None = None,
     title: str | None = None,
     draw_labels: bool = False,
+    fig=None,
 ):
     """
     Pairs plot for MCMC samples with 2-D histogram contours.
@@ -197,7 +198,10 @@ def better_pairs(
     n_bins = max(20, int(100 / resol))
     colors = _spectral_colors(len(clevels))
 
-    fig, axes = plt.subplots(d, d, figsize=figsize)
+    if fig is None:
+        fig, axes = plt.subplots(d, d, figsize=figsize)
+    else:
+        axes = fig.subplots(d, d)
     if d == 1:
         axes = np.array([[axes]])
     axes = np.atleast_2d(axes)
@@ -237,5 +241,9 @@ def better_pairs(
     if title:
         fig.suptitle(title, fontsize=12, y=1.01)
 
-    plt.tight_layout()
+    #plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass
     return fig, axes

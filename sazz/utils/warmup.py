@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import math
 from torch import Tensor
-from typing import Optional, Literal, Sequence
+from typing import Optional, Literal
 from ..models.models_torch import BayesianModel
 
 def find_reference_glm(

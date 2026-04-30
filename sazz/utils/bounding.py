@@ -390,11 +390,10 @@ def piecewise_thinning_sinusoidal_second_order(rate_time, horizon, alpha=1.2,
                                    max_ratio, bound_violations)
     return result
 
-
-def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None, 
+def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
                        R=2.0, max_iter=200, diagnostics=True):
     if t_init is None:
-        t_init = horizon / 100.0
+        t_init = max(horizon / 100, 1e-6)
 
     rate_fn = lambda t: max(rate_time(t), 0.0)
 
@@ -405,10 +404,15 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
     b = lam_prev
     t_prev = 0.0
 
+    # Pending segments: each is (t_start, t_end, slope, intercept_at_t_start)
+    # Used when we subdivide on a bound violation — second half goes here.
+    segments_pending = []
+
     n_proposals = 0
-    n_rate_evals = 2  # the two initial evaluations
+    n_rate_evals = 2
     max_ratio = 0.0
     bound_violations = 0
+    result = np.inf
 
     for _ in range(max_iter):
         u = np.random.random()
@@ -416,17 +420,36 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
 
         if abs(a) < 1e-14:
             if b < 1e-14:
+                # Flat zero rate on this segment — advance if we have a queued segment
+                if segments_pending:
+                    t0_seg, t1_seg, a, b = segments_pending.pop(0)
+                    t_prev = t0_seg
+                    lam_prev = b
+                    continue
                 result = np.inf
                 break
             s = xi / b
         else:
             disc = b**2 + 2.0 * a * xi
             if disc < 0.0:
+                if segments_pending:
+                    t0_seg, t1_seg, a, b = segments_pending.pop(0)
+                    t_prev = t0_seg
+                    lam_prev = b
+                    continue
                 result = np.inf
                 break
             s = (-b + np.sqrt(disc)) / a
 
         t_prop = t_prev + s
+
+        # If we've crossed into a queued segment, switch to it
+        if segments_pending and t_prop > segments_pending[0][0]:
+            t0_next, t1_next, a_next, b_next = segments_pending.pop(0)
+            t_prev = t0_next
+            lam_prev = b_next
+            a, b = a_next, b_next
+            continue
 
         if t_prop >= horizon:
             result = np.inf
@@ -434,35 +457,50 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
 
         n_proposals += 1
         n_rate_evals += 1
-
         lam_true = rate_fn(t_prop)
         lam_knot = alpha * lam_true
         h_prop = b + a * s
 
         ratio = lam_true / h_prop if h_prop > 1e-14 else 0.0
-        max_ratio = max(max_ratio, ratio)
+        #max_ratio = max(max_ratio, ratio)
         if ratio > 1.0:
             bound_violations += 1
 
         if ratio > R:
-            a = (lam_knot - lam_prev) / (t_prop - t_prev)
+            # SUBDIVIDE: evaluate at midpoint, queue second half, retry first half
+            t_mid = 0.5 * (t_prev + t_prop)
+            lam_mid = alpha * rate_fn(t_mid)
+            n_rate_evals += 1
+
+            # New first-half segment: t_prev -> t_mid
+            a = (lam_mid - lam_prev) / (t_mid - t_prev)
             b = lam_prev
-            #result = np.inf
-            #break
+
+            # Queue second half: t_mid -> t_prop, with slope using lam_knot at t_prop
+            slope_second = (lam_knot - lam_mid) / (t_prop - t_mid)
+            segments_pending.insert(0, (t_mid, t_prop, slope_second, lam_mid))
             continue
 
         if h_prop < 1e-14:
+            if segments_pending:
+                t0_seg, t1_seg, a, b = segments_pending.pop(0)
+                t_prev = t0_seg
+                lam_prev = b
+                continue
             result = np.inf
             break
+        max_ratio = max(max_ratio, ratio)
 
         if np.random.random() < ratio:
             result = t_prop
             break
 
+        # Rejected: standard PLI update, discard queued segments
         a = (lam_knot - lam_prev) / (t_prop - t_prev)
         b = lam_knot
         lam_prev = lam_knot
         t_prev = t_prop
+        segments_pending = []
     else:
         import warnings
         warnings.warn(
@@ -484,6 +522,100 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
         }
         return result, stats
     return result
+
+# def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None, 
+#                        R=2.0, max_iter=200, diagnostics=True):
+#     if t_init is None:
+#         t_init = horizon / 100.0
+
+#     rate_fn = lambda t: max(rate_time(t), 0.0)
+
+#     lam_prev = alpha * rate_fn(0.0)
+#     lam_init = alpha * rate_fn(t_init)
+
+#     a = (lam_init - lam_prev) / t_init
+#     b = lam_prev
+#     t_prev = 0.0
+
+#     n_proposals = 0
+#     n_rate_evals = 2  # the two initial evaluations
+#     max_ratio = 0.0
+#     bound_violations = 0
+
+#     for _ in range(max_iter):
+#         u = np.random.random()
+#         xi = -np.log(1.0 - u)
+
+#         if abs(a) < 1e-14:
+#             if b < 1e-14:
+#                 result = np.inf
+#                 break
+#             s = xi / b
+#         else:
+#             disc = b**2 + 2.0 * a * xi
+#             if disc < 0.0:
+#                 result = np.inf
+#                 break
+#             s = (-b + np.sqrt(disc)) / a
+
+#         t_prop = t_prev + s
+
+#         if t_prop >= horizon:
+#             result = np.inf
+#             break
+
+#         n_proposals += 1
+#         n_rate_evals += 1
+
+#         lam_true = rate_fn(t_prop)
+#         lam_knot = alpha * lam_true
+#         h_prop = b + a * s
+
+#         ratio = lam_true / h_prop if h_prop > 1e-14 else 0.0
+#         max_ratio = max(max_ratio, ratio)
+#         if ratio > 1.0:
+#             bound_violations += 1
+
+#         if ratio > R:
+#             a = (lam_knot - lam_prev) / (t_prop - t_prev)
+#             b = lam_prev
+#             #result = np.inf
+#             #break
+#             continue
+
+#         if h_prop < 1e-14:
+#             result = np.inf
+#             break
+
+#         if np.random.random() < ratio:
+#             result = t_prop
+#             break
+
+#         a = (lam_knot - lam_prev) / (t_prop - t_prev)
+#         b = lam_knot
+#         lam_prev = lam_knot
+#         t_prev = t_prop
+#     else:
+#         import warnings
+#         warnings.warn(
+#             f"piecewise_thinning: max_iter={max_iter} reached. "
+#             f"Last t={t_prev:.6f}, horizon={horizon:.6f}.",
+#             RuntimeWarning,
+#         )
+#         result = np.inf
+
+#     if diagnostics:
+#         stats = {
+#             'accepted': result < np.inf,
+#             'rejected': result == np.inf,
+#             'proposals': n_proposals,
+#             'rate_evals': n_rate_evals,
+#             'max_ratio': max_ratio,
+#             'bound_violations': bound_violations,
+#             'tau': result,
+#         }
+#         return result, stats
+#     return result
 
 
 def _make_stats(result, proposals, rate_evals, max_ratio, bound_violations):
