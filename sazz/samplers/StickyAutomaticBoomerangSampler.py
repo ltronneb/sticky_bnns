@@ -55,7 +55,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         kappa: float = 1.0,
         refresh_rate: float = 0.1,
         thinning: Literal["brent", "pli"] = "pli",
-        t_max: float = 1.0,
+        t_max: float = 0.1,
         pli_kwargs: Optional[dict] = None,
         cold_start_threshold: Optional[float] = None,
         dtype: torch.dtype = torch.float64,

@@ -92,7 +92,7 @@ class AutomaticZigZagSampler(nn.Module):
         self,
         grad_target: Callable[[Tensor], Tensor],
         D: int,
-        t_max: float = 1.0,
+        t_max: float = 0.1,
         gamma: float = 0.01,
         thinning: Literal["brent", "pli"] = "pli",
         adapt_t_max: bool = False,

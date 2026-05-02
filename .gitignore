@@ -22,6 +22,8 @@
 *.csv
 *.npy
 *.xlsx
+*.pt
+*.json
 
 # Logs and databases #
 ######################
