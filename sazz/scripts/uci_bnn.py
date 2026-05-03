@@ -43,7 +43,7 @@ Workflow:
     python -m sazz.scripts.uci_bnn --datasets hernandez --include-nuts
 
     # NUTS only on Boston split 0 (one-shot baseline)
-    python -m sazz.scripts.uci_bnn --datasets boston --splits 0 \\
+    python -m sazz.scripts.uci_bnn --datasets boston --splits 0 \
                                     --samplers nuts --include-nuts
 
     # Resume: skip (dataset, split, sampler) combos already on disk
@@ -105,6 +105,7 @@ GAMMA_ZZ     = 0.01
 # NUTS knobs
 NUTS_WARMUP  = 1_000
 NUTS_DRAWS   = 2_000
+NUTS_CHAINS   = 4
 
 HIDDEN       = [50]
 
@@ -355,7 +356,8 @@ def resample_pdmp(name: str, result: dict, x_ref_np: np.ndarray) -> np.ndarray:
 
 def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
              num_warmup: int = NUTS_WARMUP,
-             num_samples: int = NUTS_DRAWS) -> tuple[np.ndarray, float]:
+             num_samples: int = NUTS_DRAWS,
+             num_chains: int = NUTS_CHAINS) -> tuple[np.ndarray, float]:
     """Run NumPyro NUTS, return samples flattened to PDMP parameter ordering.
 
     The flatten order MUST match what `make_bnn_regression` produces internally
@@ -410,7 +412,7 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
 
     kernel = NUTS(bnn, target_accept_prob=0.9)
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples,
-                num_chains=1, progress_bar=True)
+                num_chains=num_chains, progress_bar=True)
 
     t0 = time.perf_counter()
     mcmc.run(jax.random.PRNGKey(seed), X=X, y=y)
@@ -642,11 +644,23 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
             **metrics, "n_skeleton": n_events, "elapsed_sec": elapsed,
         })
 
-    # Per-split metrics.json — quick to inspect without a CSV.
+    map_rows = [r for r in rows if r["sampler"] == "map"]
+    disk_rows = []
+    for pt_path in sorted(sd.glob("*.pt")):
+        payload = torch.load(pt_path, weights_only=False)
+        disk_rows.append({
+            "dataset":     payload.get("dataset", dataset_name),
+            "split_id":    payload.get("split_id", split_id),
+            "sampler":     payload.get("sampler", pt_path.stem),
+            **payload.get("metrics", {}),
+            "n_skeleton":  payload.get("n_skeleton", 0),
+            "elapsed_sec": payload.get("elapsed_sec", 0.0),
+        })
+    final_rows = map_rows + disk_rows
     with open(sd / "metrics.json", "w") as f:
-        json.dump(rows, f, indent=2)
+        json.dump(final_rows, f, indent=2)
 
-    return rows
+    return final_rows
 
 
 # ===========================================================================
@@ -663,11 +677,30 @@ def aggregate(out_dir: Path,
         if datasets is not None and ds_dir.name not in datasets:
             continue
         for split in sorted(ds_dir.glob("split_*")):
+            split_id = int(split.name.split("_")[-1])
+            ds_name = ds_dir.name
+
+            json_rows: list[dict] = []
             mj = split / "metrics.json"
-            if not mj.exists():
-                continue
-            with open(mj) as f:
-                rows.extend(json.load(f))
+            if mj.exists():
+                with open(mj) as f:
+                    json_rows = json.load(f)
+
+            seen = {r["sampler"] for r in json_rows}
+            for pt_path in sorted(split.glob("*.pt")):
+                if pt_path.stem in seen:
+                    continue
+                payload = torch.load(pt_path, weights_only=False)
+                json_rows.append({
+                    "dataset":     payload.get("dataset", ds_name),
+                    "split_id":    payload.get("split_id", split_id),
+                    "sampler":     payload.get("sampler", pt_path.stem),
+                    **payload.get("metrics", {}),
+                    "n_skeleton":  payload.get("n_skeleton", 0),
+                    "elapsed_sec": payload.get("elapsed_sec", 0.0),
+                })
+
+            rows.extend(json_rows)
 
     df = pd.DataFrame(rows)
     if df.empty:

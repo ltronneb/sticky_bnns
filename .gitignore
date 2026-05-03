@@ -51,3 +51,4 @@ __pycache__/
 # Directories #
 personal/
 datasets/
+results/
