@@ -1,38 +1,22 @@
 """Linear regression — Boomerang & Zig-Zag (sticky and non-sticky) vs NUTS.
 
-A synthetic linear-regression benchmark with known ground-truth coefficients
-and an analytical Gaussian-prior posterior. Runs four PDMP samplers,
-Gaussian-prior NUTS, and optionally horseshoe NUTS. Reports parameter
-recovery, predictive RMSE, posterior calibration, and (when sparse)
-variable-selection F1.
-
-The model always includes an intercept coordinate. Use `--intercept 0` for
-sparse benchmarks where you want the "true intercept" to be zero — the
-intercept slot still exists in the model and is sampled, just shrunk
-toward zero by its prior.
-
-The same script handles both regimes:
-  - Small dense (D=9, 3 signals): the original notebook benchmark.
-  - Sparse high-D (D=200, K=10): the closed-form / horseshoe comparison.
-
-Switching between them is just CLI args.
+Synthetic linear-regression benchmark with known ground-truth coefficients
+and an analytical Gaussian-prior posterior. The model always includes an
+intercept coordinate (slot 0); `--intercept 0` keeps the slot but generates
+data with zero true intercept.
 
 Usage:
-    # Small dense linear regression (notebook default)
     python -m sazz.scripts.linear_regression
-
-    # Sparse regression (D=200, 10 true signals, true intercept = 0, save)
     python -m sazz.scripts.linear_regression --N 2000 --D 200 \
-        --n-signals 10 --signal-scale 2.0 --intercept 0 --noise-std 1.0 \
-        --prior-std 5.0 --lik-noise-std 1.0 --include-horseshoe --save
+        --n-signals 8 --signal-scale 2.0 \
+        --prior-dist "Gauss" -- thinning pli \
+        --prior-std 5.0 --include-horseshoe --save --no-plots
 
-    # PDMP-only, no NUTS, no plots
-    python -m sazz.scripts.linear_regression --no-nuts --no-plots
-
-Storage (only when --save is passed):
-    results/linear_regression/<name>/
-      <sampler>.pt    # samples + config, one per sampler
-      metrics.json    # all metric rows + true_coefs + config
+    python -m sazz.scripts.linear_regression --N 2000 --D 200 \
+        --n-signals 8 --signal-scale 2.0 \
+        --prior-dist "Gauss" --thinning brent \
+        --n_skel 10_000 --n_resample 5000 \
+        --prior-std 5.0 --include-horseshoe --save --no-plots
 """
 
 from __future__ import annotations
@@ -59,32 +43,29 @@ from sazz.utils.sampling import (
 torch.set_default_dtype(torch.float64)
 
 
-# ===========================================================================
-# Config
-# ===========================================================================
-
 @dataclass
 class Config:
-    # Data
+    # Data — D is the number of *covariates*; sampler dim is D + 1 (slot 0 = intercept).
     N: int = 200
-    D: int = 9                          # number of *covariates*; total dim is D + 1 (intercept)
+    D: int = 9
     n_signals: int = 3
     signal_scale: float = 1.5
-    intercept_true: float = 0.5         # can be 0 — intercept slot still exists in the model
+    intercept_true: float = 0.5
     noise_std: float = 0.3              # DGP noise
 
-    # Prior / likelihood (PDMPs and NUTS share these)
-    prior_std: float = 1.0              # prior std on β coordinates
-    intercept_prior_std: float = 10.0   # prior std on intercept (kept wide to let data speak)
+    # Prior / likelihood (shared by NUTS and PDMP)
+    prior_dist: str = "Gauss"
+    prior_std: float = 1.0
+    intercept_prior_std: float = 10.0
     lik_noise_std: float = 0.5
 
     # PDMP budgets
-    n_skel: int = 50_000
-    n_resample: int = 4_000
+    n_skel: int = 100_000
+    n_resample: int = 50_000
     burnin_frac: float = 0.5
     refresh_rate: float = 1.0
-    kappa_null: float = 1.0
-    kappa_int: float = 1e6              # intercept never sticks
+    kappa_null: float = 0.4             # ~ 1/sqrt(2*pi); intercept gets kappa_int
+    kappa_int: float = 1e6
     thinning: str = "pli"
     t_max_zz: float = 0.1
     gamma_zz: float = 0.01
@@ -107,11 +88,7 @@ def set_seed(seed: int):
 # ===========================================================================
 
 def make_data(cfg: Config):
-    """Generate (X_std, y, true_coefs, is_signal).
-
-    `true_coefs` always has length D + 1: [intercept, β_1, ..., β_D].
-    `is_signal[0]` is True iff `intercept_true != 0`.
-    """
+    """Generate (X_std, y, true_coefs, is_signal). true_coefs has length D + 1."""
     rng = np.random.default_rng(cfg.seed)
     X = rng.normal(size=(cfg.N, cfg.D))
     beta = np.zeros(cfg.D)
@@ -124,12 +101,9 @@ def make_data(cfg: Config):
     return X, y, true_coefs, true_coefs != 0
 
 
-def analytic_posterior(X_aug: np.ndarray, y: np.ndarray, cfg: Config):
-    """Closed-form posterior on [intercept, β]. X_aug has the leading ones column.
-
-    Diagonal prior precision: intercept gets 1/σ_int², slopes get 1/σ_p².
-    """
-    D_total = X_aug.shape[1]            # D + 1
+def analytic_posterior(X_aug, y, cfg: Config):
+    """Closed-form posterior on [intercept, β]. X_aug has the leading ones column."""
+    D_total = X_aug.shape[1]
     prec_prior = np.eye(D_total) / cfg.prior_std ** 2
     prec_prior[0, 0] = 1.0 / cfg.intercept_prior_std ** 2
     prec = X_aug.T @ X_aug / cfg.lik_noise_std ** 2 + prec_prior
@@ -139,7 +113,7 @@ def analytic_posterior(X_aug: np.ndarray, y: np.ndarray, cfg: Config):
 
 
 # ===========================================================================
-# PDMP samplers — table-driven
+# PDMP samplers
 # ===========================================================================
 
 # (display name, family, sticky, color, marker)
@@ -178,21 +152,23 @@ def _resample(family, sticky, res, x_ref_np, cfg):
 
 
 def run_pdmps(target, cfg: Config) -> list[dict]:
-    """Run all four PDMP samplers; return list of method dicts."""
-    # The intercept is coordinate 0 in the PDMP target (D + 1 wide).
+    """Run all four PDMP samplers; return list of method dicts.
+
+    target.D == cfg.D + 1; coordinate 0 is the intercept (kappa_int → never freezes).
+    """
     kappa = torch.full((target.D,), cfg.kappa_null, dtype=torch.float64)
     kappa[0] = cfg.kappa_int
-
     x_ref_np = target.x_ref.cpu().numpy()
+
     out = []
     for name, family, sticky, color, marker in PDMP_SPECS:
         set_seed(cfg.seed)
         s = _build(family, sticky, target, cfg, kappa)
         x0 = target.x_ref.clone() + torch.randn(target.D)
         t0 = time.perf_counter()
-        res = s.sample(N=cfg.n_skel, x0=x0, diagnostics=True)
-        wall = time.perf_counter() - t0
+        res = s.sample(N=cfg.n_skel, x0=x0, diagnostics=False)
         samples = _resample(family, sticky, res, x_ref_np, cfg)
+        wall = time.perf_counter() - t0     # incl. resampling, matches NUTS pipeline timing
         out.append(dict(name=name, samples=samples, wall=wall,
                         sticky=sticky, color=color, marker=marker))
         print(f"  {name:<13} wall={wall:6.2f}s  draws={samples.shape[0]}")
@@ -200,16 +176,10 @@ def run_pdmps(target, cfg: Config) -> list[dict]:
 
 
 # ===========================================================================
-# NUTS (Gaussian or horseshoe prior on β; intercept always Gaussian)
+# NUTS — same Gaussian likelihood + Gaussian/horseshoe prior on β
 # ===========================================================================
 
 def run_nuts(X, y, cfg: Config, prior: str, k_signals_guess: int = 0) -> dict:
-    """Run NUTS on the same Gaussian-likelihood model as the PDMPs.
-
-    Always samples an intercept; `prior` controls only the prior on β.
-    Returns samples in [intercept, β_1, ..., β_D] order — the same convention
-    as `make_data` and the PDMP samplers.
-    """
     import pymc as pm
     set_seed(cfg.seed)
     target_accept = cfg.nuts_target_accept
@@ -236,13 +206,11 @@ def run_nuts(X, y, cfg: Config, prior: str, k_signals_guess: int = 0) -> dict:
         )
         wall = time.perf_counter() - t0
 
-    # Concatenate as [intercept, β]; reshape (chains, draws, D+1) -> (chains*draws, D+1)
-    int3   = trace.posterior["intercept"].values[..., None]   # (C, S, 1)
-    betas3 = trace.posterior["betas"].values                  # (C, S, D)
-    arr    = np.concatenate([int3, betas3], axis=-1)
-    samples = arr.reshape(-1, arr.shape[-1])
+    int3   = trace.posterior["intercept"].values[..., None]
+    betas3 = trace.posterior["betas"].values
+    samples = np.concatenate([int3, betas3], axis=-1).reshape(-1, cfg.D + 1)
 
-    name = "NUTS-Gaussian" if prior == "gaussian" else "NUTS-horseshoe"
+    name   = "NUTS-Gaussian" if prior == "gaussian" else "NUTS-horseshoe"
     color, marker = ("C2", "D") if prior == "gaussian" else ("C4", "P")
     return dict(name=name, samples=samples, wall=wall, sticky=False,
                 color=color, marker=marker)
@@ -260,12 +228,13 @@ def _support_via_ci(samples, alpha=0.05):
 
 def compute_metrics(method: dict, true_coefs, is_signal,
                     X_test_aug, y_test_clean, sd_ref) -> dict:
-    """Append metric fields to a method dict."""
+    """Return method dict augmented with metric scalars."""
     from sklearn.metrics import f1_score
     s = method["samples"]
     mu, sd = s.mean(0), s.std(0)
     pred_mean = (s @ X_test_aug.T).mean(0)
     p_zero = (np.abs(s) < 1e-8).mean(0) if method["sticky"] else None
+
     out = dict(method)
     out["beta_rmse"]   = float(np.sqrt(((mu - true_coefs) ** 2).mean()))
     out["pred_rmse"]   = float(np.sqrt(((pred_mean - y_test_clean) ** 2).mean()))
@@ -290,34 +259,31 @@ def print_table(rows: list[dict]):
 
 
 # ===========================================================================
-# Plots
+# Plot
 # ===========================================================================
 
-def plot_coefs(rows: list[dict], true_coefs, is_signal, title, out_path: Path | None):
-    """Auto-pick layout: dense (single panel) or sparse (signals + nulls)."""
+def plot_coefs(rows, true_coefs, is_signal, title, out_path: Path | None):
     import matplotlib.pyplot as plt
     sparse = (~is_signal).sum() > len(true_coefs) // 2
+    sig = np.where(is_signal)[0]; nul = np.where(~is_signal)[0]
+    offsets = np.linspace(-0.30, 0.30, len(rows))
 
     if not sparse:
         fig, ax = plt.subplots(figsize=(min(13, 1.0 * len(true_coefs) + 4), 4.5))
         idx = np.arange(len(true_coefs))
-        offsets = np.linspace(-0.30, 0.30, len(rows))
         for r, off in zip(rows, offsets):
             mu, sd = r["samples"].mean(0), r["samples"].std(0)
             ax.errorbar(idx + off, mu, yerr=2 * sd, fmt=r["marker"], color=r["color"],
                         label=r["name"], capsize=2, markersize=4, lw=1)
         ax.scatter(idx, true_coefs, marker="x", color="k", s=70, linewidths=2,
                    label="true", zorder=5)
-        for i in np.where(is_signal)[0]:
-            ax.axvspan(i - 0.45, i + 0.45, color="gold", alpha=0.12)
+        for i in sig: ax.axvspan(i - 0.45, i + 0.45, color="gold", alpha=0.12)
         ax.axhline(0, color="grey", lw=0.5)
-        ax.set_xlabel("coordinate"); ax.set_ylabel("coefficient")
-        ax.set_title(title); ax.legend(fontsize=8, ncol=2, frameon=False)
+        ax.set(xlabel="coordinate", ylabel="coefficient", title=title)
+        ax.legend(fontsize=8, ncol=2, frameon=False)
     else:
-        sig = np.where(is_signal)[0]; nul = np.where(~is_signal)[0]
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8),
                                        gridspec_kw={"height_ratios": [1.2, 1]})
-        offsets = np.linspace(-0.35, 0.35, len(rows))
         xs = np.arange(len(sig))
         for r, off in zip(rows, offsets):
             mu, sd = r["samples"].mean(0), r["samples"].std(0)
@@ -328,13 +294,12 @@ def plot_coefs(rows: list[dict], true_coefs, is_signal, title, out_path: Path | 
         ax1.scatter(xs, true_coefs[sig], marker="x", color="red", s=60,
                     linewidths=2, label="true", zorder=5)
         ax1.axhline(0, color="grey", lw=0.5)
-        ax1.set_xticks(xs)
-        ax1.set_xticklabels([f"β_{i}" for i in sig], rotation=45, ha="right")
-        ax1.set_ylabel("coefficient"); ax1.set_title(f"Signals — {title}")
+        ax1.set_xticks(xs); ax1.set_xticklabels([f"β_{i}" for i in sig], rotation=45, ha="right")
+        ax1.set(ylabel="coefficient", title=f"Signals — {title}")
         ax1.legend(fontsize=8, ncol=3, frameon=False)
         ax2.axhline(0, color="red", lw=1)
-        ax2.set_xlabel("coordinate"); ax2.set_ylabel("posterior mean")
-        ax2.set_title(f"Nulls ({len(nul)} of {len(true_coefs)})")
+        ax2.set(xlabel="coordinate", ylabel="posterior mean",
+                title=f"Nulls ({len(nul)} of {len(true_coefs)})")
         ax2.legend(fontsize=8, ncol=3, frameon=False)
 
     plt.tight_layout()
@@ -346,23 +311,44 @@ def plot_coefs(rows: list[dict], true_coefs, is_signal, title, out_path: Path | 
 # Persistence
 # ===========================================================================
 
-def save_run(out_dir: Path, cfg: Config, rows: list[dict],
-             true_coefs, is_signal):
+# Fields kept in metrics.json for each method (no sample arrays, no plot keys).
+_METRIC_KEYS = ["name", "wall", "sticky", "beta_rmse", "pred_rmse",
+                "f1_ci", "sigma_ratio", "p0_nulls"]
+
+
+def _to_jsonable(v):
+    """Recursively convert torch/numpy scalars and arrays into JSON-safe primitives."""
+    if v is None or isinstance(v, (str, bool, int)):
+        return v
+    if isinstance(v, float):
+        return None if np.isnan(v) else v
+    if isinstance(v, np.integer):                  return int(v)
+    if isinstance(v, np.floating):
+        f = float(v); return None if np.isnan(f) else f
+    if isinstance(v, np.ndarray):                  return v.tolist()
+    if isinstance(v, torch.Tensor):                return v.detach().cpu().tolist()
+    if isinstance(v, (list, tuple)):               return [_to_jsonable(x) for x in v]
+    if isinstance(v, dict):                        return {str(k): _to_jsonable(x) for k, x in v.items()}
+    return None                                    # drop anything unrecognised
+
+
+def save_run(out_dir: Path, cfg: Config, rows, true_coefs, is_signal):
     out_dir.mkdir(parents=True, exist_ok=True)
+    cfg_dict = _to_jsonable(asdict(cfg))
     for r in rows:
         if "samples" not in r: continue
         torch.save({
             "name": r["name"], "samples": torch.tensor(r["samples"]),
-            "wall": r.get("wall"), "config": asdict(cfg),
+            "wall": r.get("wall"), "config": cfg_dict,
         }, out_dir / f"{r['name'].replace(' ', '_')}.pt")
-    metric_rows = [{k: v for k, v in r.items() if k != "samples"} for r in rows]
+    metric_rows = [{k: _to_jsonable(r.get(k)) for k in _METRIC_KEYS} for r in rows]
     with open(out_dir / "metrics.json", "w") as f:
         json.dump({
-            "config": asdict(cfg),
+            "config":     cfg_dict,
             "true_coefs": true_coefs.tolist(),
-            "is_signal": is_signal.tolist(),
-            "rows": metric_rows,
-        }, f, indent=2, default=lambda x: None if isinstance(x, float) and np.isnan(x) else x)
+            "is_signal":  [bool(b) for b in is_signal.tolist()],
+            "rows":       metric_rows,
+        }, f, indent=2)
     print(f"\nSaved -> {out_dir}/")
 
 
@@ -371,45 +357,47 @@ def save_run(out_dir: Path, cfg: Config, rows: list[dict],
 # ===========================================================================
 
 def main():
+    defaults = Config()
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
                                 description=__doc__)
-    p.add_argument("--N", type=int, default=200)
-    p.add_argument("--D", type=int, default=9)
-    p.add_argument("--n-signals", type=int, default=3)
-    p.add_argument("--signal-scale", type=float, default=1.5)
-    p.add_argument("--intercept", type=float, default=0.5,
+    p.add_argument("--N",                   type=int,   default=defaults.N)
+    p.add_argument("--D",                   type=int,   default=defaults.D)
+    p.add_argument("--n-signals",           type=int,   default=defaults.n_signals)
+    p.add_argument("--signal-scale",        type=float, default=defaults.signal_scale)
+    p.add_argument("--intercept",           type=float, default=defaults.intercept_true,
                    help="True intercept value (the slot always exists in the model).")
-    p.add_argument("--noise-std", type=float, default=0.3)
-    p.add_argument("--prior-std", type=float, default=1.0)
-    p.add_argument("--intercept-prior-std", type=float, default=10.0)
-    p.add_argument("--lik-noise-std", type=float, default=0.5)
-    p.add_argument("--n-skel", type=int, default=50_000)
-    p.add_argument("--n-resample", type=int, default=50_000)
-    p.add_argument("--thinning", choices=["pli", "brent"], default="pli")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--prior-dist", choices=["Gauss", "StudT"],
+                    default=defaults.prior_dist,
+                    help="Prior on slope coefficients.")
+    p.add_argument("--noise-std",           type=float, default=defaults.noise_std)
+    p.add_argument("--prior-std",           type=float, default=defaults.prior_std)
+    p.add_argument("--intercept-prior-std", type=float, default=defaults.intercept_prior_std)
+    p.add_argument("--lik-noise-std",       type=float, default=defaults.lik_noise_std)
+    p.add_argument("--n-skel",              type=int,   default=defaults.n_skel)
+    p.add_argument("--n-resample",          type=int,   default=defaults.n_resample)
+    p.add_argument("--thinning",            choices=["pli", "brent"], default=defaults.thinning)
+    p.add_argument("--seed",                type=int,   default=defaults.seed)
     p.add_argument("--include-horseshoe", action="store_true")
-    p.add_argument("--no-nuts", action="store_true")
-    p.add_argument("--no-plots", action="store_true")
-    p.add_argument("--save", action="store_true")
-    p.add_argument("--out", type=Path, default=Path("results/linear_regression"))
-    p.add_argument("--name", type=str, default=None)
+    p.add_argument("--no-nuts",           action="store_true")
+    p.add_argument("--no-plots",          action="store_true")
+    p.add_argument("--save",              action="store_true")
     args = p.parse_args()
 
     cfg = Config(
         N=args.N, D=args.D, n_signals=args.n_signals, signal_scale=args.signal_scale,
         intercept_true=args.intercept, noise_std=args.noise_std,
+        prior_dist=args.prior_dist,
         prior_std=args.prior_std, intercept_prior_std=args.intercept_prior_std,
         lik_noise_std=args.lik_noise_std,
         n_skel=args.n_skel, n_resample=args.n_resample,
         thinning=args.thinning, seed=args.seed,
     )
     set_seed(cfg.seed)
-    print(f"Config: N={cfg.N} D={cfg.D} K={cfg.n_signals} thinning={cfg.thinning} seed={cfg.seed}")
+    print(f"Config: N={cfg.N} D={cfg.D} K={cfg.n_signals} prior={cfg.prior_dist} thinning={cfg.thinning} seed={cfg.seed}")
 
-    # --- Data + held-out test set (ones column always added) ---
+    # --- Data + held-out test set (test X has D covariates; intercept added below) ---
     X, y, true_coefs, is_signal = make_data(cfg)
-    print(f"signals = {int(is_signal.sum())}/{len(true_coefs)}  "
-          f"intercept_true = {cfg.intercept_true}")
+    print(f"signals = {int(is_signal.sum())}/{len(true_coefs)}  intercept_true = {cfg.intercept_true}")
 
     test_rng = np.random.default_rng(cfg.seed + 1)
     X_te = test_rng.normal(size=(cfg.N, cfg.D))
@@ -434,23 +422,24 @@ def main():
 
     target = make_linear_regression(
         torch.tensor(X), torch.tensor(y),
+        prior_dist=cfg.prior_dist,
         prior_std=cfg.prior_std, intercept_prior_std=cfg.intercept_prior_std,
-        noise_std=cfg.lik_noise_std, diagonal_only=True,
+        noise_std=cfg.lik_noise_std, diagonal_only=False,
     )
     print("\nRunning PDMP samplers...")
     rows.extend(run_pdmps(target, cfg))
 
-    # --- Metrics (Analytic is always available now → use it as σ-ratio reference) ---
+    # --- Metrics (Analytic is the σ-ratio reference) ---
     sd_ref = next(r["samples"].std(0) for r in rows if r["name"] == "Analytic")
     rows = [compute_metrics(r, true_coefs, is_signal, X_te_aug, y_te_clean, sd_ref)
             for r in rows]
     print_table(rows)
 
     # --- Plot + save ---
-    out_dir = (args.out / (args.name or _auto_name(cfg))) if args.save else None
+    out_dir = Path("results/linear_regression") / _auto_name(cfg) if args.save else None
     if out_dir: out_dir.mkdir(parents=True, exist_ok=True)
     if not args.no_plots:
-        title = f"D={cfg.D}, K={cfg.n_signals}, {cfg.thinning}"
+        title = f"D={cfg.D}, K={cfg.n_signals}, {cfg.prior_dist} prior, {cfg.thinning}"
         plot_coefs(rows, true_coefs, is_signal, title,
                    (out_dir / "coefs.png") if out_dir else None)
     if args.save:
@@ -458,7 +447,7 @@ def main():
 
 
 def _auto_name(cfg: Config) -> str:
-    return f"N{cfg.N}_D{cfg.D}_K{cfg.n_signals}_seed{cfg.seed}"
+    return f"N{cfg.N}_D{cfg.D}_K{cfg.n_signals}_{cfg.prior_dist}_{cfg.thinning}_seed{cfg.seed}"
 
 
 if __name__ == "__main__":

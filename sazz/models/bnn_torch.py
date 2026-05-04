@@ -3,13 +3,15 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.distributions import Normal, Bernoulli, Categorical
-from .smoke_test import TorchTarget
+from .make_models import TorchTarget
 from .priors_torch import Prior
 from .likelihoods_torch import Likelihood
 from .models_torch import BayesianModel
 
 from ..utils.bnn_utils import unflatten_params, _build_prior_precision, get_activation, count_params
 from ..utils.warmup import find_reference_bnn
+from ..utils.bnn_modular_utils import ParamSpec
+
 
 
 class BNNLikelihood(Likelihood):
@@ -105,33 +107,97 @@ class BNNCategoricalLikelihood(BNNLikelihood):
 
     def log_prob(self, beta: Tensor) -> Tensor:
         return self.log_prob_single(beta, self.X, self.y)
+ 
+ 
+ 
+ 
+
+ 
+class ModuleLikelihood(Likelihood):
+    def __init__(self, module: nn.Module, X, y, spec: ParamSpec):
+        super().__init__()
+        self.module = module
+        self.module.eval()              # turn off dropout/BN updates
+        self.spec = spec
+        self.register_buffer("X", X)
+        self.register_buffer("y", y)
     
-# class BNNGaussianLikelihood(BNNLikelihood):
-#     """Regression: y | x, beta ~ N(f(x; beta), noise_std^2)."""
-#     def __init__(self, X, y, layer_sizes, activation, noise_std: float = 0.1):
-#         super().__init__(X, y, layer_sizes, activation)
-#         self.noise_std = noise_std
+    def predict(self, beta: Tensor, X_new: Tensor) -> Tensor:
+        return torch.func.functional_call(
+            self.module, self.spec.to_dict(beta), (X_new,)
+        )
+  
 
-#     def log_prob(self, beta: Tensor) -> Tensor:
-#         preds = self.forward_net(beta).squeeze(-1)
-#         dist = Normal(preds, self.noise_std)
-#         return dist.log_prob(self.y).sum()
+class ModuleGaussianPrior(Prior):
+    """Diagonal Gaussian prior, indexed by a precision vector aligned with
+    a ParamSpec's flatten order."""
 
+    def __init__(self, prec: Tensor):
+        super().__init__()
+        self.register_buffer("_precision", prec)
 
-# class BNNBernoulliLikelihood(BNNLikelihood):
-#     """Binary classification: y | x, beta ~ Bernoulli(sigmoid(f(x; beta)))."""
-#     def log_prob(self, beta: Tensor) -> Tensor:
-#         logits = self.forward_net(beta).squeeze(-1)
-#         dist = Bernoulli(logits=logits)
-#         return dist.log_prob(self.y.to(logits.dtype)).sum()
+    def log_prob(self, beta: Tensor) -> Tensor:
+        return -0.5 * (self._precision * beta ** 2).sum()
 
+    def precision_diag(self) -> Tensor:
+        return self._precision
 
-# class BNNCategoricalLikelihood(BNNLikelihood):
-#     """Multiclass: y | x, beta ~ Categorical(softmax(f(x; beta)))."""
-#     def log_prob(self, beta: Tensor) -> Tensor:
-#         logits = self.forward_net(beta)
-#         dist = Categorical(logits=logits)
-#         return dist.log_prob(self.y.long()).sum()
+        
+class ModuleGaussianLikelihood(Likelihood):
+    """BNN regression likelihood evaluated via torch.func.functional_call.
+
+    Wraps an nn.Module + ParamSpec. The forward pass uses functional_call so
+    the module's parameters are taken from the flat beta vector instead of
+    its own .parameters().
+    """
+
+    def __init__(self, module: nn.Module, spec: ParamSpec,
+                 X: Tensor, y: Tensor, noise_std: float):
+        super().__init__()
+        self.module = module
+        self.module.eval()
+        self.spec = spec
+        self.register_buffer("X", X)
+        self.register_buffer("y", y)
+        self.noise_std = noise_std
+        
+    # def predict(self, beta: Tensor, X_new: Tensor) -> Tensor:
+    #     params = self.spec.to_dict(beta)
+    #     return torch.func.functional_call(self.module, params, (X_new,))
+
+    def log_prob_single(self, beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
+        preds = self.predict(beta, X_i).squeeze(-1)
+        return Normal(preds, self.noise_std).log_prob(y_i).sum()
+
+    def log_prob(self, beta: Tensor) -> Tensor:
+        return self.log_prob_single(beta, self.X, self.y)
+ 
+ 
+class ModuleCategoricalLikelihood(Likelihood):
+    """Multiclass classification likelihood evaluated via functional_call."""
+
+    def __init__(self, module: nn.Module, spec: ParamSpec,
+                 X: Tensor, y: Tensor):
+        super().__init__()
+        self.module = module
+        self.module.eval()
+        self.spec = spec
+        self.register_buffer("X", X)
+        self.register_buffer("y", y.long())
+
+    # def predict(self, beta: Tensor, X_new: Tensor) -> Tensor:
+    #     params = self.spec.to_dict(beta)
+    #     return torch.func.functional_call(self.module, params, (X_new,))
+
+    def log_prob_single(self, beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
+        logits = self.predict(beta, X_i)
+        return Categorical(logits=logits).log_prob(y_i.long()).sum()
+
+    def log_prob(self, beta: Tensor) -> Tensor:
+        return self.log_prob_single(beta, self.X, self.y)
+
+  
+
     
     
 def make_bnn_regression(X, y, layer_sizes, activation="tanh",
@@ -219,7 +285,9 @@ def make_bnn_classification(X, y, layer_sizes, activation="tanh",
         meta={"model": model, "layer_sizes": layer_sizes, "n_classes": n_classes},
     )
     
-    
+
+
+  
 # ===========================================================================
 # Prediction utilities
 # ===========================================================================

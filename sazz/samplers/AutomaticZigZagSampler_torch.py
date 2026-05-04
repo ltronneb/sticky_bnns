@@ -1,38 +1,3 @@
-"""
-AutomaticZigZagSampler.py
-
-Unified Zig-Zag sampler in PyTorch. Mirrors the structure of
-``AutomaticBoomerangSampler`` and merges the Brent and PLI thinning
-variants into a single class controlled by ``thinning``.
-
-Design principles
------------------
-- The **trajectory** (x_t = x + t*v), **gradU** (= grad_target), and the
-  **velocity flip** at an accepted event live ON the torch computational
-  graph so that gradients flow back through skeleton points to e.g.
-  neural-network parameters.
-- The **bounding / thinning** logic (Brent optimisation, PLI envelope
-  construction and the thinning loop) runs OFF the graph — these are
-  stochastic scheduling decisions, not differentiable maps. They receive
-  *detached* tensors and return plain Python floats.
-- The sampling loop re-evaluates the trajectory at the accepted event
-  time *on the graph*, so the chain
-      x_{n-1} -> trajectory(tau) -> grad_target -> flip -> v_n
-  is fully differentiable.
-
-Notes vs. Boomerang
--------------------
-- Zig-Zag has no Gaussian reference measure, so there is no ``preprocess``
-  step, no ``x_ref``, no ``Sigma``, and no velocity refresh clock.
-- Velocities live on {-1, +1}^D. Events flip a single coordinate, drawn
-  from the categorical distribution proportional to the per-coordinate
-  switching rates max(0, v_i * grad_i U(x)) + gamma.
-- The Zig-Zag switching rate is already nonnegative; we don't need the
-  Boomerang's negative-rate sign convention. ``brent`` is given
-  ``-lambda(t)`` to find the maximum of lambda over [0, horizon]; PLI is
-  given ``lambda(t)`` directly (it clips at zero internally).
-"""
-
 import time as _time
 from functools import partial
 from typing import Callable, Optional, Literal
