@@ -71,6 +71,7 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
         grad_target,
         D: int,
         kappa: float = 1.0,
+        can_freeze: list[bool] = None,
         t_max: float = 0.1,
         gamma: float = 0.01,
         thinning: Literal["brent", "pli"] = "pli",
@@ -97,9 +98,13 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
             self.kappa = torch.full((D,), kappa, dtype=dtype, device=self.device)
         else:
             self.kappa = torch.as_tensor(kappa, dtype=dtype, device=self.device)
-
+        
+        if can_freeze is None:
+            self.can_freeze = torch.ones(D, dtype=torch.bool, device=self.device)
+        else:
+            self.can_freeze = torch.as_tensor(can_freeze, dtype=torch.bool, device=self.device)
+    
         self.cold_start_threshold = cold_start_threshold
-
         # Mutable state (reset between runs)
         self.frozen_mask = torch.zeros(D, dtype=torch.bool, device=self.device)
         self.frozen_velocity = torch.zeros(D, dtype=dtype, device=self.device)
@@ -158,7 +163,8 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
         """
         x_np = x.cpu().numpy()
         v_np = v.cpu().numpy()
-        active_np = (~self.frozen_mask).cpu().numpy()
+        #active_np = (~self.frozen_mask).cpu().numpy()
+        active_np = (~self.frozen_mask & self.can_freeze).cpu().numpy()
 
         t_hit = float("inf")
         i_hit = None
@@ -305,8 +311,10 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
         if self.cold_start_threshold is None:
             return
         for i in range(self.D):
-            if abs(positions[0, i].item()) < self.cold_start_threshold \
-            and self.kappa[i].item() < 1e6:        # skip never-stick coords
+            #if abs(positions[0, i].item()) < self.cold_start_threshold \
+            #and self.kappa[i].item() < 1e6:        # skip never-stick coords
+            if positions[0].abs() < self.cold_start_threshold \
+            and self.can_freeze:
                 v_init = float(velocities[0, i].item())
                 rate_i = self.kappa[i].item() * abs(v_init)
                 if rate_i < 1e-14:
@@ -316,28 +324,6 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
                 self.frozen_mask[i] = True
                 self.frozen_velocity[i] = v_init
                 self.thaw_deadline[i] = float(np.random.exponential(1.0 / rate_i))
-    # @torch.no_grad()
-    # def _apply_cold_start(self, positions: Tensor, velocities: Tensor):
-    #     """
-    #     Freeze every coordinate with kappa < 1e5 at initialisation.
-    #     Each frozen coord gets a thaw deadline drawn from
-    #     Exp(kappa_i * |v_i^(0)|) where v_i^(0) is the initial +/- 1
-    #     velocity that was just sampled.
-    #     """
-    #     if not self.cold_start_threshold:
-    #         return
-
-    #     for i in range(self.D):
-    #         if self.kappa[i].item() < 1e5:
-    #             v_init = float(velocities[0, i].item())
-    #             rate_i = self.kappa[i].item() * abs(v_init)
-    #             if rate_i < 1e-14:
-    #                 continue
-    #             positions[0, i] = 0.0
-    #             velocities[0, i] = 0.0
-    #             self.frozen_mask[i] = True
-    #             self.frozen_velocity[i] = v_init
-    #             self.thaw_deadline[i] = float(np.random.exponential(1.0 / rate_i))
 
     # ------------------------------------------------------------------
     # Main sampling loop

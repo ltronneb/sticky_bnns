@@ -17,7 +17,7 @@ Nothing in this file knows about layer_sizes. Everything talks ParamSpec.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
 import torch
@@ -54,6 +54,7 @@ class ParamSpec:
     numels: list[int]
     fan_ins: list[int]
     is_bias: list[bool]
+    can_freeze: list[bool] 
     D: int
 
     # --- Construction -----------------------------------------------------
@@ -74,13 +75,15 @@ class ParamSpec:
         C_in * kH * kW. For 1D tensors (biases) fan_in is set to 1; the
         value is unused because biases get prior_std_bias.
         """
-        names, shapes, numels, fan_ins, is_bias = [], [], [], [], []
+        names, shapes, numels, fan_ins, is_bias, can_freeze = [], [], [], [], [], []
         for name, p in module.named_parameters():
             names.append(name)
             shapes.append(p.shape)
             numels.append(p.numel())
             is_b = (p.dim() == 1)
             is_bias.append(is_b)
+            cf = getattr(p, "can_freeze", not is_b)
+            can_freeze.append(cf)
             if is_b:
                 fan_ins.append(1)  # placeholder, never consumed
             else:
@@ -92,39 +95,7 @@ class ParamSpec:
             numels=numels,
             fan_ins=fan_ins,
             is_bias=is_bias,
-            D=sum(numels),
-        )
-
-    @classmethod
-    def from_layer_sizes(cls, layer_sizes: Sequence[int]) -> "ParamSpec":
-        """
-        Convenience: build a ParamSpec for a plain FFN without instantiating
-        an nn.Module. Equivalent to building an nn.Sequential of nn.Linear
-        layers and calling from_module on it. Order matches the v1 flatten
-        convention: (W_0, b_0, W_1, b_1, ...).
-        """
-        names, shapes, numels, fan_ins, is_bias = [], [], [], [], []
-        for i, (n_in, n_out) in enumerate(
-            zip(layer_sizes[:-1], layer_sizes[1:])
-        ):
-            # Weight
-            names.append(f"layers.{i}.weight")
-            shapes.append(torch.Size([n_out, n_in]))
-            numels.append(n_out * n_in)
-            fan_ins.append(int(n_in))
-            is_bias.append(False)
-            # Bias
-            names.append(f"layers.{i}.bias")
-            shapes.append(torch.Size([n_out]))
-            numels.append(n_out)
-            fan_ins.append(1)
-            is_bias.append(True)
-        return cls(
-            names=names,
-            shapes=shapes,
-            numels=numels,
-            fan_ins=fan_ins,
-            is_bias=is_bias,
+            can_freeze=can_freeze,
             D=sum(numels),
         )
 
@@ -368,69 +339,3 @@ def make_kappa_from_inclusion(
         offset += numel
     return kappa
 
-
-# ---------------------------------------------------------------------------
-# Activation helper (re-exported here for convenience; same as v1)
-# ---------------------------------------------------------------------------
-
-def get_activation(name: str):
-    """
-    Return a torch activation callable from a string name. Supported:
-    "relu", "tanh", "sigmoid", "leaky_relu", "elu".
-    """
-    _activations = {
-        "relu":       torch.relu,
-        "tanh":       torch.tanh,
-        "sigmoid":    torch.sigmoid,
-        "leaky_relu": torch.nn.functional.leaky_relu,
-        "elu":        torch.nn.functional.elu,
-    }
-    if name not in _activations:
-        raise ValueError(
-            f"Unknown activation '{name}'. Choose from {list(_activations)}"
-        )
-    return _activations[name]
-
-
-# ---------------------------------------------------------------------------
-# FFN builder — convenience for quickly making a standard fully-connected
-# nn.Module that matches the layer_sizes convention.
-# ---------------------------------------------------------------------------
-
-class _FFN(nn.Module):
-    """
-    Plain fully-connected network. Stored as nn.ModuleList so that
-    named_parameters() yields layers.0.weight, layers.0.bias, layers.1.weight,
-    ..., matching ParamSpec.from_layer_sizes ordering.
-    """
-    def __init__(self, layer_sizes: Sequence[int], activation):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            nn.Linear(n_in, n_out)
-            for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:])
-        ])
-        self.activation = activation
-        self._n_layers = len(self.layers)
-
-    def forward(self, x: Tensor) -> Tensor:
-        h = x
-        for i, layer in enumerate(self.layers):
-            h = layer(h)
-            if i < self._n_layers - 1:
-                h = self.activation(h)
-        return h
-
-
-def build_ffn_module(
-    layer_sizes: Sequence[int],
-    activation: Union[str, callable] = "tanh",
-) -> nn.Module:
-    """
-    Build a plain FFN nn.Module matching the standard layer_sizes
-    convention. The named_parameters() ordering is layer-major
-    (weight then bias per layer), so ParamSpec.from_module(...) and
-    ParamSpec.from_layer_sizes(layer_sizes) produce identical layouts.
-    """
-    if isinstance(activation, str):
-        activation = get_activation(activation)
-    return _FFN(layer_sizes, activation)

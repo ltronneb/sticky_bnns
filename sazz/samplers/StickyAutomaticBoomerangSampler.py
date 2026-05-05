@@ -53,6 +53,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         grad_target,
         D: int,
         kappa: float = 1.0,
+        can_freeze: list[bool] = None,
         refresh_rate: float = 0.1,
         thinning: Literal["brent", "pli"] = "pli",
         t_max: float = 0.1,
@@ -77,9 +78,13 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
             self.kappa = torch.full((D,), kappa, dtype=dtype, device=self.device)
         else:
             self.kappa = torch.as_tensor(kappa, dtype=dtype, device=self.device)
-
+            
+        if can_freeze is None:
+            self.can_freeze = torch.ones(D, dtype=torch.bool, device=self.device)
+        else:
+            self.can_freeze = torch.as_tensor(can_freeze, dtype=torch.bool, device=self.device)
+    
         self.cold_start_threshold = cold_start_threshold
-
         # Mutable state (reset between runs)
         self.frozen_mask = torch.zeros(D, dtype=torch.bool, device=self.device)
         self.frozen_velocity = torch.zeros(D, dtype=dtype, device=self.device)
@@ -138,7 +143,8 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         t_hit = float("inf")
         i_hit = None
 
-        active_indices = torch.where(~self.frozen_mask)[0]
+        #active_indices = torch.where(~self.frozen_mask)[0]
+        active_indices = torch.where(~self.frozen_mask & self.can_freeze)[0]
         x_np = x.cpu().numpy()
         v_np = v.cpu().numpy()
         xref_np = self.x_ref.cpu().numpy()
@@ -306,7 +312,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         self.frozen_mask.zero_()
         self.frozen_velocity.zero_()
         self.thaw_deadline.fill_(float("inf"))
-
+#near_zero_mask = (positions[0].abs() < self.cold_start_threshold) & self.can_freeze
     # ------------------------------------------------------------------
     # Cold start: optionally freeze near-zero coordinates at init
     # ------------------------------------------------------------------
@@ -315,8 +321,10 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         if self.cold_start_threshold is None:
             return
         for i in range(self.D):
-            if abs(positions[0, i].item()) < self.cold_start_threshold \
-            and self.kappa[i].item() < 1e6:        # skip never-stick coords
+            #if abs(positions[0, i].item()) < self.cold_start_threshold \
+            #and self.kappa[i].item() < 1e6:        # skip never-stick coords
+            if positions[0].abs() < self.cold_start_threshold \
+            and self.can_freeze:
                 v_init = float(velocities[0, i].item())
                 rate_i = self.kappa[i].item() * abs(v_init)
                 if rate_i < 1e-14:
@@ -326,29 +334,6 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
                 self.frozen_mask[i] = True
                 self.frozen_velocity[i] = v_init
                 self.thaw_deadline[i] = float(np.random.exponential(1.0 / rate_i))
-    # @torch.no_grad()
-    # def _apply_cold_start(self, positions: Tensor, velocities: Tensor):
-    #     """
-    #     Freeze coordinates whose x_ref is near zero, giving the sampler
-    #     a sparse initialisation.
-    #     """
-    #     if self.cold_start_threshold is None:
-    #         return
-
-    #     for i in range(self.D):
-    #         if (
-    #             abs(self.x_ref[i].item()) < self.cold_start_threshold
-    #             and self.kappa[i].item() < 1e5
-    #         ):
-    #             v_draw = abs(self.Sigma_sqrt[i, i].item() * np.random.randn())
-    #             rate_i = self.kappa[i].item() * v_draw
-    #             if rate_i < 1e-14:
-    #                 continue
-    #             positions[0, i] = 0.0
-    #             velocities[0, i] = 0.0
-    #             self.frozen_mask[i] = True
-    #             self.frozen_velocity[i] = 0.0
-    #             self.thaw_deadline[i] = float(np.random.exponential(1.0 / rate_i))
 
     # ------------------------------------------------------------------
     # Main sampling loop

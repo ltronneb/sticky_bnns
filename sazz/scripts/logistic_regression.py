@@ -72,7 +72,7 @@ class Config:
     # NUTS
     nuts_draws: int = 2_000
     nuts_tune: int = 1_000
-    nuts_chains: int = 2
+    nuts_chains: int = 4
     nuts_target_accept: float = 0.9
 
     seed: int = 0

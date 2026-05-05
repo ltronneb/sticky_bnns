@@ -114,7 +114,8 @@ class BNNCategoricalLikelihood(BNNLikelihood):
 
  
 class ModuleLikelihood(Likelihood):
-    def __init__(self, module: nn.Module, X, y, spec: ParamSpec):
+    def __init__(self, module: nn.Module, spec: ParamSpec, 
+                 X: Tensor, y: Tensor):
         super().__init__()
         self.module = module
         self.module.eval()              # turn off dropout/BN updates
@@ -143,7 +144,7 @@ class ModuleGaussianPrior(Prior):
         return self._precision
 
         
-class ModuleGaussianLikelihood(Likelihood):
+class ModuleGaussianLikelihood(ModuleLikelihood):
     """BNN regression likelihood evaluated via torch.func.functional_call.
 
     Wraps an nn.Module + ParamSpec. The forward pass uses functional_call so
@@ -153,17 +154,8 @@ class ModuleGaussianLikelihood(Likelihood):
 
     def __init__(self, module: nn.Module, spec: ParamSpec,
                  X: Tensor, y: Tensor, noise_std: float):
-        super().__init__()
-        self.module = module
-        self.module.eval()
-        self.spec = spec
-        self.register_buffer("X", X)
-        self.register_buffer("y", y)
+        super().__init__(module, spec, X, y) 
         self.noise_std = noise_std
-        
-    # def predict(self, beta: Tensor, X_new: Tensor) -> Tensor:
-    #     params = self.spec.to_dict(beta)
-    #     return torch.func.functional_call(self.module, params, (X_new,))
 
     def log_prob_single(self, beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
         preds = self.predict(beta, X_i).squeeze(-1)
@@ -172,22 +164,52 @@ class ModuleGaussianLikelihood(Likelihood):
     def log_prob(self, beta: Tensor) -> Tensor:
         return self.log_prob_single(beta, self.X, self.y)
  
+
+class ModuleGaussianLikelihoodLearnedNoise(ModuleLikelihood):
+    """Gaussian regression with a learned noise scale.
+    
+    The flat parameter vector now has length spec.D + 1, with the extra
+    coordinate at the end carrying log_sigma. A weakly informative prior
+    log_sigma ~ N(0, prior_log_sigma_std**2) is added to the energy.
+    """
+    def __init__(self, module, spec, X, y, 
+                 prior_log_sigma_mean=0.0, prior_log_sigma_std=1.0):
+        super().__init__(module, spec, X, y)
+        self.prior_log_sigma_mean = prior_log_sigma_mean
+        self.prior_log_sigma_std = prior_log_sigma_std
+
+    def _split(self, beta):
+        return beta[:-1], beta[-1]   # weights, log_sigma
+
+    def predict(self, beta, X_new):
+        # Predictions still come from the network alone; log_sigma is
+        # a separate latent affecting the likelihood, not the regression
+        # function.
+        weights, _ = self._split(beta)
+        return super().predict(weights, X_new)
+
+    def log_prob_single(self, beta, X_i, y_i):
+        weights, log_sigma = self._split(beta)
+        sigma = log_sigma.exp()
+        preds = super().predict(weights, X_i).squeeze(-1)
+        log_lik = Normal(preds, sigma).log_prob(y_i).sum()
+        # Prior on log_sigma — defined directly on the unconstrained scale,
+        # no Jacobian needed.
+        log_prior_sigma = -0.5 * (
+            (log_sigma - self.prior_log_sigma_mean) / self.prior_log_sigma_std
+        ) ** 2
+        return log_lik + log_prior_sigma
+
+    def log_prob(self, beta):
+        return self.log_prob_single(beta, self.X, self.y)
+
  
-class ModuleCategoricalLikelihood(Likelihood):
+class ModuleCategoricalLikelihood(ModuleLikelihood):
     """Multiclass classification likelihood evaluated via functional_call."""
 
     def __init__(self, module: nn.Module, spec: ParamSpec,
                  X: Tensor, y: Tensor):
-        super().__init__()
-        self.module = module
-        self.module.eval()
-        self.spec = spec
-        self.register_buffer("X", X)
-        self.register_buffer("y", y.long())
-
-    # def predict(self, beta: Tensor, X_new: Tensor) -> Tensor:
-    #     params = self.spec.to_dict(beta)
-    #     return torch.func.functional_call(self.module, params, (X_new,))
+        super().__init__(module, spec, X, y.long())
 
     def log_prob_single(self, beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
         logits = self.predict(beta, X_i)
@@ -196,7 +218,7 @@ class ModuleCategoricalLikelihood(Likelihood):
     def log_prob(self, beta: Tensor) -> Tensor:
         return self.log_prob_single(beta, self.X, self.y)
 
-  
+
 
     
     

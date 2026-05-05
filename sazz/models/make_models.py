@@ -20,6 +20,7 @@ class TorchTarget:
         self.marginal_grids = marginal_grids  # dict[int, {grid, pdf, label}]
         self.meta = meta or {}
 
+
 def _prepend_intercept(X: Tensor) -> Tensor:
     """Add a column of 1s at position 0 for the implicit intercept."""
     N = X.shape[0]
