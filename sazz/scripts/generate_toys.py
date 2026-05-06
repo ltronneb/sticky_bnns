@@ -43,7 +43,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from sazz.scripts.uci_bnn import BNNConfig
+from sazz.scripts.uci_bnn_module import BNNConfig
 
 TOY_DIR = Path("datasets/toy_1d")
 TOY_NAMES = ("hernandez", "gap", "sharp", "multiscale")

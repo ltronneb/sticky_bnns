@@ -124,6 +124,24 @@ class ParamSpec:
     def n_groups(self) -> int:
         """Number of distinct parameter tensors (== len(named_parameters))."""
         return len(self.names)
+    
+    def with_extra_scalar(self, name: str, can_freeze: bool = False) -> "ParamSpec":
+        """Append a scalar latent (e.g. log_sigma) to this spec.
+        
+        The scalar is treated as a 1D tensor of size 1, gets the bias prior
+        (prior_std_bias), and defaults to can_freeze=False since most uses
+        (noise scale, observation precision) shouldn't go through the freeze
+        machinery.
+        """
+        return ParamSpec(
+            names=self.names + [name],
+            shapes=self.shapes + [torch.Size([1])],
+            numels=self.numels + [1],
+            fan_ins=self.fan_ins + [1],
+            is_bias=self.is_bias + [True],
+            can_freeze=self.can_freeze + [can_freeze],
+            D=self.D + 1,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -390,6 +390,7 @@ def piecewise_thinning_sinusoidal_second_order(rate_time, horizon, alpha=1.2,
                                    max_ratio, bound_violations)
     return result
 
+
 def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
                        R=2.0, max_iter=200, diagnostics=True):
     if t_init is None:
@@ -522,6 +523,7 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
         }
         return result, stats
     return result
+
 
 # def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None, 
 #                        R=2.0, max_iter=200, diagnostics=True):

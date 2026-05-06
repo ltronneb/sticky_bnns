@@ -84,6 +84,7 @@ def find_reference_bnn(
     reference: Literal["prior", "laplace_diag", "adam"] = "laplace_diag",
     n_fisher_batch: int = 64,
     floor_eps: float = 1e-8,
+    #init_beta=None, 
 ) -> tuple[Tensor, Tensor]:
     """
     MAP via Adam + choice of diagonal reference precision for BNNs.
@@ -141,8 +142,29 @@ def find_reference_bnn(
         )
 
     # --- MAP via Adam ---
-    beta = torch.randn(D, dtype=dtype, device=device) * 0.01
+    if model is not None and hasattr(model.likelihood, "module"):
+        init_module_beta = torch.cat([
+            p.detach().flatten() for p in model.likelihood.module.parameters()
+        ]).to(dtype=dtype, device=device)
+        
+        if init_module_beta.numel() == D:
+            beta = init_module_beta
+        elif init_module_beta.numel() < D:
+            # Learned-noise case: pad with zeros for log_sigma (and any future
+            # extra latents). exp(0) = 1, sensible starting noise scale.
+            pad = torch.zeros(D - init_module_beta.numel(), dtype=dtype, device=device)
+            beta = torch.cat([init_module_beta, pad])
+        else:
+            raise ValueError(
+                f"Module has more parameters ({init_module_beta.numel()}) than "
+                f"the sampler dimension D={D}."
+            )
+    else:
+        beta = torch.randn(D, dtype=dtype, device=device)
+
     beta.requires_grad_(True)
+    #beta = torch.randn(D, dtype=dtype, device=device) #* 0.01
+    #beta.requires_grad_(True)
     optimizer = torch.optim.Adam([beta], lr=lr)
     for _ in range(n_steps):
         optimizer.zero_grad()

@@ -9,7 +9,8 @@ import time as _time
 
 import pandas as pd
 
-from sazz.utils.linear_envelope import piecewise_thinning, piecewise_thinning_midpoint, piecewise_thinning_sinusoidal, piecewise_thinning_sinusoidal_second_order
+#from sazz.utils.OLD.linear_envelope import piecewise_thinning, piecewise_thinning_midpoint, piecewise_thinning_sinusoidal, piecewise_thinning_sinusoidal_second_order
+from sazz.utils.bounding import piecewise_thinning_sinusoidal_second_order
 from sazz.samplers.boomerang_sampler.BoomerangSampler import BoomerangSampler
 
 class BoomerangSampler_PLI(BoomerangSampler):

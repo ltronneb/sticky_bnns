@@ -8,7 +8,7 @@ from .priors_torch import Prior
 from .likelihoods_torch import Likelihood
 from .models_torch import BayesianModel
 
-from ..utils.bnn_utils import unflatten_params, _build_prior_precision, get_activation, count_params
+from ..utils.OLD.bnn_utils import unflatten_params, _build_prior_precision, get_activation, count_params
 from ..utils.warmup import find_reference_bnn
 from ..utils.bnn_modular_utils import ParamSpec
 
@@ -167,42 +167,45 @@ class ModuleGaussianLikelihood(ModuleLikelihood):
 
 class ModuleGaussianLikelihoodLearnedNoise(ModuleLikelihood):
     """Gaussian regression with a learned noise scale.
-    
-    The flat parameter vector now has length spec.D + 1, with the extra
-    coordinate at the end carrying log_sigma. A weakly informative prior
-    log_sigma ~ N(0, prior_log_sigma_std**2) is added to the energy.
+
+    Sampled coordinate is log_sigma (last entry of beta). The implied prior
+    on sigma = exp(log_sigma) is HalfNormal(prior_sigma_scale). The
+    half-normal density on sigma, transformed to log_sigma via the standard
+    change-of-variables, contributes:
+
+        log p(log_sigma) = -sigma**2 / (2 * tau**2) + log_sigma + const
+
+    The corresponding entry in ModuleGaussianPrior's precision vector
+    should be 0, since the prior on log_sigma lives entirely here.
     """
-    def __init__(self, module, spec, X, y, 
-                 prior_log_sigma_mean=0.0, prior_log_sigma_std=1.0):
-        super().__init__(module, spec, X, y)
-        self.prior_log_sigma_mean = prior_log_sigma_mean
-        self.prior_log_sigma_std = prior_log_sigma_std
+    def __init__(self, module, base_spec, X, y, prior_sigma_scale=1.0):
+        extended_spec = base_spec.with_extra_scalar(
+            "log_sigma", can_freeze=False,
+        )
+        super().__init__(module, extended_spec, X, y)
+        self.base_spec = base_spec
+        self.prior_sigma_scale = prior_sigma_scale
 
     def _split(self, beta):
-        return beta[:-1], beta[-1]   # weights, log_sigma
+        return beta[:-1], beta[-1]
 
     def predict(self, beta, X_new):
-        # Predictions still come from the network alone; log_sigma is
-        # a separate latent affecting the likelihood, not the regression
-        # function.
         weights, _ = self._split(beta)
-        return super().predict(weights, X_new)
+        params = self.base_spec.to_dict(weights)
+        return torch.func.functional_call(self.module, params, (X_new,))
 
     def log_prob_single(self, beta, X_i, y_i):
-        weights, log_sigma = self._split(beta)
+        _, log_sigma = self._split(beta)
         sigma = log_sigma.exp()
-        preds = super().predict(weights, X_i).squeeze(-1)
+        preds = self.predict(beta, X_i).squeeze(-1)
         log_lik = Normal(preds, sigma).log_prob(y_i).sum()
-        # Prior on log_sigma — defined directly on the unconstrained scale,
-        # no Jacobian needed.
-        log_prior_sigma = -0.5 * (
-            (log_sigma - self.prior_log_sigma_mean) / self.prior_log_sigma_std
-        ) ** 2
-        return log_lik + log_prior_sigma
+        # HalfNormal(tau) on sigma, with Jacobian to log_sigma
+        log_prior = -0.5 * (sigma / self.prior_sigma_scale) ** 2 + log_sigma
+        return log_lik + log_prior
 
     def log_prob(self, beta):
         return self.log_prob_single(beta, self.X, self.y)
-
+    
  
 class ModuleCategoricalLikelihood(ModuleLikelihood):
     """Multiclass classification likelihood evaluated via functional_call."""

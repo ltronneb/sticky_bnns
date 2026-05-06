@@ -162,10 +162,12 @@ def build_sampler(name: str, target: TorchTarget):
     if name == "sticky_zigzag":
         return StickyAutomaticZigZagSampler(
             **common, t_max=T_MAX_ZZ, gamma=GAMMA_ZZ, kappa=kappa,
+            can_freeze=torch.tensor(spec.can_freeze, dtype=torch.bool)
         )
     if name == "sticky_boomerang":
         s = StickyAutomaticBoomerangSampler(
             **common, refresh_rate=1.0, kappa=kappa,
+            can_freeze=torch.tensor(spec.can_freeze, dtype=torch.bool)
         )
         s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
         info = tune_refresh_rate(s, n_pilot=200)

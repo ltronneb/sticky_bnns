@@ -39,7 +39,7 @@ from sazz.samplers.AutomaticZigZagSampler_torch import AutomaticZigZagSampler
 from sazz.samplers.StickyAutomaticZigZagSampler_torch import (
     StickyAutomaticZigZagSampler,
 )
-from sazz.models.bnn_torch import ModuleGaussianPrior, ModuleGaussianLikelihood
+from sazz.models.bnn_torch import ModuleGaussianPrior, ModuleGaussianLikelihood, ModuleGaussianLikelihoodLearnedNoise
 from sazz.models.make_models import TorchTarget
 from sazz.models.models_torch import BayesianModel
 from sazz.utils.bnn_modular_utils import (
@@ -78,7 +78,7 @@ N_SAVE      = NUTS_DRAWS * NUTS_CHAINS
 
 HIDDEN      = [50]
 
-OUT_DIR     = Path("results/uci_bnn_v2")
+OUT_DIR     = Path("results/uci_bnn_module")
 TOY_DIR     = Path("datasets/toy_1d")
 
 PDMP_SAMPLER_NAMES = ("zigzag", "sticky_zigzag", "boomerang", "sticky_boomerang")
@@ -202,6 +202,56 @@ def build_target(data: dict[str, Any], cfg: BNNConfig,
     )
 
 
+def build_target_learned_noise(data, cfg, prior_sigma_scale=1.0,
+                               dtype=torch.float64, device="cpu"):
+    """v2 regression target with a learned noise scale.
+
+    The sampled vector has length base_spec.D + 1, with log_sigma at the
+    end. The prior on log_sigma is HalfNormal(prior_sigma_scale) on sigma,
+    transformed to the log scale — encoded inside the likelihood class.
+    The corresponding entry in the prior precision vector is therefore 0.
+    """
+    X = data["X_train"].to(dtype=dtype, device=device)
+    y = data["y_train"].to(dtype=dtype, device=device)
+
+    module = FFN(cfg.layer_sizes, cfg.activation)
+    base_spec = ParamSpec.from_module(module)
+    extended_spec = base_spec.with_extra_scalar("log_sigma", can_freeze=False)
+
+    # Build precision for the EXTENDED spec (so prec has length D+1), then
+    # zero the last entry — log_sigma's prior lives in the likelihood, not
+    # in ModuleGaussianPrior.
+    prec = build_prior_precision(
+        extended_spec, cfg.prior_std_weight, cfg.prior_std_bias,
+        cfg.fan_in_scaling, dtype, device,
+    )
+    prec[-1] = 0.0
+
+    prior = ModuleGaussianPrior(prec)
+    likelihood = ModuleGaussianLikelihoodLearnedNoise(
+        module, base_spec, X, y, prior_sigma_scale=prior_sigma_scale,
+    )
+    model = BayesianModel(prior, likelihood)
+
+    x_ref, Sigma_inv = find_reference_bnn(
+        model.energy, extended_spec.D, model=model, dtype=dtype, device=device,
+        reference="laplace_diag", n_steps=cfg.adam_steps, lr=1e-2,
+    )
+    sigma_map = x_ref[-1].exp()
+    prior_curvature = 2.0 * sigma_map ** 2 / prior_sigma_scale ** 2
+    Sigma_inv[-1, -1] = Sigma_inv[-1, -1] + prior_curvature
+
+    return TorchTarget(
+        name=f"bnn_v2ln_{'x'.join(map(str, cfg.layer_sizes))}_{cfg.activation}",
+        D=extended_spec.D,
+        grad_target=model.grad_energy,
+        x_ref=x_ref,
+        Sigma_inv=Sigma_inv,
+        meta={"model": model, "spec": extended_spec, "module": module,
+              "base_spec": base_spec, "layer_sizes": cfg.layer_sizes},
+    )
+
+
 # ===========================================================================
 # PDMP samplers
 # ===========================================================================
@@ -221,8 +271,13 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
             prior_inclusion_weight=cfg.prior_inclusion_weight,
             fan_in_scaling=cfg.fan_in_scaling,
         )
+        can_freeze = torch.repeat_interleave(
+            torch.tensor(spec.can_freeze, dtype=torch.bool),
+            torch.tensor(spec.numels),
+        )
         return StickyAutomaticZigZagSampler(
-            **common, t_max=T_MAX_ZZ, gamma=GAMMA_ZZ, kappa=kappa,
+            **common, t_max=T_MAX_ZZ, gamma=GAMMA_ZZ, kappa=kappa, 
+            can_freeze=can_freeze
         )
 
     if name == "boomerang":
@@ -240,8 +295,13 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
             prior_inclusion_weight=cfg.prior_inclusion_weight,
             fan_in_scaling=cfg.fan_in_scaling,
         )
+        can_freeze = torch.repeat_interleave(
+            torch.tensor(spec.can_freeze, dtype=torch.bool),
+            torch.tensor(spec.numels),
+        )
         s = StickyAutomaticBoomerangSampler(
             **common, refresh_rate=1.0, kappa=kappa,
+            can_freeze=can_freeze
         )
         s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
         info = tune_refresh_rate(s, n_pilot=200)
@@ -456,13 +516,21 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
 
 def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
               cfg: BNNConfig, out_dir: Path,
-              samplers: tuple[str, ...], resume: bool) -> None:
+              samplers: tuple[str, ...], resume: bool,#) -> None:
+              learned_noise: bool = False) -> None:
+    suffix = "_ln" if learned_noise else ""
     print(f"\n--- {dataset_name.upper()} split {split_id:02d} | "
           f"layers={cfg.layer_sizes} | act={cfg.activation} | "
-          f"noise_std={cfg.noise_std} | seed={BASE_SEED + split_id} ---")
+          f"noise={'learned' if learned_noise else f'fixed ({cfg.noise_std})'} | "
+          f"seed={BASE_SEED + split_id} ---")
 
     needs_pdmp = any(s in PDMP_SAMPLER_NAMES for s in samplers)
-    target = build_target(data, cfg) if needs_pdmp else None
+    if needs_pdmp:
+        target = (build_target_learned_noise(data, cfg)
+                  if learned_noise else build_target(data, cfg))
+    else:
+        target = None
+
     if target is not None:
         print(f"  D = {target.D}")
 
@@ -470,9 +538,9 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
     sd = split_dir(out_dir, dataset_name, split_id)
 
     for name in samplers:
-        out_path = sd / f"{name}.pt"
+        out_path = sd / f"{name}{suffix}.pt"   # <-- suffix here
         if resume and out_path.exists():
-            print(f"  [{name}] skipping — exists at {out_path}")
+            print(f"  [{name}{suffix}] skipping — exists at {out_path}")
             continue
 
         print(f"  [{name}]")
@@ -526,6 +594,9 @@ def main():
                         choices=list(ALL_DATASETS))
     parser.add_argument("--samplers", nargs="+", default=None,
                         choices=list(ALL_SAMPLER_NAMES))
+    parser.add_argument("--learned-noise", action="store_true",
+                    help="Use the half-normal-on-sigma learned noise model "
+                         "instead of fixed cfg.noise_std.")
     parser.add_argument("--splits", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--include-nuts", action="store_true")
     parser.add_argument("--include-nuts-hs", action="store_true")
@@ -556,10 +627,11 @@ def main():
             for split_id in args.splits:
                 data = make_split(X, y, seed=BASE_SEED + split_id)
                 run_split(ds, split_id, data, cfgs[ds],
-                          args.out, tuple(samplers), resume=args.resume)
+                          args.out, tuple(samplers), resume=args.resume, learned_noise=args.learned_noise)
 
     if toy_to_run:
         print("\nLoading toy 1D datasets...")
+        directory = Path(f"{args.out}" + "/toys")        
         try:
             toys = {n: load_toy(n, args.toy_dir) for n in toy_to_run}
         except FileNotFoundError as e:
@@ -571,8 +643,9 @@ def main():
               f"samplers {samplers} | pipeline=v2")
         for ds in toy_to_run:
             data, cfg = toys[ds]
-            run_split(ds, 0, data, cfg, args.out, tuple(samplers),
-                      resume=args.resume)
+            run_split(ds, 0, data, cfg, directory, tuple(samplers),
+                      resume=args.resume, learned_noise=args.learned_noise)
+            
 
 
 if __name__ == "__main__":

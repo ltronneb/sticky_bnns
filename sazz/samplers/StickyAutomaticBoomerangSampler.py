@@ -323,8 +323,8 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         for i in range(self.D):
             #if abs(positions[0, i].item()) < self.cold_start_threshold \
             #and self.kappa[i].item() < 1e6:        # skip never-stick coords
-            if positions[0].abs() < self.cold_start_threshold \
-            and self.can_freeze:
+            if positions[0, i].abs().item() < self.cold_start_threshold \
+            and self.can_freeze[i].item():
                 v_init = float(velocities[0, i].item())
                 rate_i = self.kappa[i].item() * abs(v_init)
                 if rate_i < 1e-14:

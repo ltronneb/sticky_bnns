@@ -76,7 +76,7 @@ from sazz.samplers.StickyAutomaticZigZagSampler_torch import (
     StickyAutomaticZigZagSampler,
 )
 from sazz.models.bnn_torch import make_bnn_regression, predict_regression
-from sazz.utils.bnn_utils import make_kappa_from_inclusion
+from sazz.utils.OLD.bnn_utils import make_kappa_from_inclusion
 from sazz.utils.warmup import tune_refresh_rate
 from sazz.utils.sampling import (
     resample_boomerang_path,
