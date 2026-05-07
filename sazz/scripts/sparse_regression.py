@@ -1,11 +1,14 @@
-"""Linear regression — Boomerang & Zig-Zag (sticky and non-sticky) vs NUTS.
+"""Sparse linear regression — sticky samplers on a high-D problem.
 
-Small synthetic benchmark (N=200, D=8) with a Gaussian prior and known
-ground truth. Includes analytic posterior as reference.
+Large-D benchmark designed to stress-test sparsity-inducing behaviour.
+Sticky samplers are expected to freeze most null coordinates; non-sticky
+samplers and NUTS serve as baselines. No analytic posterior (Student-t
+prior), and NUTS is slow at this scale so it's off by default.
 
 Usage:
-    python -m sazz.scripts.linear_regression
-    python -m sazz.scripts.linear_regression --N 500 --D 20 --n-signals 5 --seed 1
+    python -m sazz.scripts.sparse_regression
+    python -m sazz.scripts.sparse_regression --N 2000 --D 200 --n-signals 8 \
+        --signal-scale 2.0 --prior-std 1.0 --seed 0 --no-nuts --save
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import torch
 from sklearn.metrics import f1_score
 
 from sazz.models.model import BayesianModel, TorchTarget
-from sazz.models.priors import ModuleGaussianPrior
+from sazz.models.priors import ModuleGaussianPrior, ModuleStudentTPrior
 from sazz.models.likelihoods import ModuleGaussianLikelihood
 from sazz.models.glms import LinearRegressionNet
 from sazz.utils.bnn_utils import ParamSpec
@@ -34,19 +37,20 @@ torch.set_default_dtype(torch.float64)
 
 @dataclass
 class Config:
-    N: int = 200
-    D: int = 8
-    n_signals: int = 3
-    signal_scale: float = 1.5
-    intercept_true: float = 0.5
-    noise_std: float = 0.3
+    N: int = 2000
+    D: int = 200
+    n_signals: int = 5
+    signal_scale: float = 2.0
+    intercept_true: float = 0.0
+    noise_std: float = 0.5
 
+    prior: str = "Gauss"   # "Gauss" or "StudT"
     prior_std: float = 1.0
     bias_prior_std: float = 10.0
     lik_noise_std: float = 0.5
 
-    n_skel: int = 10_000
-    n_resample: int = 5_000
+    n_skel: int = 100_000
+    n_resample: int = 10_000
     burnin_frac: float = 0.5
     refresh_rate: float = 1.0
     kappa_null: float = 0.4
@@ -55,8 +59,8 @@ class Config:
     t_max_zz: float = 0.1
     gamma_zz: float = 0.01
 
-    nuts_draws: int = 2_000
-    nuts_tune: int = 1_000
+    nuts_draws: int = 5_000
+    nuts_tune: int = 2_000
     nuts_chains: int = 4
 
     seed: int = 0
@@ -75,29 +79,29 @@ def make_data(cfg: Config):
     return X, y, true_coefs, true_coefs != 0
 
 
-def analytic_posterior(X, y, cfg: Config):
-    X_aug = np.column_stack([np.ones(len(X)), X])
-    D = X_aug.shape[1]
-    prec_prior = np.eye(D) / cfg.prior_std ** 2
-    prec_prior[0, 0] = 1.0 / cfg.bias_prior_std ** 2
-    prec = X_aug.T @ X_aug / cfg.lik_noise_std ** 2 + prec_prior
-    Sigma = np.linalg.inv(prec)
-    mu = Sigma @ (X_aug.T @ y / cfg.lik_noise_std ** 2)
-    return mu, Sigma
-
-
 def make_target(X, y, cfg: Config) -> TorchTarget:
     X_t = torch.tensor(X)
     y_t = torch.tensor(y)
     net = LinearRegressionNet(cfg.D)
     spec = ParamSpec.from_module(net)
-    prec = torch.tensor(
-        [1.0 / (cfg.bias_prior_std ** 2 if is_b else cfg.prior_std ** 2)
-         for sz, is_b in zip(spec.numels, spec.is_bias) for _ in range(sz)]
-    )
-    model = BayesianModel(ModuleGaussianPrior(prec), ModuleGaussianLikelihood(net, spec, X_t, y_t, cfg.lik_noise_std))
-    x_ref, Sigma_inv = find_reference_glm(model.energy, spec.D, diagonal_only=False)
-    return TorchTarget(f"linreg_D{cfg.D}", spec.D, model.grad_energy, x_ref, Sigma_inv,
+
+    if cfg.prior == "Gauss":
+        prec = torch.tensor(
+            [1.0 / (cfg.bias_prior_std ** 2 if is_b else cfg.prior_std ** 2)
+             for sz, is_b in zip(spec.numels, spec.is_bias) for _ in range(sz)]
+        )
+        prior = ModuleGaussianPrior(prec)
+    else:
+        bias_mask = torch.tensor(
+            [is_b for sz, is_b in zip(spec.numels, spec.is_bias) for _ in range(sz)]
+        )
+        prior = ModuleStudentTPrior(bias_mask, bias_std=cfg.bias_prior_std,
+                                    scale=cfg.prior_std, df=3.0)
+
+    likelihood = ModuleGaussianLikelihood(net, spec, X_t, y_t, cfg.lik_noise_std)
+    model = BayesianModel(prior, likelihood)
+    x_ref, Sigma_inv = find_reference_glm(model.energy, spec.D, diagonal_only=True)
+    return TorchTarget(f"sparse_linreg_D{cfg.D}", spec.D, model.grad_energy, x_ref, Sigma_inv,
                        meta={"model": model, "net": net, "spec": spec})
 
 
@@ -106,7 +110,10 @@ def run_nuts(X, y, cfg: Config) -> dict:
     set_seed(cfg.seed)
     with pm.Model():
         intercept = pm.Normal("intercept", mu=0.0, sigma=cfg.bias_prior_std)
-        betas = pm.Normal("betas", mu=0.0, sigma=cfg.prior_std, shape=cfg.D)
+        if cfg.prior == "Gauss":
+            betas = pm.Normal("betas", mu=0.0, sigma=cfg.prior_std, shape=cfg.D)
+        else:
+            betas = pm.StudentT("betas", nu=3.0, mu=0.0, sigma=cfg.prior_std, shape=cfg.D)
         pm.Normal("y", mu=intercept + X @ betas, sigma=cfg.lik_noise_std, observed=y)
         t0 = time.perf_counter()
         trace = pm.sample(draws=cfg.nuts_draws, tune=cfg.nuts_tune, chains=cfg.nuts_chains,
@@ -153,59 +160,60 @@ def compute_metrics(method, true_coefs, is_signal, X_te_aug, y_te_clean, sd_ref)
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--N",          type=int,   default=200)
-    p.add_argument("--D",          type=int,   default=8)
-    p.add_argument("--n-signals",  type=int,   default=3)
-    p.add_argument("--signal-scale", type=float, default=1.5)
-    p.add_argument("--prior-std",  type=float, default=1.0)
-    p.add_argument("--n-skel",     type=int,   default=10_000)
-    p.add_argument("--n-resample", type=int,   default=5_000)
-    p.add_argument("--thinning",   choices=["pli", "brent"], default="pli")
-    p.add_argument("--seed",       type=int,   default=0)
-    p.add_argument("--no-nuts",    action="store_true")
-    p.add_argument("--nuts-hs",    action="store_true", help="Also run NUTS with horseshoe prior")
-    p.add_argument("--no-plots",   action="store_true")
-    p.add_argument("--save",       action="store_true")
+    p.add_argument("--N",           type=int,   default=2000)
+    p.add_argument("--D",           type=int,   default=200)
+    p.add_argument("--n-signals",   type=int,   default=5)
+    p.add_argument("--signal-scale",type=float, default=2.0)
+    p.add_argument("--prior",       choices=["Gauss", "StudT"], default="Gauss")
+    p.add_argument("--prior-std",   type=float, default=1.0)
+    p.add_argument("--n-skel",      type=int,   default=100_000)
+    p.add_argument("--n-resample",  type=int,   default=10_000)
+    p.add_argument("--thinning",    choices=["pli", "brent"], default="pli")
+    p.add_argument("--seed",        type=int,   default=0)
+    p.add_argument("--nuts",        action="store_true", help="Run NUTS (slow at high D)")
+    p.add_argument("--nuts-hs",     action="store_true", help="Run NUTS with horseshoe prior (slow at high D)")
+    p.add_argument("--no-plots",    action="store_true")
+    p.add_argument("--save",        action="store_true")
     args = p.parse_args()
 
     cfg = Config(N=args.N, D=args.D, n_signals=args.n_signals,
-                 signal_scale=args.signal_scale, prior_std=args.prior_std,
+                 signal_scale=args.signal_scale, prior=args.prior, prior_std=args.prior_std,
                  n_skel=args.n_skel, n_resample=args.n_resample,
                  thinning=args.thinning, seed=args.seed)
     set_seed(cfg.seed)
-    print(f"Linear regression  N={cfg.N} D={cfg.D} K={cfg.n_signals} seed={cfg.seed}")
+    print(f"Sparse regression  N={cfg.N} D={cfg.D} K={cfg.n_signals} prior={cfg.prior} seed={cfg.seed}")
 
     X, y, true_coefs, is_signal = make_data(cfg)
+    print(f"signals = {int(is_signal.sum())}/{len(true_coefs)}")
+
     test_rng = np.random.default_rng(cfg.seed + 1)
     X_te = (lambda Z: (Z - Z.mean(0)) / Z.std(0))(test_rng.normal(size=(cfg.N, cfg.D)))
     y_te_clean = X_te @ true_coefs[1:] + true_coefs[0]
     X_te_aug = np.column_stack([np.ones(cfg.N), X_te])
 
-    # Analytic posterior (Gaussian prior + Gaussian likelihood → exact)
-    mu_an, Sigma_an = analytic_posterior(X, y, cfg)
-    analytic_samples = np.random.default_rng(cfg.seed).multivariate_normal(mu_an, Sigma_an, size=8_000)
-    sd_ref = analytic_samples.std(0)
-
-    rows = [dict(name="Analytic", samples=analytic_samples, wall=None,
-                 sticky=False, color="k", marker="D")]
-    if not args.no_nuts:
-        print("Running NUTS...")
+    rows = []
+    if args.nuts:
+        print("Running NUTS (slow)...")
         rows.append(run_nuts(X, y, cfg))
     if args.nuts_hs:
-        print("Running NUTS (horseshoe)...")
+        print("Running NUTS (horseshoe, slow)...")
         rows.append(run_nuts_horseshoe(X, y, cfg))
+    sd_ref = rows[0]["samples"].std(0) if rows else None
 
     target = make_target(X, y, cfg)
     print("Running PDMP samplers...")
     rows.extend(run_pdmps(target, cfg))
 
+    if sd_ref is None:
+        sd_ref = next((r["samples"].std(0) for r in rows if not r["sticky"]), None)
+
     rows = [compute_metrics(r, true_coefs, is_signal, X_te_aug, y_te_clean, sd_ref) for r in rows]
     print_table(rows, metric_key="pred_rmse", metric_label="pred-RMSE")
 
-    out_dir = Path(f"results/linear_regression/N{cfg.N}_D{cfg.D}_K{cfg.n_signals}_seed{cfg.seed}") if args.save else None
+    out_dir = Path(f"results/sparse_regression/N{cfg.N}_D{cfg.D}_K{cfg.n_signals}_{cfg.prior}_seed{cfg.seed}") if args.save else None
     if not args.no_plots:
         plot_coefs(rows, true_coefs, is_signal,
-                   f"Linear regression D={cfg.D}, K={cfg.n_signals}",
+                   f"Sparse regression D={cfg.D}, K={cfg.n_signals}, {cfg.prior} prior",
                    (out_dir / "coefs.png") if out_dir else None)
     if args.save:
         save_run(out_dir, cfg, rows,
