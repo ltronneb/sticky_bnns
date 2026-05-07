@@ -21,7 +21,7 @@ import torch
 import math
 from torch import Tensor
 from typing import Optional, Literal
-from ..models.models_torch import BayesianModel
+from ..models.model import BayesianModel
 
 def find_reference_glm(
     energy_fn,
