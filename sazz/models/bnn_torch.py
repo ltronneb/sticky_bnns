@@ -221,8 +221,6 @@ class ModuleCategoricalLikelihood(ModuleLikelihood):
     def log_prob(self, beta: Tensor) -> Tensor:
         return self.log_prob_single(beta, self.X, self.y)
 
-
-
     
     
 def make_bnn_regression(X, y, layer_sizes, activation="tanh",
