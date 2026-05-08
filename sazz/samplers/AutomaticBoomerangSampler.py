@@ -137,20 +137,30 @@ class AutomaticBoomerangSampler(nn.Module):
         x_ref = x_ref.to(dtype=self.dtype, device=self.device).detach()
         Sigma_inv = Sigma_inv.to(dtype=self.dtype, device=self.device).detach()
 
-        # Force symmetry + jitter
-        Sigma_inv = 0.5 * (Sigma_inv + Sigma_inv.T)
-        Sigma_inv = Sigma_inv + jitter * torch.eye(
-            self.D, dtype=self.dtype, device=self.device
-        )
-
-        Sigma = torch.linalg.inv(Sigma_inv)
-        Sigma = 0.5 * (Sigma + Sigma.T)
-        Sigma_sqrt = torch.linalg.cholesky(Sigma)  # lower triangular
-
-        self.x_ref = x_ref
-        self.Sigma_inv = Sigma_inv
-        self.Sigma = Sigma
-        self.Sigma_sqrt = Sigma_sqrt
+        if Sigma_inv.ndim == 1:
+            # Diagonal path: Sigma_inv is a 1-D vector of diagonal entries.
+            # All operations are elementwise — no [D, D] matrix ever allocated.
+            Sigma_inv_diag = Sigma_inv + jitter
+            Sigma_diag     = 1.0 / Sigma_inv_diag
+            Sigma_sqrt_diag = Sigma_diag.sqrt()
+            self.x_ref      = x_ref
+            self.Sigma_inv  = Sigma_inv_diag   # 1-D
+            self.Sigma      = Sigma_diag        # 1-D
+            self.Sigma_sqrt = Sigma_sqrt_diag   # 1-D
+        else:
+            # Original full-matrix path (kept for non-diagonal Sigma_inv).
+            # Force symmetry + jitter
+            Sigma_inv = 0.5 * (Sigma_inv + Sigma_inv.T)
+            Sigma_inv = Sigma_inv + jitter * torch.eye(
+                self.D, dtype=self.dtype, device=self.device
+            )
+            Sigma = torch.linalg.inv(Sigma_inv)
+            Sigma = 0.5 * (Sigma + Sigma.T)
+            Sigma_sqrt = torch.linalg.cholesky(Sigma)  # lower triangular
+            self.x_ref      = x_ref
+            self.Sigma_inv  = Sigma_inv
+            self.Sigma      = Sigma
+            self.Sigma_sqrt = Sigma_sqrt
 
     # ------------------------------------------------------------------
     # Dynamics — ON the computational graph
@@ -173,7 +183,10 @@ class AutomaticBoomerangSampler(nn.Module):
         Gradient of the *excess* potential (target minus reference Gaussian).
         Stays on the graph.
         """
-        return self.grad_target(x) - self.Sigma_inv @ (x - self.x_ref)
+        # Original: self.Sigma_inv @ (x - self.x_ref)  [full matrix]
+        dx = x - self.x_ref
+        prec_dx = self.Sigma_inv * dx if self.Sigma_inv.ndim == 1 else self.Sigma_inv @ dx
+        return self.grad_target(x) - prec_dx
 
     def reflect_velocity(self, v: Tensor, grad: Tensor) -> Tensor:
         """
@@ -181,9 +194,15 @@ class AutomaticBoomerangSampler(nn.Module):
         Stays on the graph.
         """
         rate = torch.dot(v, grad)
-        skew = self.Sigma_sqrt.T @ grad
-        denom = torch.dot(skew, skew)
-        return v - 2.0 * rate / denom * (self.Sigma_sqrt @ skew)
+        # Original: skew = self.Sigma_sqrt.T @ grad; self.Sigma_sqrt @ skew  [full matrix]
+        if self.Sigma_sqrt.ndim == 1:
+            skew = self.Sigma_sqrt * grad
+            denom = torch.dot(skew, skew)
+            return v - 2.0 * rate / denom * (self.Sigma_sqrt * skew)
+        else:
+            skew = self.Sigma_sqrt.T @ grad
+            denom = torch.dot(skew, skew)
+            return v - 2.0 * rate / denom * (self.Sigma_sqrt @ skew)
 
     # ------------------------------------------------------------------
     # Rate function — thin wrapper used OFF graph by the bounding code
@@ -263,7 +282,8 @@ class AutomaticBoomerangSampler(nn.Module):
     def _refresh_velocity(self) -> Tensor:
         """Sample a fresh velocity from N(0, Sigma)."""
         z = torch.randn(self.D, dtype=self.dtype, device=self.device)
-        return self.Sigma_sqrt @ z
+        # Original: self.Sigma_sqrt @ z  [full matrix]
+        return self.Sigma_sqrt * z if self.Sigma_sqrt.ndim == 1 else self.Sigma_sqrt @ z
 
     # ------------------------------------------------------------------
     # Main sampling loop

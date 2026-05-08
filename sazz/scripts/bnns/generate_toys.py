@@ -1,37 +1,7 @@
-"""Generate toy 1D datasets for BNN benchmarking, persist to disk.
-
-Each toy dataset is generated once with a fixed seed, preprocessed
-(standardised inputs and targets), bundled with a `BNNConfig` describing
-the architecture/prior/noise model that should be used for it, and
-written to `datasets/toy_1d/<name>.pt`. Subsequent runs of `uci_bnn.py`
-load these `.pt` files directly — no RNG involved on the runner side, so
-results are reproducible regardless of unrelated code changes.
-
-The on-disk schema for a toy `.pt` matches what `make_split` returns for
-UCI datasets, plus:
-  - "config":         BNNConfig instance used to build the BNN target
-  - "y_test_clean":   noise-free test targets (standardised)
-  - "y_test_clean_raw", "x_train_raw", "y_train_raw", "x_test_raw"
-  - "noise_std_true", "x_mean", "x_std", "y_mean"
-
-Datasets:
-  hernandez   PBP / HL&A 2015 toy: y = x^3 + N(0, 9), 20 training points on [-4, 4]
-  gap         y = sin(1.5x) + 0.3x with a gap in [-1.5, 1.5]
-  sharp       tanh + sharp Gaussian bump near x=0.5
-  multiscale  superposition of slow and fast sinusoids
-
+"""
 Usage:
     # Generate everything (overwrites if --force is set)
     python -m sazz.scripts.generate_toys
-
-    # Generate only one
-    python -m sazz.scripts.generate_toys --names hernandez
-
-    # Force re-generation
-    python -m sazz.scripts.generate_toys --force
-
-    # Custom output directory
-    python -m sazz.scripts.generate_toys --out datasets/my_toys
 """
 
 from __future__ import annotations
@@ -42,8 +12,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
-from sazz.scripts.bnns.uci_bnn import BNNConfig
 
 TOY_DIR = Path("datasets/toy_1d")
 TOY_NAMES = ("hernandez", "gap", "sharp", "multiscale")
@@ -93,24 +61,12 @@ def _gen_hernandez(rng: np.random.Generator) -> dict[str, Any]:
     noise = 3.0
     x_train = rng.uniform(-4.0, 4.0, size=20)
     y_train = true_f(x_train) + rng.normal(0, noise, size=20)
-    x_test = np.linspace(-6.0, 6.0, 300)
+    x_test = np.linspace(-4.0, 4.0, 300)
     y_test_clean = true_f(x_test)
     y_test_noisy = y_test_clean + rng.normal(0, noise, size=300)
     data = _standardise_1d(x_train, y_train, x_test, y_test_noisy,
                            y_test_clean, noise)
-
-    # HL&A 2015 toy uses [1, 100, 1] ReLU. Noise on standardised scale is
-    # noise_true / y_std — which we know exactly now that we have the data.
-    data["config"] = BNNConfig(
-        layer_sizes=[1, 100, 1],
-        activation="relu",
-        noise_std=noise / data["y_std"],
-        prior_std_weight=1.0,
-        prior_std_bias=1.0,
-        fan_in_scaling=True,
-        adam_steps=3000,
-        prior_inclusion_weight=[0.5, 0.5],
-    )
+    data["noise_std"] = noise / data["y_std"]
     return data
 
 
@@ -128,16 +84,7 @@ def _gen_gap(rng: np.random.Generator) -> dict[str, Any]:
     y_test_noisy = y_test_clean + rng.normal(0, noise, size=300)
     data = _standardise_1d(x_train, y_train, x_test, y_test_noisy,
                            y_test_clean, noise)
-    data["config"] = BNNConfig(
-        layer_sizes=[1, 100, 1],
-        activation="tanh",
-        noise_std=noise / data["y_std"],
-        prior_std_weight=1.0,
-        prior_std_bias=1.0,
-        fan_in_scaling=True,
-        adam_steps=3000,
-        prior_inclusion_weight=[0.5, 0.5],
-    )
+    data["noise_std"] = noise / data["y_std"]
     return data
 
 
@@ -155,16 +102,7 @@ def _gen_sharp(rng: np.random.Generator) -> dict[str, Any]:
     y_test_noisy = y_test_clean + rng.normal(0, noise, size=300)
     data = _standardise_1d(x_train, y_train, x_test, y_test_noisy,
                            y_test_clean, noise)
-    data["config"] = BNNConfig(
-        layer_sizes=[1, 100, 1],
-        activation="tanh",
-        noise_std=noise / data["y_std"],
-        prior_std_weight=1.0,
-        prior_std_bias=1.0,
-        fan_in_scaling=True,
-        adam_steps=3000,
-        prior_inclusion_weight=[0.5, 0.5],
-    )
+    data["noise_std"] = noise / data["y_std"]
     return data
 
 
@@ -179,16 +117,7 @@ def _gen_multiscale(rng: np.random.Generator) -> dict[str, Any]:
     y_test_noisy = y_test_clean + rng.normal(0, noise, size=300)
     data = _standardise_1d(x_train, y_train, x_test, y_test_noisy,
                            y_test_clean, noise)
-    data["config"] = BNNConfig(
-        layer_sizes=[1, 100, 1],
-        activation="tanh",
-        noise_std=noise / data["y_std"],
-        prior_std_weight=1.0,
-        prior_std_bias=1.0,
-        fan_in_scaling=True,
-        adam_steps=3000,
-        prior_inclusion_weight=[0.5, 0.5],
-    )
+    data["noise_std"] = noise / data["y_std"]
     return data
 
 
@@ -241,7 +170,7 @@ def main():
         print(f"  {name}: saved -> {path}  "
               f"(n_train={data['n_train']}, n_test={data['n_test']}, "
               f"y_std={data['y_std']:.3f}, "
-              f"noise_std_standardised={data['config'].noise_std:.4f})")
+              f"noise_std_standardised={data['noise_std']:.4f})")
 
 
 if __name__ == "__main__":

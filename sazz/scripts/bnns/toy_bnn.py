@@ -1,19 +1,4 @@
-"""UCI BNN benchmarks — v2 modular pipeline (ParamSpec + nn.Module + functional_call).
-
-Drop-in alternative to `uci_bnn.py`. The likelihood is an nn.Module evaluated
-via torch.func.functional_call; prior precision and kappa are built from a
-ParamSpec derived from the module.
-
-This script only runs samplers and saves the resulting chains. Metrics live in
-`sazz.utils.evaluation` (or wherever the metrics utility ends up). Every
-sampler — PDMP and NUTS alike — saves a `samples` tensor of comparable length
-(thinned to match NUTS's draws-per-run), so downstream evaluation code has a
-single uniform interface.
-
-Output goes to results/uci_bnn_v2/ so v1 results are not overwritten.
-
-Usage (same shape as uci_bnn.py):
-
+"""
     python -m sazz.scripts.toy_bnn --datasets hernandez
 """
 
@@ -45,6 +30,7 @@ from sazz.utils.bnn_utils import (
 )
 from sazz.models.neural_networks import FFN
 from sazz.utils.warmup import find_reference_bnn, tune_refresh_rate
+from sazz.scripts.bnns.generate_toys import GENERATORS, DEFAULT_SEED
 from sazz.utils.sampling import (
     resample_boomerang_path, resample_boomerang_path_sticky,
     resample_zigzag_path, resample_zigzag_path_sticky,
@@ -57,8 +43,8 @@ from sazz.utils.sampling import (
 
 torch.set_default_dtype(torch.float64)
 
-N_SKELETON  = 100_000
-N_RESAMPLE  = 50_000
+N_SKELETON  = 10_000
+N_RESAMPLE  = 5_000
 BURNIN_FRAC = 0.2
 BASE_SEED   = 42
 
@@ -83,14 +69,43 @@ PDMP_SAMPLER_NAMES = ("zigzag", "sticky_zigzag", "boomerang", "sticky_boomerang"
 ALL_SAMPLER_NAMES  = PDMP_SAMPLER_NAMES + ("nuts", "nuts_horseshoe")
 TOY_DATASETS       = ("hernandez", "gap", "sharp", "multiscale")
 
+# Prior scales and architecture — edit here to change hyperparameters.
+# noise_std is data-dependent and filled in at load time from the .pt file.
+DATASET_CONFIGS = {
+    "hernandez": dict(
+        layer_sizes=[1, 100, 1], activation="relu",
+        prior_std_weight=3.0, prior_std_bias=3.0,
+        fan_in_scaling=True, adam_steps=3000,
+        prior_inclusion_weight=[0.5, 0.5],
+    ),
+    "gap": dict(
+        layer_sizes=[1, 100, 1], activation="tanh",
+        prior_std_weight=3.0, prior_std_bias=3.0,
+        fan_in_scaling=True, adam_steps=3000,
+        prior_inclusion_weight=[0.5, 0.5],
+    ),
+    "sharp": dict(
+        layer_sizes=[1, 100, 1], activation="tanh",
+        prior_std_weight=3.0, prior_std_bias=3.0,
+        fan_in_scaling=True, adam_steps=3000,
+        prior_inclusion_weight=[0.5, 0.5],
+    ),
+    "multiscale": dict(
+        layer_sizes=[1, 100, 1], activation="tanh",
+        prior_std_weight=5.0, prior_std_bias=5.0,
+        fan_in_scaling=True, adam_steps=3000,
+        prior_inclusion_weight=[0.5, 0.5],
+    ),
+}
+
 
 @dataclass
 class BNNConfig:
     layer_sizes: list[int]
     activation: str = "relu"
     noise_std: float = 0.3
-    prior_std_weight: float = 1.0
-    prior_std_bias: float = 1.0
+    prior_std_weight: float = 5.0
+    prior_std_bias: float = 5.0
     fan_in_scaling: bool = True
     adam_steps: int = 5000
     prior_inclusion_weight: list[float] = field(default_factory=list)
@@ -103,14 +118,11 @@ class BNNConfig:
 
 def load_toy(name: str, toy_dir: Path) -> tuple[dict[str, Any], BNNConfig]:
     path = toy_dir / f"{name}.pt"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Toy dataset '{name}' not found at {path}. "
-            f"Run: python -m sazz.scripts.generate_toys --names {name}"
-        )
-    print(path)
-    data = torch.load(path, weights_only=False)
-    cfg = data.pop("config")
+    toy_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(DEFAULT_SEED)
+    data = GENERATORS[name](rng)
+    torch.save(data, path)
+    cfg = BNNConfig(**DATASET_CONFIGS[name], noise_std=data["noise_std"])
     return data, cfg
 
 
@@ -584,7 +596,7 @@ def main():
                 f"python -m sazz.scripts.generate_toys --names {' '.join(toy_to_run)}")
         return
     print(f"\nRunning {toy_to_run} (single split each) | "
-            f"samplers {samplers} | pipeline=v2")
+            f"samplers {samplers}")
     for ds in toy_to_run:
         data, cfg = toys[ds]
         run_split(ds, 0, data, cfg, directory, tuple(samplers),

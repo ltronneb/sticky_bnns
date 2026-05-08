@@ -208,10 +208,14 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
 
         v_a = v[active]
         g_a = grad[active]
-        Sigma_a = self.Sigma[active][:, active]
+        # Original: Sigma_a = self.Sigma[active][:, active]; Sigma_g = Sigma_a @ g_a  [full matrix]
+        if self.Sigma.ndim == 1:
+            Sigma_g = self.Sigma[active] * g_a
+        else:
+            Sigma_a = self.Sigma[active][:, active]
+            Sigma_g = Sigma_a @ g_a
 
         rate = torch.dot(v_a, g_a)
-        Sigma_g = Sigma_a @ g_a
         denom = torch.dot(g_a, Sigma_g)
 
         if denom.item() <= 1e-14:
@@ -231,12 +235,17 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         active = ~self.frozen_mask
 
         if torch.any(active):
-            n_active = int(active.sum().item())
-            Sigma_a = self.Sigma[active][:, active]
-            jitter = 1e-12 * torch.eye(n_active, dtype=self.dtype, device=self.device)
-            chol_a = torch.linalg.cholesky(Sigma_a + jitter)
-            z = torch.randn(n_active, dtype=self.dtype, device=self.device)
-            v[active] = chol_a @ z
+            # Original: Sigma_a = self.Sigma[active][:, active]; chol_a = cholesky(Sigma_a); v[active] = chol_a @ z  [full matrix]
+            if self.Sigma.ndim == 1:
+                z = torch.randn(int(active.sum().item()), dtype=self.dtype, device=self.device)
+                v[active] = self.Sigma_sqrt[active] * z
+            else:
+                n_active = int(active.sum().item())
+                Sigma_a = self.Sigma[active][:, active]
+                jitter = 1e-12 * torch.eye(n_active, dtype=self.dtype, device=self.device)
+                chol_a = torch.linalg.cholesky(Sigma_a + jitter)
+                z = torch.randn(n_active, dtype=self.dtype, device=self.device)
+                v[active] = chol_a @ z
 
         return v
 

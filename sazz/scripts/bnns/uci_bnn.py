@@ -9,8 +9,8 @@ sampler — PDMP and NUTS alike — saves a `samples` tensor of comparable lengt
 single uniform interface.
 
 Usage:
-    python -m sazz.scripts.uci_bnn --datasets boston --splits 0
-    python -m sazz.scripts.uci_bnn --datasets energy --include-nuts
+    python -m sazz.scripts.bnns.uci_bnn --datasets boston --splits 0
+    python -m sazz.scripts.bnns.uci_bnn --datasets energy --include-nuts
 """
 
 from __future__ import annotations
@@ -253,7 +253,7 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
         )
         return StickyAutomaticZigZagSampler(
             **common, t_max=T_MAX_ZZ, gamma=GAMMA_ZZ, kappa=kappa, 
-            can_freeze=can_freeze, cold_start_threshold=1e-5
+            can_freeze=can_freeze, cold_start_threshold=1e-4
         )
 
     if name == "boomerang":
@@ -278,7 +278,7 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
         )
         s = StickyAutomaticBoomerangSampler(
             **common, refresh_rate=1.0, kappa=kappa,
-            can_freeze=can_freeze, cold_start_threshold=1e-5
+            can_freeze=can_freeze, cold_start_threshold=1e-4
         )
         s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
         info = tune_refresh_rate(s, n_pilot=200)

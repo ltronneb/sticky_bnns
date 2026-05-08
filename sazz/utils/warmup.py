@@ -210,8 +210,10 @@ def find_reference_bnn(
         )
 
     diag_prec = diag_prec.clamp(min=floor_eps)
-    Sigma_inv = torch.diag(diag_prec)
-    return x_ref, Sigma_inv
+    # Return as 1-D diagonal vector — preprocess handles both 1-D and 2-D.
+    # Avoids allocating a [D, D] matrix (critical for large D like CNNs).
+    # Original: Sigma_inv = torch.diag(diag_prec)
+    return x_ref, diag_prec
 
 
 def _empirical_fisher_diag(
@@ -413,55 +415,4 @@ def tune_refresh_rate(
         "T_pilot": T_pilot,
         "floor_active": floor_active,
     }
-
-
-# def warmup(sampler, n_rounds=3, n_pilot=500,
-#                      target=None, tune_refresh=False):
-#     """
-#     Iterative warm-up: run short pilots, update (x_ref, Sigma_inv)
-#     from resampled path moments.
-#     """
-#     dtype = sampler.dtype
-#     device = sampler.device
-#     D = sampler.D
-
-#     # --- Round 0: initial reference ---
-#     if target is not None and target.x_ref is not None:
-#         sampler.preprocess(
-#             x_ref=target.x_ref.to(dtype=dtype, device=device),
-#             Sigma_inv=target.Sigma_inv.to(dtype=dtype, device=device),
-#         )
-#     else:
-#         # No reference available — start with prior-like defaults
-#         sampler.preprocess(
-#             x_ref=torch.zeros(D, dtype=dtype, device=device),
-#             Sigma_inv=torch.eye(D, dtype=dtype, device=device),
-#         )
-
-#     # --- Iterative refinement ---
-#     for i in range(n_rounds):
-#         result = sampler.sample(N=n_pilot, diagnostics=False)
-
-#         pos_np = result["positions"].cpu().numpy()
-#         vel_np = result["velocities"].cpu().numpy()
-#         tim_np = result["times"].cpu().numpy()
-#         x_ref_np = sampler.x_ref.cpu().numpy()
-
-#         samples = resample_pdmp_path(
-#             pos_np, vel_np, tim_np, x_ref_np,
-#             N_resample=n_pilot, burnin_frac=0.0,
-#         )
-
-#         x_ref_new = np.mean(samples, axis=0)
-#         var_diag = np.clip(np.var(samples, axis=0), 1e-8, None)
-#         Sigma_inv_new = np.diag(1.0 / var_diag)
-
-#         sampler.preprocess(
-#             x_ref=torch.tensor(x_ref_new, dtype=dtype, device=device),
-#             Sigma_inv=torch.tensor(Sigma_inv_new, dtype=dtype, device=device),
-#         )
-
-#     # if tune_refresh:
-#     #     _tune_refresh_rate(sampler, n_pilot)
-        
-        
+     

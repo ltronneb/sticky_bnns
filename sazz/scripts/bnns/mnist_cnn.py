@@ -10,9 +10,10 @@ underdetermined, but the goal is "does it run, how fast" rather than
 "are the predictions any good."
 
 Usage:
-    python -m sazz.scripts.mnist_cnn
-    python -m sazz.scripts.mnist_cnn --sampler sticky_zigzag
-    python -m sazz.scripts.mnist_cnn --n-train 50 --n-skeleton 5000
+    python -m sazz.scripts.bnns.mnist_cnn
+    python -m sazz.scripts.bnns.mnist_cnn --n-train 500 --batch-size 64
+    python -m sazz.scripts.bnns.mnist_cnn --sampler sticky_zigzag
+    python -m sazz.scripts.bnns.mnist_cnn --n-train 50 --n-skeleton 5000
 """
 
 from __future__ import annotations
@@ -32,9 +33,9 @@ from sazz.samplers.StickyAutomaticBoomerangSampler import (
 from sazz.samplers.StickyAutomaticZigZagSampler import (
     StickyAutomaticZigZagSampler,
 )
-from sazz.models.bnn import ModuleGaussianPrior, ModuleCategoricalLikelihood
-from sazz.models.make_models import TorchTarget
-from sazz.models.model import BayesianModel
+from sazz.models.priors import ModuleGaussianPrior
+from sazz.models.likelihoods import ModuleCategoricalLikelihood
+from sazz.models.model import BayesianModel, TorchTarget
 from sazz.models.neural_networks import CNN
 from sazz.utils.bnn_utils import (
     ParamSpec, build_prior_precision, make_kappa_from_inclusion,
@@ -48,17 +49,17 @@ from sazz.utils.sampling import (
 torch.set_default_dtype(torch.float64)
 
 # Knobs — kept small so it actually finishes
-N_TRAIN     = 100
-N_TEST      = 100
-N_SKELETON  = 2_000
+N_TRAIN     = 1000
+N_TEST      = 500
+N_SKELETON  = 1_000
 N_RESAMPLE  = 500
 BURNIN_FRAC = 0.2
 
 T_MAX_ZZ    = 0.1
 GAMMA_ZZ    = 0.01
 
-PRIOR_STD_W = 1.0
-PRIOR_STD_B = 1.0
+PRIOR_STD_W = 5.0
+PRIOR_STD_B = 5.0
 INCL_W      = 0.5     # spike-and-slab inclusion weight per layer
 
 DATA_DIR    = Path("../datasets")
@@ -103,7 +104,9 @@ def load_mnist_subset(n_train: int, n_test: int, seed: int = 0):
 # Target
 # ===========================================================================
 
-def build_target(X_train, y_train, dtype=torch.float64) -> TorchTarget:
+def build_target(X_train, y_train, dtype=torch.float64,
+                 batch_size: int | None = None,
+                 map_path: Path | None = None) -> TorchTarget:
     """Build a CNN-BNN target for MNIST classification."""
     module = CNN(activation="relu").to(dtype=dtype)
     spec = ParamSpec.from_module(module)
@@ -123,19 +126,48 @@ def build_target(X_train, y_train, dtype=torch.float64) -> TorchTarget:
     likelihood = ModuleCategoricalLikelihood(module, spec, X_train, y_train)
     model = BayesianModel(prior, likelihood)
 
-    print("\n  Running find_reference_bnn ...")
-    t0 = time.perf_counter()
-    x_ref, Sigma_inv = find_reference_bnn(
-        model.energy, spec.D, model=model, dtype=dtype, device="cpu",
-        reference="laplace_diag", n_steps=2000, lr=1e-2,
-    )
-    print(f"  find_reference done in {time.perf_counter() - t0:.1f}s  "
-          f"||x_ref||_inf = {x_ref.abs().max().item():.3f}")
+    N = X_train.shape[0]
+    if batch_size is not None:
+        m = batch_size
+        scale = N / m
+        def grad_target_mb(beta: torch.Tensor) -> torch.Tensor:
+            idx = torch.randint(0, N, (m,))
+            b = beta.detach().requires_grad_(True)
+            with torch.enable_grad():
+                prior_grad = torch.autograd.grad(
+                    -model.prior.log_prob(b), b, create_graph=False
+                )[0]
+                ll = likelihood.log_prob_single(b, X_train[idx], y_train[idx])
+                ll_grad = torch.autograd.grad(ll, b, create_graph=False)[0]
+            return prior_grad - scale * ll_grad
+        grad_target = grad_target_mb
+        print(f"  minibatch gradient: batch_size={m}, scale={scale:.1f}")
+    else:
+        grad_target = model.grad_energy
+
+    if map_path is not None:
+        print(f"\n  Loading MAP from {map_path} ...")
+        ckpt = torch.load(map_path, weights_only=False)
+        assert ckpt["D"] == spec.D, \
+            f"MAP file has D={ckpt['D']} but model has D={spec.D}"
+        x_ref     = ckpt["x_ref"].to(dtype=dtype)
+        Sigma_inv = ckpt["Sigma_inv"].to(dtype=dtype)
+        print(f"  loaded  ||x_ref||_inf={x_ref.abs().max():.3f}  "
+              f"(train_acc={ckpt.get('train_acc', float('nan')):.3f})")
+    else:
+        print("\n  Running find_reference_bnn ...")
+        t0 = time.perf_counter()
+        x_ref, Sigma_inv = find_reference_bnn(
+            model.energy, spec.D, model=model, dtype=dtype, device="cpu",
+            reference="prior", n_steps=2000, lr=1e-2,
+        )
+        print(f"  find_reference done in {time.perf_counter() - t0:.1f}s  "
+              f"||x_ref||_inf = {x_ref.abs().max().item():.3f}")
 
     return TorchTarget(
         name="mnist_cnn_bnn",
         D=spec.D,
-        grad_target=model.grad_energy,
+        grad_target=grad_target,
         x_ref=x_ref,
         Sigma_inv=Sigma_inv,
         meta={"model": model, "spec": spec, "module": module},
@@ -158,16 +190,20 @@ def build_sampler(name: str, target: TorchTarget):
     print(f"  kappa: min={kappa.min().item():.3f}  "
           f"max={kappa.max().item():.3e}  "
           f"(weights vs biases — biases should be ~1e6)")
-
+    
+    can_freeze = torch.repeat_interleave(
+            torch.tensor(spec.can_freeze, dtype=torch.bool),
+            torch.tensor(spec.numels),
+    )
     if name == "sticky_zigzag":
         return StickyAutomaticZigZagSampler(
             **common, t_max=T_MAX_ZZ, gamma=GAMMA_ZZ, kappa=kappa,
-            can_freeze=torch.tensor(spec.can_freeze, dtype=torch.bool)
+            can_freeze=can_freeze, cold_start_threshold=1e-2
         )
     if name == "sticky_boomerang":
         s = StickyAutomaticBoomerangSampler(
             **common, refresh_rate=1.0, kappa=kappa,
-            can_freeze=torch.tensor(spec.can_freeze, dtype=torch.bool)
+            can_freeze=can_freeze, cold_start_threshold=1e-2
         )
         s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
         info = tune_refresh_rate(s, n_pilot=200)
@@ -216,12 +252,18 @@ def predict_class_probs(samples: Tensor, target: TorchTarget,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sampler", default="sticky_boomerang",
+    parser.add_argument("--sampler", default="sticky_zigzag",
                         choices=["sticky_zigzag", "sticky_boomerang"])
     parser.add_argument("--n-train", type=int, default=N_TRAIN)
     parser.add_argument("--n-test",  type=int, default=N_TEST)
     parser.add_argument("--n-skeleton", type=int, default=N_SKELETON)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Minibatch size for gradient estimation. "
+                             "Default: None (full data).")
+    parser.add_argument("--map-path", type=Path, default=None,
+                        help="Path to a .pt file saved by cnn_map.py. "
+                             "If given, skips find_reference_bnn.")
     args = parser.parse_args()
 
     print("=" * 72)
@@ -237,10 +279,24 @@ def main():
     )
 
     print("\n[target]")
-    target = build_target(X_train, y_train)
+    target = build_target(X_train, y_train, batch_size=args.batch_size,
+                          map_path=args.map_path)
 
     print(f"\n[sampler] building {args.sampler}")
     sampler = build_sampler(args.sampler, target)
+
+    spec = target.meta["spec"]
+    can_freeze = torch.repeat_interleave(
+        torch.tensor(spec.can_freeze, dtype=torch.bool),
+        torch.tensor(spec.numels),
+    )
+    near_zero_mask = (target.x_ref.abs() < sampler.cold_start_threshold) & can_freeze
+    n_frozen_init  = int(near_zero_mask.sum())
+    n_freezable    = int(can_freeze.sum())
+    print(f"\n[cold start]  threshold={sampler.cold_start_threshold:.0e}")
+    print(f"  MAP weights near zero : {n_frozen_init:>6} / {n_freezable}  "
+          f"({100 * n_frozen_init / n_freezable:.1f}% of freezable, "
+          f"{100 * n_frozen_init / target.D:.1f}% of all D={target.D})")
 
     print(f"\n[sampling] {args.n_skeleton} skeleton points ...")
     t0 = time.perf_counter()
