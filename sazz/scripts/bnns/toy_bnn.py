@@ -200,7 +200,10 @@ def build_target_learned_noise(data, cfg, prior_sigma_scale=1.0,
     )
     sigma_map = x_ref[-1].exp()
     prior_curvature = 2.0 * sigma_map ** 2 / prior_sigma_scale ** 2
-    Sigma_inv[-1, -1] = Sigma_inv[-1, -1] + prior_curvature
+    if Sigma_inv.dim() == 1:
+        Sigma_inv[-1] = Sigma_inv[-1] + prior_curvature
+    else:
+        Sigma_inv[-1, -1] = Sigma_inv[-1, -1] + prior_curvature
 
     return TorchTarget(
         name=f"bnn_v2ln_{'x'.join(map(str, cfg.layer_sizes))}_{cfg.activation}",

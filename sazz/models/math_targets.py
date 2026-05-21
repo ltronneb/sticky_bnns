@@ -147,3 +147,54 @@ def make_gaussian_mixture(D=1, preset="bimodal", dtype=torch.float64):
         Sigma_inv=0.1 * torch.eye(D, dtype=dtype),
         marginal_grids=marginal_grids,
     )
+
+
+def make_neals_funnel(D=10, sigma_v=3.0, dtype=torch.float64):
+    """
+    Neal's funnel: v ~ N(0, sigma_v^2), x_i | v ~ N(0, exp(v)) i.i.d. for i=1..D-1.
+    """
+    if D < 2:
+        raise ValueError("Funnel needs D >= 2 (one v plus at least one x).")
+
+    sv2 = sigma_v ** 2
+    Dm1 = D - 1
+
+    def grad_target(beta):
+        v = beta[0]
+        x = beta[1:]
+        exp_neg_v = torch.exp(-v)
+        sum_x2 = (x * x).sum()
+        dE_dv = v / sv2 + 0.5 * Dm1 - 0.5 * exp_neg_v * sum_x2
+        dE_dx = exp_neg_v * x
+        return torch.cat([dE_dv.unsqueeze(0), dE_dx])
+
+    grid_v = np.linspace(-4 * sigma_v, 4 * sigma_v, 500)
+    pdf_v = np.exp(-0.5 * grid_v ** 2 / sv2) / (sigma_v * np.sqrt(2 * np.pi))
+
+    # x_i marginal: integrate N(x_i; 0, exp(v)) against N(v; 0, sigma_v^2).
+    # No closed form; use a v-quadrature.
+    v_quad = np.linspace(-4 * sigma_v, 4 * sigma_v, 400)
+    pv_quad = np.exp(-0.5 * v_quad ** 2 / sv2) / (sigma_v * np.sqrt(2 * np.pi))
+    dv = v_quad[1] - v_quad[0]
+    grid_x = np.linspace(-30.0, 30.0, 500)
+    pdf_x = np.zeros_like(grid_x)
+    for j, xj in enumerate(grid_x):
+        cond = np.exp(-0.5 * xj ** 2 * np.exp(-v_quad)) / np.sqrt(2 * np.pi * np.exp(v_quad))
+        pdf_x[j] = np.sum(cond * pv_quad) * dv
+
+    marginal_grids = {0: {"grid": grid_v, "pdf": pdf_v, "label": r"$v$"}}
+    for i in range(1, D):
+        marginal_grids[i] = {"grid": grid_x, "pdf": pdf_x, "label": rf"$x_{{{i}}}$"}
+
+
+    Sigma_inv = torch.eye(D, dtype=dtype)
+    Sigma_inv[0, 0] = 1.0 / sv2
+
+    return TorchTarget(
+        name=f"neals_funnel_D{D}_sv{sigma_v}",
+        D=D,
+        grad_target=grad_target,
+        x_ref=torch.zeros(D, dtype=dtype),
+        Sigma_inv=Sigma_inv,
+        marginal_grids=marginal_grids,
+    )

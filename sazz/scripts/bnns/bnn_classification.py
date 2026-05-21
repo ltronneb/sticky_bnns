@@ -106,6 +106,7 @@ def build_target(
 
 def build_sampler(
     name: str, target, *,
+    thinning: str = "pli",
     prior_std_weight: float = 1.0,
     prior_inclusion_weight: float = 0.5,
     fan_in_scaling: bool = True,
@@ -113,7 +114,7 @@ def build_sampler(
     t_max: float = 0.1,
     gamma: float = 0.01,
 ):
-    common = dict(grad_target=target.grad_target, D=target.D, thinning="pli")
+    common = dict(grad_target=target.grad_target, D=target.D, thinning=thinning)
     spec = target.meta["spec"]
 
     if name == "zigzag":
@@ -186,6 +187,7 @@ def sample_bnn_classification(
     n_skeleton: int = 10_000,
     n_resample: int = 5_000,
     burnin_frac: float = 0.2,
+    thinning: str = "pli",
     prior_std_weight: float = 1.0,
     prior_std_bias: float = 1.0,
     prior_inclusion_weight: float = 0.5,
@@ -209,6 +211,7 @@ def sample_bnn_classification(
     print(f"[2/3] Sampling {n_skeleton} skeleton events")
     s = build_sampler(
         sampler, target,
+        thinning=thinning,
         prior_std_weight=prior_std_weight,
         prior_inclusion_weight=prior_inclusion_weight,
         fan_in_scaling=fan_in_scaling,

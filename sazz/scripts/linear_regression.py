@@ -202,7 +202,7 @@ def main():
     rows = [compute_metrics(r, true_coefs, is_signal, X_te_aug, y_te_clean, sd_ref) for r in rows]
     print_table(rows, metric_key="pred_rmse", metric_label="pred-RMSE")
 
-    out_dir = Path(f"results/linear_regression/N{cfg.N}_D{cfg.D}_K{cfg.n_signals}_seed{cfg.seed}") if args.save else None
+    out_dir = Path(f"results/linear_regression/{args.thinning}/N{cfg.N}_D{cfg.D}_K{cfg.n_signals}_seed{cfg.seed}") if args.save else None
     if not args.no_plots:
         plot_coefs(rows, true_coefs, is_signal,
                    f"Linear regression D={cfg.D}, K={cfg.n_signals}",

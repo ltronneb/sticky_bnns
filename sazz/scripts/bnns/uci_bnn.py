@@ -108,16 +108,16 @@ def load_raw_datasets() -> dict[str, tuple[np.ndarray, np.ndarray]]:
     from sklearn.datasets import fetch_openml
 
     boston = fetch_openml(name="boston", version=1, as_frame=True, parser="auto")
-    # df_naval = pd.read_csv("datasets/naval_data.txt", sep=r"\s+", header=None)
-    # df_energy = pd.read_excel("datasets/energy_data.xlsx")
+    df_naval = pd.read_csv("datasets/naval_data.txt", sep=r"\s+", header=None)
+    df_energy = pd.read_excel("datasets/energy_data.xlsx")
 
     return {
         "boston": (boston.data.values.astype(float),
                    boston.target.values.astype(float)),
-        # "naval":  (df_naval.iloc[:, :16].values.astype(float),
-        #            df_naval.iloc[:, 16].values.astype(float)),
-        # "energy": (df_energy.iloc[:, :8].values.astype(float),
-        #            df_energy.iloc[:, 8].values.astype(float)),
+        "naval":  (df_naval.iloc[:, :16].values.astype(float),
+                   df_naval.iloc[:, 16].values.astype(float)),
+        "energy": (df_energy.iloc[:, :8].values.astype(float),
+                   df_energy.iloc[:, 8].values.astype(float)),
     }
 
 
@@ -215,7 +215,10 @@ def build_target_learned_noise(data, cfg, prior_sigma_scale=1.0,
     )
     sigma_map = x_ref[-1].exp()
     prior_curvature = 2.0 * sigma_map ** 2 / prior_sigma_scale ** 2
-    Sigma_inv[-1, -1] = Sigma_inv[-1, -1] + prior_curvature
+    if Sigma_inv.dim() == 1:
+        Sigma_inv[-1] = Sigma_inv[-1] + prior_curvature
+    else:
+        Sigma_inv[-1, -1] = Sigma_inv[-1, -1] + prior_curvature
 
     return TorchTarget(
         name=f"bnn_v2ln_{'x'.join(map(str, cfg.layer_sizes))}_{cfg.activation}",
@@ -313,7 +316,8 @@ def resample_pdmp(name: str, result: dict, x_ref_np: np.ndarray) -> np.ndarray:
 # ===========================================================================
 
 def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
-             prior_sigma_scale: float = 1.0) -> tuple[np.ndarray, float]:
+             prior_sigma_scale: float = 1.0,
+             target: "TorchTarget | None" = None) -> tuple[np.ndarray, float]:
     import jax
     import jax.numpy as jnp
     import numpyro
@@ -353,13 +357,34 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
         with numpyro.plate("data", X.shape[0]):
             numpyro.sample("y", dist.Normal(h.squeeze(-1), sigma), obs=y)
 
-    kernel = NUTS(bnn, target_accept_prob=0.9)
+    # Unpack x_ref (MAP estimate) into named init params so NUTS starts from
+    # the same point as the PDMP samplers, enabling a fair comparison.
+    # Each value needs a leading num_chains dimension for parallel chains.
+    init_params = None
+    if target is not None:
+        x0 = np.asarray(target.x_ref)
+        init_params = {}
+        offset = 0
+        for i, (n_in, n_out) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+            W_size = n_out * n_in
+            W = jnp.array(x0[offset:offset + W_size].reshape(n_out, n_in))
+            init_params[f"W{i}"] = jnp.broadcast_to(W, (NUTS_CHAINS,) + W.shape)
+            offset += W_size
+            b = jnp.array(x0[offset:offset + n_out])
+            init_params[f"b{i}"] = jnp.broadcast_to(b, (NUTS_CHAINS,) + b.shape)
+            offset += n_out
+        if cfg.learned_noise:
+            # x_ref stores log_sigma; NumPyro samples sigma on the positive reals
+            sigma = jnp.exp(jnp.array(x0[offset]))
+            init_params["sigma"] = jnp.broadcast_to(sigma, (NUTS_CHAINS,))
+
+    kernel = NUTS(bnn, target_accept_prob=0.9, adapt_mass_matrix=True)
     mcmc = MCMC(kernel,
                 num_warmup=NUTS_WARMUP, num_samples=NUTS_DRAWS,
                 num_chains=NUTS_CHAINS, progress_bar=True)
 
     t0 = time.perf_counter()
-    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y)
+    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y, init_params=init_params)
     elapsed = time.perf_counter() - t0
 
     posterior = mcmc.get_samples()
@@ -374,7 +399,8 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
     return np.concatenate(flat, axis=1).astype(np.float64), elapsed
 
 def run_nuts_horseshoe(data: dict[str, Any], cfg: BNNConfig, seed: int,
-                       prior_sigma_scale: float = 1.0) -> tuple[np.ndarray, float]:
+                       prior_sigma_scale: float = 1.0,
+                       target: "TorchTarget | None" = None) -> tuple[np.ndarray, float]:
     """NUTS with a horseshoe prior on weights, half-Cauchy on biases.
 
     Per-weight prior:  W_ij ~ N(0, (tau * lambda_ij)^2)
@@ -440,13 +466,34 @@ def run_nuts_horseshoe(data: dict[str, Any], cfg: BNNConfig, seed: int,
         with numpyro.plate("data", X.shape[0]):
             numpyro.sample("y", dist.Normal(h.squeeze(-1), sigma), obs=y)
 
-    kernel = NUTS(bnn, target_accept_prob=0.95)   # tighter step than vanilla
+    # Init from x_ref: tau=lam=1 so W = 1*1*W_raw = x_ref_W at start.
+    # tau and lam adapt freely during warmup — horseshoe regularization kicks in.
+    init_params = None
+    if target is not None:
+        x0 = np.asarray(target.x_ref)
+        init_params = {}
+        offset = 0
+        for i, (n_in, n_out) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+            W_size = n_out * n_in
+            W_raw = jnp.array(x0[offset:offset + W_size].reshape(n_out, n_in))
+            init_params[f"tau{i}"] = jnp.ones(NUTS_CHAINS)
+            init_params[f"lam{i}"] = jnp.ones((NUTS_CHAINS, n_out, n_in))
+            init_params[f"W{i}_raw"] = jnp.broadcast_to(W_raw, (NUTS_CHAINS,) + W_raw.shape)
+            offset += W_size
+            b = jnp.array(x0[offset:offset + n_out])
+            init_params[f"b{i}"] = jnp.broadcast_to(b, (NUTS_CHAINS,) + b.shape)
+            offset += n_out
+        if cfg.learned_noise:
+            sigma = jnp.exp(jnp.array(x0[offset]))
+            init_params["sigma"] = jnp.broadcast_to(sigma, (NUTS_CHAINS,))
+
+    kernel = NUTS(bnn, target_accept_prob=0.95, adapt_mass_matrix=True)
     mcmc = MCMC(kernel,
                 num_warmup=NUTS_WARMUP, num_samples=NUTS_DRAWS,
                 num_chains=NUTS_CHAINS, progress_bar=True)
 
     t0 = time.perf_counter()
-    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y)
+    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y, init_params=init_params)
     elapsed = time.perf_counter() - t0
 
     posterior = mcmc.get_samples()
@@ -511,14 +558,14 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
           f"noise={'learned' if cfg.learned_noise else f'fixed ({cfg.noise_std})'} | "
           f"seed={BASE_SEED + split_id} ---")
 
-    needs_pdmp = any(s in PDMP_SAMPLER_NAMES for s in samplers)
-    if needs_pdmp:
+    needs_target = any(s in PDMP_SAMPLER_NAMES or s in ("nuts", "nuts_horseshoe") for s in samplers)
+    if needs_target:
         target = (build_target_learned_noise(data, cfg)
                   if cfg.learned_noise else build_target(data, cfg))
         print(f"\n  BNN parameter groups (D = {target.meta['spec'].D}):")
         for name, shape, fan_in, is_b, can_freeze in zip(
-            target.meta['spec'].names, target.meta['spec'].shapes, 
-            target.meta['spec'].fan_ins, 
+            target.meta['spec'].names, target.meta['spec'].shapes,
+            target.meta['spec'].fan_ins,
             target.meta['spec'].is_bias, target.meta['spec'].can_freeze
         ):
             print(f"    {name:<20} shape={tuple(shape)}  fan_in={fan_in}  "
@@ -543,7 +590,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 
         if name == "nuts":
             try:
-                samples_np, elapsed = run_nuts(data, cfg, seed)
+                samples_np, elapsed = run_nuts(data, cfg, seed, target=target)
             except ImportError as e:
                 print(f"      NUTS dependency missing ({e}); skipping.")
                 continue
@@ -551,7 +598,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
             n_events = samples_np.shape[0]
         elif name == "nuts_horseshoe":
             try:
-                samples_np, elapsed = run_nuts_horseshoe(data, cfg, seed)
+                samples_np, elapsed = run_nuts_horseshoe(data, cfg, seed, target=target)
             except ImportError as e:
                 print(f"      NumPyro missing ({e}); skipping.")
                 continue

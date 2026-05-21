@@ -303,33 +303,23 @@ def warmup(sampler, n_rounds=3, n_pilot=500, target=None, zero_tol=1e-8):
         else:
             update_mask = np.ones(D, dtype=bool)
 
-        Sigma_inv_diag = np.diag(sampler.Sigma_inv.cpu().numpy()).copy()
         x_ref_new = x_ref_np.copy()
 
-        # if update_mask.any():
-        #     active_samples = samples[:, update_mask]
-        #     x_ref_new[update_mask] = active_samples.mean(axis=0)
-        #     var_diag = np.clip(active_samples.var(axis=0), 1e-8, None)
-        #     Sigma_inv_diag[update_mask] = 1.0 / var_diag
+        # Build a 2-D Sigma_inv matrix to hold the full-covariance update.
+        # sampler.Sigma_inv may be 1-D (diagonal path) or 2-D (full-matrix path).
+        raw = sampler.Sigma_inv.cpu().numpy()
+        Sigma_inv_full = np.diag(raw) if raw.ndim == 1 else raw.copy()
+
         if update_mask.any():
             active_samples = samples[:, update_mask]
             x_ref_new[update_mask] = active_samples.mean(axis=0)
 
-            # Full empirical covariance instead of diagonal variance
             cov = np.cov(active_samples.T)  # shape [n_active, n_active]
-
-            # Regularise to ensure PD
             cov_reg = cov + 1e-6 * np.eye(cov.shape[0])
             Sigma_inv_block = np.linalg.inv(cov_reg)
 
-            # Place into the full Sigma_inv (preserves masked-out coords' values)
-            Sigma_inv_full = sampler.Sigma_inv.cpu().numpy().copy()
             active_idx = np.where(update_mask)[0]
             Sigma_inv_full[np.ix_(active_idx, active_idx)] = Sigma_inv_block
-
-        else:
-            # No active coords — keep current Sigma_inv unchanged
-            Sigma_inv_full = sampler.Sigma_inv.cpu().numpy().copy()
 
         sampler.preprocess(
             x_ref=torch.tensor(x_ref_new, dtype=dtype, device=device),
