@@ -18,6 +18,7 @@ from sazz.utils.sampling import (
     resample_boomerang_path, resample_boomerang_path_sticky,
     resample_zigzag_path, resample_zigzag_path_sticky,
 )
+from sazz.utils.warmup import tune_refresh_rate
 
 PDMP_SPECS = [
     ("Boom",        "boomerang", False, "C0", "o"),
@@ -67,6 +68,7 @@ def run_pdmps(target, cfg, kappa=None) -> list[dict]:
         set_seed(cfg.seed)
         s = build_sampler(family, sticky, target, cfg, kappa)
         t0 = time.perf_counter()
+        #tune_refresh_rate(s, n_pilot=500)
         res = s.sample(N=cfg.n_skel, x0=target.x_ref.clone(), diagnostics=False)
         samples = resample(family, sticky, res, x_ref_np, cfg)
         samples = np.concatenate([samples[:, -1:], samples[:, :-1]], axis=1)
