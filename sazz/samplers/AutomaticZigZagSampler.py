@@ -16,7 +16,7 @@ from tqdm import tqdm
 #       Adaptive piecewise-linear upper envelope; returns +inf if no event
 #       in [0, horizon].
 # ---------------------------------------------------------------------------
-from sazz.utils.bounding import brent, piecewise_thinning
+from sazz.utils.bounding import brent, brent_monotone_aware, piecewise_thinning, grid_thinning
 
 
 class AutomaticZigZagSampler(nn.Module):
@@ -59,7 +59,7 @@ class AutomaticZigZagSampler(nn.Module):
         D: int,
         t_max: float = 0.1,
         gamma: float = 0.01,
-        thinning: Literal["brent", "pli"] = "pli",
+        thinning: Literal["brent", "pli", "brent_monotone", "grid"] = "pli",
         adapt_t_max: bool = False,
         pli_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
@@ -159,8 +159,12 @@ class AutomaticZigZagSampler(nn.Module):
 
         if self.thinning == "brent":
             return self._brent_bound(pos_np, vel_np, horizon)
+        if self.thinning == "brent_monotone":
+            return self._brent_monotone_bound(pos_np, vel_np, horizon)
         elif self.thinning == "pli":
             return self._pli_bound(pos_np, vel_np, horizon)
+        elif self.thinning == "grid":
+            return self._grid_bound(pos_np, vel_np, horizon)
         else:
             raise ValueError(f"Unknown thinning method: {self.thinning}")
 
@@ -189,6 +193,32 @@ class AutomaticZigZagSampler(nn.Module):
         stats["lambda_max"] = lambda_max
         stats["tau"] = tau_star
         return tau_star, stats
+    
+    def _brent_monotone_bound(
+        self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
+    ) -> tuple[float, dict]:
+        """
+        Classic Brent-based global bounding.
+        Find the maximum of the rate in [0, horizon], then do Poisson
+        thinning with that constant bound. The accept/reject step at
+        the proposed time happens in the main loop.
+        """
+        neg_rate_fn = lambda t: -max(self._rate_numpy(t, pos_np, vel_np), 0.0)
+
+        x_star, stats = brent_monotone_aware(neg_rate_fn, 0.0, horizon, diagnostics=True)
+        # Guard the boundary (legacy numpy zig-zag clamps too)
+        # if x_star > horizon:
+        #     x_star = horizon
+        lambda_max = max(-neg_rate_fn(x_star), 0.0)
+
+        if lambda_max <= 1e-14:
+            tau_star = float("inf")
+        else:
+            tau_star = -np.log(np.random.random()) / lambda_max
+
+        stats["lambda_max"] = lambda_max
+        stats["tau"] = tau_star
+        return tau_star, stats
 
     def _pli_bound(
         self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
@@ -199,6 +229,19 @@ class AutomaticZigZagSampler(nn.Module):
         """
         rate_fn = partial(self._rate_numpy, x_np=pos_np, v_np=vel_np)
         tau, stats = piecewise_thinning(
+            rate_fn, horizon, diagnostics=True, **self.pli_kwargs
+        )
+        return tau, stats
+    
+    def _grid_bound(
+        self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
+    ) -> tuple[float, dict]:
+        """
+        Grid bound by (Andral & Kamatani 2024)
+        NOT READY YET
+        """
+        rate_fn = partial(self._rate_numpy, x_np=pos_np, v_np=vel_np)
+        tau, stats = grid_thinning(
             rate_fn, horizon, diagnostics=True, **self.pli_kwargs
         )
         return tau, stats
@@ -302,7 +345,7 @@ class AutomaticZigZagSampler(nn.Module):
 
             event_accepted = False
 
-            if self.thinning == "brent":
+            if self.thinning == "brent" or self.thinning == "brent_monotone":
                 if tau < horizon:
                     row["event_type"] = "bounce"
                     u = np.random.random()

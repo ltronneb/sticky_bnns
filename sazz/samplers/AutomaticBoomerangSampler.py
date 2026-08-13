@@ -39,7 +39,7 @@ from tqdm import tqdm
 #       rate_fn, horizon, ..., diagnostics=True) -> (tau, stats)
 # ---------------------------------------------------------------------------
 from sazz.utils.bounding import (
-    brent,
+    brent, brent_monotone_aware,
     piecewise_thinning_sinusoidal_second_order,
 )
 
@@ -75,7 +75,7 @@ class AutomaticBoomerangSampler(nn.Module):
         grad_target: Callable[[Tensor], Tensor],
         D: int,
         refresh_rate: float = 0.1,
-        thinning: Literal["brent", "pli"] = "pli",
+        thinning: Literal["brent", "pli", "brent_monotone"] = "pli",
         t_max: float = 0.1,
         pli_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
@@ -236,6 +236,8 @@ class AutomaticBoomerangSampler(nn.Module):
 
         if self.thinning == "brent":
             return self._brent_bound(pos_np, vel_np, horizon)
+        elif self.thinning == "brent_monotone":
+            return self._brent_monotone_bound(pos_np, vel_np, horizon)
         elif self.thinning == "pli":
             return self._pli_bound(pos_np, vel_np, horizon)
         else:
@@ -252,6 +254,28 @@ class AutomaticBoomerangSampler(nn.Module):
         neg_rate_fn = lambda t: -max(self._rate_numpy(t, pos_np, vel_np), 0.0)
 
         x_star, stats = brent(neg_rate_fn, 0.0, horizon, diagnostics=True)
+        lambda_max = max(-neg_rate_fn(x_star), 0.0)
+
+        if lambda_max <= 1e-14:
+            tau_star = float("inf")
+        else:
+            tau_star = -math.log(np.random.random()) / lambda_max
+
+        stats["lambda_max"] = lambda_max
+        stats["tau"] = tau_star
+        return tau_star, stats
+
+    def _brent_monotone_bound(
+        self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
+    ) -> tuple[float, dict]:
+        """
+        Monotone aware Brent-based global bounding.
+        Find the maximum of the (negative) rate in [0, horizon], then do
+        Poisson thinning with that constant bound.
+        """
+        neg_rate_fn = lambda t: -max(self._rate_numpy(t, pos_np, vel_np), 0.0)
+
+        x_star, stats = brent_monotone_aware(neg_rate_fn, 0.0, horizon, diagnostics=True)
         lambda_max = max(-neg_rate_fn(x_star), 0.0)
 
         if lambda_max <= 1e-14:
@@ -354,7 +378,7 @@ class AutomaticBoomerangSampler(nn.Module):
                 pos, vel = self.trajectory(time_passed, x_prev, v_prev)
 
             # Determine horizon
-            if self.thinning == "brent":
+            if self.thinning == "brent" or self.thinning == "brent_monotone":
                 horizon = min(self.t_max, dt_refresh)
             else:
                 horizon = dt_refresh
@@ -378,7 +402,7 @@ class AutomaticBoomerangSampler(nn.Module):
 
             event_accepted = False
 
-            if self.thinning == "brent":
+            if self.thinning == "brent" or self.thinning=="brent_monotone":
                 # Brent: tau is from Poisson thinning with constant bound.
                 # Must do accept/reject at the proposed time.
                 if tau < horizon:

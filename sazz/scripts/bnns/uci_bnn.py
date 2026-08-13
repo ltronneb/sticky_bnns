@@ -46,7 +46,6 @@ from sazz.utils.sampling import (
     resample_zigzag_path, resample_zigzag_path_sticky,
 )
 
-
 # ===========================================================================
 # Config
 # ===========================================================================
@@ -83,7 +82,7 @@ class BNNConfig:
     prior_std_weight: float = 1.0
     prior_std_bias: float = 1.0
     fan_in_scaling: bool = True
-    adam_steps: int = 5000
+    adam_steps: int = 20000
     prior_inclusion_weight: list[float] = field(default_factory=list)
     learned_noise: bool = False
 
@@ -260,12 +259,13 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
         )
 
     if name == "boomerang":
-        s = AutomaticBoomerangSampler(**common, refresh_rate=0.1)
-        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
-        info = tune_refresh_rate(s, n_pilot=200)
-        print(f"      tuned refresh_rate: "
-              f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
-        warmup(s, n_rounds=3, n_pilot=2000)
+        SIGMA_INV_SCALE = 10.0
+        s = AutomaticBoomerangSampler(**common, refresh_rate=1.0)
+        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv * SIGMA_INV_SCALE)
+        # info = tune_refresh_rate(s, n_pilot=200)
+        # print(f"      tuned refresh_rate: "
+        #       f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
+        # warmup(s, n_rounds=3, n_pilot=2000)
         return s
 
     if name == "sticky_boomerang":
@@ -283,10 +283,13 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
             **common, refresh_rate=1.0, kappa=kappa,
             can_freeze=can_freeze, cold_start_threshold=1e-4
         )
-        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
-        info = tune_refresh_rate(s, n_pilot=200)
-        print(f"      tuned refresh_rate: "
-              f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
+        SIGMA_INV_SCALE = 10.0
+        s = AutomaticBoomerangSampler(**common, refresh_rate=1.0)
+        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv * SIGMA_INV_SCALE)
+        # s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
+        # info = tune_refresh_rate(s, n_pilot=200)
+        # print(f"      tuned refresh_rate: "
+        #       f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
         return s
 
     raise ValueError(f"Unknown PDMP sampler: {name}")

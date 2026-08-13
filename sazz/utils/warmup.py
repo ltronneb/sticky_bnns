@@ -82,7 +82,7 @@ def find_reference_bnn(
     lr: float = 1e-2,
     model: Optional["BayesianModel"] = None,
     reference: Literal["prior", "laplace_diag", "adam"] = "laplace_diag",
-    n_fisher_batch: int = 64,
+    n_fisher_batch: int = 128,
     floor_eps: float = 1e-8,
     #init_beta=None, 
 ) -> tuple[Tensor, Tensor]:

@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100, diagnostics=True):
     """
@@ -79,38 +80,185 @@ def brent(f, a, b, tol=1e-5, rel_tol=1e-5,maxiter = 100, diagnostics=True):
     return x
 
 
-def sample_trajectory_at_regular_intervals(Position, Velocity, EventTimes, dt):
+def brent_monotone_aware(f, a, b, tol=1e-5, rel_tol=1e-5, maxiter=100,
+                         eps=1e-6, diagnostics=True):
     """
-    Given event-based trajectory (Position, Velocity, EventTimes),
-    return the state at regular time grid with spacing dt.
+    Brent minimizer with a pre-optimization monotonicity check (Corbella et al.).
 
-    Parameters:
-    - Position: array of shape (N, D) of positions at each event
-    - Velocity: array of shape (N, D) of velocities at each event
-    - EventTimes: array of shape (N,) of event times (monotonic increasing)
-    - dt: float, desired time grid spacing
+    Before running the full algorithm, evaluates f at both endpoints and checks
+    whether the function is monotonic in [a, b]. If so, returns the endpoint
+    minimum immediately without further iterations.
 
-    Returns:
-    - t_grid: array of shape (M,) of regular times from 0 up to T_max
-    - pos_grid: array of shape (M, D) positions at each time in t_grid
-    - vel_grid: array of shape (M, D) velocities at each time in t_grid
+    The monotonicity check works as follows:
+      1. Evaluate f(a) and f(b).
+      2. Run the first Brent iteration.
+      3. If either bracket endpoint is unchanged, probe eps-inward from that
+         endpoint to confirm the function approaches from below there.
+      4. If monotone: return that endpoint value. Otherwise: continue as normal.
     """
-    # Create regular time grid
-    T_max = EventTimes[EventTimes > 0].max()
-    t_grid = np.arange(0, T_max + dt, dt)
+    phi = (1 + 5 ** 0.5) / 2
 
-    # For each regular time, find the index of the last event time <= t
-    idx = np.searchsorted(EventTimes, t_grid, side='right') - 1
-    idx = np.clip(idx, 0, len(EventTimes) - 2)
+    f_a = f(a)
+    f_b = f(b)
+    n_rate_evals = 2
 
-    # Compute time offset within each segment
-    tau = (t_grid - EventTimes[idx])[:, None]  # shape (M,1)
+    x = w = v = a + (b - a) / 2
+    f_x = f_w = f_v = f(x)
+    n_rate_evals += 1
 
-    # Linear interpolation for position; velocity is piecewise constant
-    pos_grid = Position[idx] + Velocity[idx] * tau
-    vel_grid = Velocity[idx]
+    a0, b0 = a, b  # remember initial bracket
 
-    return t_grid, pos_grid, vel_grid
+    iteration = 0
+    monotone_checked = False
+
+    while np.abs(b - a) > tol + rel_tol * abs(x):
+        u = None
+        if x != w and x != v and w != v:
+            numerator = (x - w) ** 2 * (f_x - f_v) - (x - v) ** 2 * (f_x - f_w)
+            denominator = 2 * ((x - w) * (f_x - f_v) - (x - v) * (f_x - f_w))
+            if denominator != 0:
+                u = x - numerator / denominator
+        if u is not None and a < u < b and abs(u - x) >= tol:
+            pass
+        else:
+            if x < (a + b) / 2:
+                u = x + (b - x) / phi
+            else:
+                u = x - (b - x) / phi
+
+        f_u = f(u)
+        n_rate_evals += 1
+
+        if f_u < f_x:
+            if u < x:
+                b = x
+            else:
+                a = x
+            v, w, x = w, x, u
+            f_v, f_w, f_x = f_w, f_x, f_u
+        else:
+            if u < x:
+                a = u
+            else:
+                b = u
+            if f_u <= f_w or w == x:
+                v, w = w, u
+                f_v, f_w = f_w, f_u
+            elif f_u <= f_v or v == x or v == w:
+                v = u
+                f_v = f_u
+
+        iteration += 1
+
+        # After first iteration: check for monotonicity
+        if iteration == 1 and not monotone_checked:
+            monotone_checked = True
+            if a == a0:
+                # Left endpoint unchanged — probe just inside a
+                f_probe = f(a0 + eps)
+                n_rate_evals += 1
+                if f_probe >= f_a:
+                    # f is non-decreasing from a: minimum is at a
+                    if diagnostics:
+                        return a0, {'rate_evals': n_rate_evals, 'monotone': True}
+                    return a0
+            elif b == b0:
+                # Right endpoint unchanged — probe just inside b
+                f_probe = f(b0 - eps)
+                n_rate_evals += 1
+                if f_probe >= f_b:
+                    # f is non-decreasing toward b from below: minimum is at b
+                    if diagnostics:
+                        return b0, {'rate_evals': n_rate_evals, 'monotone': True}
+                    return b0
+
+        if iteration > maxiter:
+            break
+
+    if diagnostics:
+        return x, {'rate_evals': n_rate_evals, 'monotone': False}
+    return x
+
+
+def grid_thinning(rate_batch, horizon, n_segments=20, base_rate=0.0, alpha=1.0,
+                  max_iter=200, device=None, dtype=torch.float64,
+                  diagnostics=True):
+    """
+    Thinning against a grid-based piecewise-constant bound (Andral & Kamatani 2024).
+
+    Grid is fixed at window start; rejections do not re-anchor it. On segment
+    [t_i, t_{i+1}] the bound is max(y_i, y_{i+1}, m_i), where m_i is the ordinate
+    of the intersection of the endpoint tangents.
+
+    rate_batch(t) takes a 1-D tensor of times and returns the SIGNED rate at each,
+    differentiably. The knot derivatives come from autograd, so the bound costs
+    one forward and one backward pass per window.
+    """
+    t = torch.linspace(0.0, horizon, n_segments + 1, device=device, dtype=dtype,
+                       requires_grad=True)
+    y = rate_batch(t)
+    d, = torch.autograd.grad(y.sum(), t)          # y_i depends only on t_i
+
+    with torch.no_grad():
+        t0, t1, y0, y1, d0, d1 = t[:-1], t[1:], y[:-1], y[1:], d[:-1], d[1:]
+        dd = d0 - d1
+        ok = dd.abs() > 1e-14
+        x = torch.where(ok, (y1 - y0 + d0 * t0 - d1 * t1) / torch.where(ok, dd, torch.ones_like(dd)), t0)
+        x = torch.min(torch.max(x, t0), t1)
+        m = torch.where(ok, d0 * x + y0 - d0 * t0, y0)
+
+        bound = alpha * (torch.maximum(torch.maximum(y0, y1), m.clamp(min=0.0)) + base_rate)
+        cum = torch.cat([bound.new_zeros(1), torch.cumsum(bound * (t1 - t0), 0)])
+
+    # serial accept/reject: scalar and sequential, so run it on the host
+    t_np = t.detach().cpu().numpy()
+    bound_np = bound.cpu().numpy()
+    cum_np = cum.cpu().numpy()
+
+    e = 0.0
+    n_proposals, n_rate_evals, max_ratio, bound_violations = 0, n_segments + 1, 0.0, 0
+    result = np.inf
+
+    for _ in range(max_iter):
+        e += -np.log(1.0 - np.random.random())
+        if e >= cum_np[-1]:
+            break
+        i = min(max(int(np.searchsorted(cum_np, e, side='right')) - 1, 0), n_segments - 1)
+        if bound_np[i] <= 1e-14:
+            break
+        t_prop = t_np[i] + (e - cum_np[i]) / bound_np[i]
+        if t_prop >= horizon:
+            break
+
+        n_proposals += 1
+        n_rate_evals += 1
+        with torch.no_grad():
+            lam = rate_batch(torch.tensor([t_prop], device=device, dtype=dtype)).item()
+        ratio = (max(lam, 0.0) + base_rate) / bound_np[i]
+        max_ratio = max(max_ratio, ratio)
+        if ratio > 1.0:
+            bound_violations += 1
+        if np.random.random() < ratio:
+            result = t_prop
+            break
+    else:
+        import warnings
+        warnings.warn(
+            f"grid_thinning: max_iter={max_iter} reached, horizon={horizon:.6f}.",
+            RuntimeWarning,
+        )
+
+    if diagnostics:
+        return result, {
+            'accepted': result < np.inf,
+            'rejected': result == np.inf,
+            'proposals': n_proposals,
+            'rate_evals': n_rate_evals,
+            'max_ratio': max_ratio,
+            'bound_violations': bound_violations,
+            'tau': result,
+        }
+    return result
 
 
 def piecewise_thinning_sinusoidal_second_order(rate_time, horizon, alpha=1.2,
@@ -134,24 +282,6 @@ def piecewise_thinning_sinusoidal_second_order(rate_time, horizon, alpha=1.2,
     The fitted function is then sampled at n_segments points per period
     (no extra gradient evals) to build a tight piecewise-linear envelope.
 
-    Parameters
-    ----------
-    rate_time : callable
-        rate_time(t) -> float, the signed rate along the trajectory.
-    horizon : float
-        Maximum time to search for an event.
-    alpha : float
-        Scaling factor for the approximate upper bound (>= 1).
-    n_segments : int
-        Number of linear segments per period for the envelope.
-    R : float
-        Ratio threshold; if ratio > R, subdivide.
-    max_iter : int
-        Maximum number of thinning iterations.
-    second_harmonic : bool
-        If True, fit 5-parameter model (2 extra gradient evals).
-    diagnostics : bool
-        Whether to return diagnostic statistics.
     """
     rate_fn = lambda t: max(rate_time(t), 0.0)
 
@@ -325,6 +455,9 @@ def piecewise_thinning_sinusoidal_second_order(rate_time, horizon, alpha=1.2,
             s = (-b + np.sqrt(disc)) / a
 
         t_prop = t_prev + s
+
+        if s < 1e-14:
+            continue
 
         # Overshoot current segment — advance to next
         if segments_pending and t_prop > segments_pending[0][0]:
@@ -525,101 +658,6 @@ def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None,
     return result
 
 
-# def piecewise_thinning(rate_time, horizon, alpha=1.2, t_init=None, 
-#                        R=2.0, max_iter=200, diagnostics=True):
-#     if t_init is None:
-#         t_init = horizon / 100.0
-
-#     rate_fn = lambda t: max(rate_time(t), 0.0)
-
-#     lam_prev = alpha * rate_fn(0.0)
-#     lam_init = alpha * rate_fn(t_init)
-
-#     a = (lam_init - lam_prev) / t_init
-#     b = lam_prev
-#     t_prev = 0.0
-
-#     n_proposals = 0
-#     n_rate_evals = 2  # the two initial evaluations
-#     max_ratio = 0.0
-#     bound_violations = 0
-
-#     for _ in range(max_iter):
-#         u = np.random.random()
-#         xi = -np.log(1.0 - u)
-
-#         if abs(a) < 1e-14:
-#             if b < 1e-14:
-#                 result = np.inf
-#                 break
-#             s = xi / b
-#         else:
-#             disc = b**2 + 2.0 * a * xi
-#             if disc < 0.0:
-#                 result = np.inf
-#                 break
-#             s = (-b + np.sqrt(disc)) / a
-
-#         t_prop = t_prev + s
-
-#         if t_prop >= horizon:
-#             result = np.inf
-#             break
-
-#         n_proposals += 1
-#         n_rate_evals += 1
-
-#         lam_true = rate_fn(t_prop)
-#         lam_knot = alpha * lam_true
-#         h_prop = b + a * s
-
-#         ratio = lam_true / h_prop if h_prop > 1e-14 else 0.0
-#         max_ratio = max(max_ratio, ratio)
-#         if ratio > 1.0:
-#             bound_violations += 1
-
-#         if ratio > R:
-#             a = (lam_knot - lam_prev) / (t_prop - t_prev)
-#             b = lam_prev
-#             #result = np.inf
-#             #break
-#             continue
-
-#         if h_prop < 1e-14:
-#             result = np.inf
-#             break
-
-#         if np.random.random() < ratio:
-#             result = t_prop
-#             break
-
-#         a = (lam_knot - lam_prev) / (t_prop - t_prev)
-#         b = lam_knot
-#         lam_prev = lam_knot
-#         t_prev = t_prop
-#     else:
-#         import warnings
-#         warnings.warn(
-#             f"piecewise_thinning: max_iter={max_iter} reached. "
-#             f"Last t={t_prev:.6f}, horizon={horizon:.6f}.",
-#             RuntimeWarning,
-#         )
-#         result = np.inf
-
-#     if diagnostics:
-#         stats = {
-#             'accepted': result < np.inf,
-#             'rejected': result == np.inf,
-#             'proposals': n_proposals,
-#             'rate_evals': n_rate_evals,
-#             'max_ratio': max_ratio,
-#             'bound_violations': bound_violations,
-#             'tau': result,
-#         }
-#         return result, stats
-#     return result
-
-
 def _make_stats(result, proposals, rate_evals, max_ratio, bound_violations):
     return {
         'accepted': result < np.inf,
@@ -630,3 +668,26 @@ def _make_stats(result, proposals, rate_evals, max_ratio, bound_violations):
         'bound_violations': bound_violations,
         'tau': result,
     }
+    
+    
+# def sample_trajectory_at_regular_intervals(Position, Velocity, EventTimes, dt):
+#     """
+#     Given event-based trajectory (Position, Velocity, EventTimes),
+#     return the state at regular time grid with spacing dt.
+#     """
+#     # Create regular time grid
+#     T_max = EventTimes[EventTimes > 0].max()
+#     t_grid = np.arange(0, T_max + dt, dt)
+
+#     # For each regular time, find the index of the last event time <= t
+#     idx = np.searchsorted(EventTimes, t_grid, side='right') - 1
+#     idx = np.clip(idx, 0, len(EventTimes) - 2)
+
+#     # Compute time offset within each segment
+#     tau = (t_grid - EventTimes[idx])[:, None]  # shape (M,1)
+
+#     # Linear interpolation for position; velocity is piecewise constant
+#     pos_grid = Position[idx] + Velocity[idx] * tau
+#     vel_grid = Velocity[idx]
+
+#     return t_grid, pos_grid, vel_grid

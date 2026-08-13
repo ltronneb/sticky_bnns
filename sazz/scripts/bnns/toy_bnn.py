@@ -41,15 +41,17 @@ from sazz.utils.sampling import (
 # Config
 # ===========================================================================
 
-torch.set_default_dtype(torch.float64)
+DTYPE  = torch.float32
+DEVICE = "cpu" #torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+torch.set_default_dtype(DTYPE)
 
-N_SKELETON  = 10_000
-N_RESAMPLE  = 5_000
+N_SKELETON  = 50_000
+N_RESAMPLE  = 10_000
 BURNIN_FRAC = 0.2
 BASE_SEED   = 42
 
 T_MAX_ZZ    = 0.1
-GAMMA_ZZ    = 0.01
+GAMMA_ZZ    = 0.001
 
 NUTS_DRAWS  = 2_000
 NUTS_WARMUP = 1_000
@@ -75,25 +77,25 @@ DATASET_CONFIGS = {
     "hernandez": dict(
         layer_sizes=[1, 100, 1], activation="relu",
         prior_std_weight=3.0, prior_std_bias=3.0,
-        fan_in_scaling=True, adam_steps=3000,
+        fan_in_scaling=True, adam_steps=10000,
         prior_inclusion_weight=[0.5, 0.5],
     ),
     "gap": dict(
         layer_sizes=[1, 100, 1], activation="tanh",
         prior_std_weight=3.0, prior_std_bias=3.0,
-        fan_in_scaling=True, adam_steps=3000,
+        fan_in_scaling=True, adam_steps=10000,
         prior_inclusion_weight=[0.5, 0.5],
     ),
     "sharp": dict(
         layer_sizes=[1, 100, 1], activation="tanh",
         prior_std_weight=3.0, prior_std_bias=3.0,
-        fan_in_scaling=True, adam_steps=3000,
+        fan_in_scaling=True, adam_steps=10000,
         prior_inclusion_weight=[0.5, 0.5],
     ),
     "multiscale": dict(
         layer_sizes=[1, 100, 1], activation="tanh",
         prior_std_weight=5.0, prior_std_bias=5.0,
-        fan_in_scaling=True, adam_steps=3000,
+        fan_in_scaling=True, adam_steps=10000,
         prior_inclusion_weight=[0.5, 0.5],
     ),
 }
@@ -131,7 +133,7 @@ def load_toy(name: str, toy_dir: Path) -> tuple[dict[str, Any], BNNConfig]:
 # ===========================================================================
 
 def build_target(data: dict[str, Any], cfg: BNNConfig,
-                 dtype=torch.float64, device="cpu") -> TorchTarget:
+                 dtype=DTYPE, device=DEVICE) -> TorchTarget:
     """Build a v2 regression BNN target via ParamSpec + functional_call."""
     X = data["X_train"].to(dtype=dtype, device=device)
     y = data["y_train"].to(dtype=dtype, device=device)
@@ -146,6 +148,7 @@ def build_target(data: dict[str, Any], cfg: BNNConfig,
     prior = ModuleGaussianPrior(prec)
     likelihood = ModuleGaussianLikelihood(module, spec, X, y, cfg.noise_std)
     model = BayesianModel(prior, likelihood)
+    #model.grad_energy = torch.compile(model.grad_energy) #Try this on larger networks for speed
 
     x_ref, Sigma_inv = find_reference_bnn(
         model.energy, spec.D, model=model, dtype=dtype, device=device,
@@ -164,7 +167,7 @@ def build_target(data: dict[str, Any], cfg: BNNConfig,
 
 
 def build_target_learned_noise(data, cfg, prior_sigma_scale=1.0,
-                               dtype=torch.float64, device="cpu"):
+                               dtype=DTYPE, device=DEVICE):
     """v2 regression target with a learned noise scale.
 
     The sampled vector has length base_spec.D + 1, with log_sigma at the
@@ -222,7 +225,8 @@ def build_target_learned_noise(data, cfg, prior_sigma_scale=1.0,
 
 def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
     """Instantiate one of the four PDMP samplers, all with PLI thinning."""
-    common = dict(grad_target=target.grad_target, D=target.D, thinning="pli")
+    common = dict(grad_target=target.grad_target, D=target.D, thinning="pli",
+                  dtype=DTYPE, device=DEVICE)
     spec = target.meta["spec"]
 
     if name == "zigzag":
@@ -234,22 +238,24 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
             prior_std_weight=cfg.prior_std_weight,
             prior_inclusion_weight=cfg.prior_inclusion_weight,
             fan_in_scaling=cfg.fan_in_scaling,
+            dtype=DTYPE, device=DEVICE,
         )
         can_freeze = torch.repeat_interleave(
             torch.tensor(spec.can_freeze, dtype=torch.bool),
             torch.tensor(spec.numels),
-        )
+        ).to(device=DEVICE)
         return StickyAutomaticZigZagSampler(
-            **common, t_max=T_MAX_ZZ, gamma=GAMMA_ZZ, kappa=kappa, 
+            **common, t_max=T_MAX_ZZ, gamma=GAMMA_ZZ, kappa=kappa,
             can_freeze=can_freeze
         )
 
     if name == "boomerang":
-        s = AutomaticBoomerangSampler(**common, refresh_rate=0.1)
-        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
-        info = tune_refresh_rate(s, n_pilot=200)
-        print(f"      tuned refresh_rate: "
-              f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
+        SIGMA_INV_SCALE = 10.0
+        s = AutomaticBoomerangSampler(**common, refresh_rate=1.0)
+        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv * SIGMA_INV_SCALE)
+        #info = tune_refresh_rate(s, n_pilot=200)
+        #print(f"      tuned refresh_rate: "
+        #      f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
         return s
 
     if name == "sticky_boomerang":
@@ -258,19 +264,22 @@ def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
             prior_std_weight=cfg.prior_std_weight,
             prior_inclusion_weight=cfg.prior_inclusion_weight,
             fan_in_scaling=cfg.fan_in_scaling,
+            dtype=DTYPE, device=DEVICE,
         )
         can_freeze = torch.repeat_interleave(
             torch.tensor(spec.can_freeze, dtype=torch.bool),
             torch.tensor(spec.numels),
-        )
+        ).to(device=DEVICE)
         s = StickyAutomaticBoomerangSampler(
             **common, refresh_rate=1.0, kappa=kappa,
             can_freeze=can_freeze
         )
-        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
-        info = tune_refresh_rate(s, n_pilot=200)
-        print(f"      tuned refresh_rate: "
-              f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
+        SIGMA_INV_SCALE = 10.0
+        s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv * SIGMA_INV_SCALE)
+        # s.preprocess(x_ref=target.x_ref, Sigma_inv=target.Sigma_inv)
+        # info = tune_refresh_rate(s, n_pilot=200)
+        # print(f"      tuned refresh_rate: "
+        #       f"{info['lambda_r_old']:.3f} -> {info['lambda_r_new']:.3f}")
         return s
 
     raise ValueError(f"Unknown PDMP sampler: {name}")
@@ -493,7 +502,7 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
 def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
               cfg: BNNConfig, out_dir: Path,
               samplers: tuple[str, ...], resume: bool,#) -> None:
-              learned_noise: bool = False) -> None:
+              learned_noise: bool = False, profile: bool = False) -> None:
     suffix = "_ln" if learned_noise else ""
     print(f"\n--- {dataset_name.upper()} split {split_id:02d} | "
           f"layers={cfg.layer_sizes} | act={cfg.activation} | "
@@ -524,7 +533,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 
         if name == "nuts":
             try:
-                samples_np, elapsed = run_nuts(data, cfg, seed)
+                samples_np, elapsed = run_nuts(data, cfg, seed, learned_noise=learned_noise)
             except ImportError as e:
                 print(f"      NUTS dependency missing ({e}); skipping.")
                 continue
@@ -532,7 +541,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
             n_events = samples_np.shape[0]
         elif name == "nuts_horseshoe":
             try:
-                samples_np, elapsed = run_nuts_horseshoe(data, cfg, seed)
+                samples_np, elapsed = run_nuts_horseshoe(data, cfg, seed, learned_noise=learned_noise)
             except ImportError as e:
                 print(f"      NumPyro missing ({e}); skipping.")
                 continue
@@ -541,13 +550,24 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
         else:
             sampler = build_pdmp_sampler(name, target, cfg)
             t0 = time.perf_counter()
-            result = sampler.sample(N=N_SKELETON, diagnostics=True)
+            if profile:
+                import cProfile, pstats, io
+                pr = cProfile.Profile()
+                pr.enable()
+                result = sampler.sample(N=5000, diagnostics=False)
+                pr.disable()
+                s = io.StringIO()
+                pstats.Stats(pr, stream=s).sort_stats("cumulative").print_stats(20)
+                print(s.getvalue())
+                continue
+            else:
+                result = sampler.sample(N=N_SKELETON, diagnostics=True)
+                n_events = N_SKELETON
             samples = torch.tensor(
                 resample_pdmp(name, result, target.x_ref.cpu().numpy())
             )
             elapsed = time.perf_counter() - t0
-            print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s")
-            n_events = N_SKELETON
+            print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s")
 
         save_run(out_path,
                  dataset=dataset_name, split_id=split_id, sampler=name,
@@ -576,6 +596,7 @@ def main():
     parser.add_argument("--include-nuts", action="store_true")
     parser.add_argument("--include-nuts-hs", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--out", type=Path, default=OUT_DIR)
     parser.add_argument("--toy-dir", type=Path, default=TOY_DIR)
     args = parser.parse_args()
@@ -603,7 +624,8 @@ def main():
     for ds in toy_to_run:
         data, cfg = toys[ds]
         run_split(ds, 0, data, cfg, directory, tuple(samplers),
-                    resume=args.resume, learned_noise=args.learned_noise)
+                    resume=args.resume, learned_noise=args.learned_noise,
+                    profile=args.profile)
             
 
 

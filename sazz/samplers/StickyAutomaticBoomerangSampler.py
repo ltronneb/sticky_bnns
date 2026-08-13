@@ -55,7 +55,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         kappa: float = 1.0,
         can_freeze: list[bool] = None,
         refresh_rate: float = 0.1,
-        thinning: Literal["brent", "pli"] = "pli",
+        thinning: Literal["brent", "pli", "brent_monotone"] = "pli",
         t_max: float = 0.1,
         pli_kwargs: Optional[dict] = None,
         cold_start_threshold: Optional[float] = None,
@@ -278,6 +278,8 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
 
         if self.thinning == "brent":
             return self._brent_bound_sticky(pos_np, vel_np, horizon)
+        if self.thinning == "brent_monotone":
+            return self._brent_monotone_bound_sticky(pos_np, vel_np, horizon)
         elif self.thinning == "pli":
             return self._pli_bound_sticky(pos_np, vel_np, horizon)
         else:
@@ -291,6 +293,25 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
         neg_rate_fn = lambda t: -max(self._rate_numpy_sticky(t, pos_np, vel_np), 0.0)
 
         x_star, stats = brent(neg_rate_fn, 0.0, horizon, diagnostics=True)
+        lambda_max = max(-neg_rate_fn(x_star), 0.0)
+
+        if lambda_max <= 1e-14:
+            tau_star = float("inf")
+        else:
+            tau_star = -math.log(np.random.random()) / lambda_max
+
+        stats["lambda_max"] = lambda_max
+        stats["tau"] = tau_star
+        return tau_star, stats
+
+    def _brent_monotone_bound_sticky(
+        self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
+    ) -> tuple[float, dict]:
+        from sazz.utils.bounding import brent_monotone_aware
+
+        neg_rate_fn = lambda t: -max(self._rate_numpy_sticky(t, pos_np, vel_np), 0.0)
+
+        x_star, stats = brent_monotone_aware(neg_rate_fn, 0.0, horizon, diagnostics=True)
         lambda_max = max(-neg_rate_fn(x_star), 0.0)
 
         if lambda_max <= 1e-14:
@@ -406,6 +427,8 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
 
             if self.thinning == "brent":
                 horizon = min(self.t_max, dt_refresh, dt_hit, dt_thaw)
+            if self.thinning == "brent_monotone":
+                horizon = min(self.t_max, dt_refresh, dt_hit, dt_thaw)
             else:
                 horizon = min(dt_refresh, dt_hit, dt_thaw)
 
@@ -435,7 +458,7 @@ class StickyAutomaticBoomerangSampler(AutomaticBoomerangSampler):
 
             # ---- Bounce proposal beat the horizon ----
             if tau < horizon:
-                if self.thinning == "brent":
+                if self.thinning == "brent" or self.thinning == "brent_monotone":
                     row["event_type"] = "bounce"
                     u = np.random.random()
                     pos_np = pos.detach().cpu().numpy()

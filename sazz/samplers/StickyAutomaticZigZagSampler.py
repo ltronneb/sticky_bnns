@@ -42,7 +42,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from sazz.utils.bounding import brent, piecewise_thinning
+from sazz.utils.bounding import brent, brent_monotone_aware, piecewise_thinning
 
 from .AutomaticZigZagSampler import AutomaticZigZagSampler
 
@@ -74,7 +74,7 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
         can_freeze: list[bool] = None,
         t_max: float = 0.1,
         gamma: float = 0.01,
-        thinning: Literal["brent", "pli"] = "pli",
+        thinning: Literal["brent", "pli", "brent_monotone"] = "pli",
         adapt_t_max: bool = False,
         pli_kwargs: Optional[dict] = None,
         cold_start_threshold: Optional[bool] = None,
@@ -261,6 +261,8 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
 
         if self.thinning == "brent":
             return self._brent_bound_sticky(pos_np, vel_np, horizon)
+        if self.thinning == "brent_monotone":
+            return self._brent_monotone_bound_sticky(pos_np, vel_np, horizon)
         elif self.thinning == "pli":
             return self._pli_bound_sticky(pos_np, vel_np, horizon)
         else:
@@ -272,6 +274,25 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
         neg_rate_fn = lambda t: -max(self._rate_numpy_sticky(t, pos_np, vel_np), 0.0)
 
         x_star, stats = brent(neg_rate_fn, 0.0, horizon, diagnostics=True)
+        # if x_star > horizon:
+        #     x_star = horizon
+        lambda_max = max(-neg_rate_fn(x_star), 0.0)
+
+        if lambda_max <= 1e-14:
+            tau_star = float("inf")
+        else:
+            tau_star = -np.log(np.random.random()) / lambda_max
+
+        stats["lambda_max"] = lambda_max
+        stats["tau"] = tau_star
+        return tau_star, stats
+
+    def _brent_monotone_bound_sticky(
+        self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
+    ) -> tuple[float, dict]:
+        neg_rate_fn = lambda t: -max(self._rate_numpy_sticky(t, pos_np, vel_np), 0.0)
+
+        x_star, stats = brent_monotone_aware(neg_rate_fn, 0.0, horizon, diagnostics=True)
         # if x_star > horizon:
         #     x_star = horizon
         lambda_max = max(-neg_rate_fn(x_star), 0.0)
@@ -413,7 +434,7 @@ class StickyAutomaticZigZagSampler(AutomaticZigZagSampler):
 
             # ---- Bounce proposal beat the horizon ----
             if tau < horizon:
-                if self.thinning == "brent":
+                if self.thinning == "brent" or self.thinning == "brent_monotone":
                     row["event_type"] = "bounce"
                     u = np.random.random()
                     pos_np = pos.detach().cpu().numpy()
