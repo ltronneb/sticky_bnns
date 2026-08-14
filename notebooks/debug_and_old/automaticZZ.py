@@ -66,7 +66,7 @@ def myopt(upper_bound, x0val, v0val, eps=1e-9, round=True):
     output = {"Λbar": Lambda_bar, "evals": evals}
     return output
 
-def zz(NS=None, x0_0=None, v0_0=None, tmax=None, B=False, roundopt=True, ε₁=1e-20):
+def zz(NS=None, x0_0=None, v0_0=None, tmax=None, B=False, roundopt=True, ε=1e-20):
     """Zigzag sampler algorithm."""
     # Check if the stopping criterion has been defined and how
     if NS is False and B is False:
@@ -113,13 +113,13 @@ def zz(NS=None, x0_0=None, v0_0=None, tmax=None, B=False, roundopt=True, ε₁=1
     
     while keepgoing:
         # Check for bounds at the horizon
-        while np.isnan(globalrate(horizon, x0=x0i, v0=v0i)) and horizon > ε₁:
+        while np.isnan(globalrate(horizon, x0=x0i, v0=v0i)) and horizon > ε:
             horizon = horizon / 2
             # Count evaluations [added to the horizon change section]
             GradEvals[0, k] += 1
         
         # If approached the horizon (at the chosen ε₁) switch back
-        if horizon <= ε₁:
+        if horizon <= ε:
             raise ValueError("Possible border ahead")
         else:  # Continue with the current horizon
             opt = myopt(upper_bound=horizon, x0val=x0i, v0val=v0i, round=roundopt)
@@ -478,7 +478,7 @@ def getMestPOT(ss, x, v, tmax, J=None, D=None, SS_s=None):
     # Would need implementation of gpfit and other dependencies
     pass
 
-def zz_w_ss(NS=None, x0_0=None, v0_0=None, tmax=None, B=False, ε₁=1e-20, 
+def zz_w_ss(NS=None, x0_0=None, v0_0=None, tmax=None, B=False, ε=1e-20, 
             ssM=2000, NOBS=None, ssS=None):
     """Zigzag sampler with subsampling."""
     # Would need implementation of subsampling variant

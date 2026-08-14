@@ -16,7 +16,7 @@ from tqdm import tqdm
 #       Adaptive piecewise-linear upper envelope; returns +inf if no event
 #       in [0, horizon].
 # ---------------------------------------------------------------------------
-from sazz.utils.bounding import brent, brent_monotone_aware, piecewise_thinning, grid_thinning
+from sazz.utils.bounding import brent, brent_monotone_aware, piecewise_thinning#, grid_thinning
 
 
 class AutomaticZigZagSampler(nn.Module):
@@ -233,18 +233,18 @@ class AutomaticZigZagSampler(nn.Module):
         )
         return tau, stats
     
-    def _grid_bound(
-        self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
-    ) -> tuple[float, dict]:
-        """
-        Grid bound by (Andral & Kamatani 2024)
-        NOT READY YET
-        """
-        rate_fn = partial(self._rate_numpy, x_np=pos_np, v_np=vel_np)
-        tau, stats = grid_thinning(
-            rate_fn, horizon, diagnostics=True, **self.pli_kwargs
-        )
-        return tau, stats
+    # def _grid_bound(
+    #     self, pos_np: np.ndarray, vel_np: np.ndarray, horizon: float
+    # ) -> tuple[float, dict]:
+    #     """
+    #     Grid bound by (Andral & Kamatani 2024)
+    #     NOT READY YET
+    #     """
+    #     rate_fn = partial(self._rate_numpy, x_np=pos_np, v_np=vel_np)
+    #     tau, stats = grid_thinning(
+    #         rate_fn, horizon, diagnostics=True, **self.pli_kwargs
+    #     )
+    #     return tau, stats
 
     # ------------------------------------------------------------------
     # Initial velocity — ±1 per coordinate

@@ -68,7 +68,7 @@ N_SAVE      = NUTS_DRAWS * NUTS_CHAINS
 
 HIDDEN      = [50]
 
-OUT_DIR     = Path("results/uci_bnn")
+OUT_DIR     = Path("results/uci_bnn_brent_monotone")
 
 PDMP_SAMPLER_NAMES = ("zigzag", "sticky_zigzag", "boomerang", "sticky_boomerang")
 ALL_SAMPLER_NAMES  = PDMP_SAMPLER_NAMES + ("nuts", "nuts_horseshoe")
@@ -236,7 +236,7 @@ def build_target_learned_noise(data, cfg, prior_sigma_scale=1.0,
 
 def build_pdmp_sampler(name: str, target: TorchTarget, cfg: BNNConfig):
     """Instantiate one of the four PDMP samplers, all with PLI thinning."""
-    common = dict(grad_target=target.grad_target, D=target.D, thinning="pli")
+    common = dict(grad_target=target.grad_target, D=target.D, thinning="brent_monotone")
     spec = target.meta["spec"]
 
     if name == "zigzag":
