@@ -50,6 +50,10 @@ class GridBoomerangSampler(nn.Module):
     first harmonic).
     grid_kwargs: forwarded to grid_thinning (max_iter, min_window,
     max_violations, eps).
+    chunk_size: passed to the vmap composition in _make_rate_and_grad_fn.
+    [K, D] with K = n_segments+1 concurrent forward+backward graphs through
+    the target can OOM on larger BNN/CNN targets; default None keeps the
+    current unchunked behavior.
     """
 
     def __init__(
@@ -63,6 +67,7 @@ class GridBoomerangSampler(nn.Module):
         alpha_plus: float = 1.01,
         alpha_minus: float = 1.04,
         alpha_violation: float = 2.0,
+        chunk_size: Optional[int] = None,
         grid_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
@@ -76,6 +81,7 @@ class GridBoomerangSampler(nn.Module):
         self.alpha_plus = alpha_plus
         self.alpha_minus = alpha_minus
         self.alpha_violation = alpha_violation
+        self.chunk_size = chunk_size
         self.grid_kwargs = grid_kwargs or {
             "max_iter": 200,
             "min_window": 1e-8,
@@ -185,7 +191,8 @@ class GridBoomerangSampler(nn.Module):
             # Works correctly on CPU; CUDA untested but should work (this is
             # a standard, well-supported torch.func composition there).
             y, dy = torch.func.vmap(
-                lambda ti: torch.func.jvp(g_scalar, (ti,), (torch.ones_like(ti),))
+                lambda ti: torch.func.jvp(g_scalar, (ti,), (torch.ones_like(ti),)),
+                chunk_size=self.chunk_size,
             )(t_batch)
             return y, dy
 
@@ -221,6 +228,17 @@ class GridBoomerangSampler(nn.Module):
             diagnostics=True, **self.grid_kwargs,
         )
         stats["n_segments"] = n_segments
+
+        # Capture the horizon THIS call actually used to draw tau BEFORE the
+        # Algorithm-4 adaptation below mutates self._grid_t_max in place.
+        # sample() must read stats["horizon"] (and branch on
+        # stats["accepted"]), never re-derive "the horizon tau was drawn
+        # against" via a fresh min(self._grid_t_max, dt_refresh) AFTER this
+        # method returns -- self._grid_t_max may have already shrunk (e.g.
+        # on a rejection), which can make a genuinely accepted tau fail a
+        # re-derived `tau < horizon_used` check and get silently routed into
+        # the no_event branch instead of being recorded as a bounce.
+        stats["horizon"] = horizon
 
         # --- t_max adaptation (Algorithm 4) ---
         if stats["violated"]:
@@ -292,9 +310,11 @@ class GridBoomerangSampler(nn.Module):
             total_bound_violations += stats.get("bound_violations", 0)
             grid_t_max_log.append(self._grid_t_max)
 
+            horizon_used = stats["horizon"]
+
             row = {
                 "rate_evals": stats.get("rate_evals", 0),
-                "horizon": min(self._grid_t_max, dt_refresh),
+                "horizon": horizon_used,
                 "time": current_time,
                 "event_type": None,
                 "accepted": None,
@@ -303,13 +323,18 @@ class GridBoomerangSampler(nn.Module):
                 "max_ratio": stats.get("max_ratio", 0.0),
             }
 
-            event_accepted = False
-            horizon_used = min(self._grid_t_max, dt_refresh)
+            # Branch on stats["accepted"] (equivalently tau < math.inf, what
+            # grid_thinning's own _make_stats already sets), NEVER on a
+            # re-derived min(self._grid_t_max, dt_refresh) -- self._grid_t_max
+            # has already been mutated by _grid_bound's Algorithm-4 step by
+            # the time we get here, so a fresh recomputation could silently
+            # discard a genuinely accepted event if the adaptation shrank the
+            # horizon below tau (see _grid_bound's stats["horizon"] comment).
+            event_accepted = bool(stats["accepted"])
 
-            if tau < horizon_used:
+            if event_accepted:
                 row["event_type"] = "bounce"
                 row["accepted"] = True
-                event_accepted = True
             else:
                 # Advance by effective_horizon, not horizon_used -- see
                 # grid_bound.py's module docstring.

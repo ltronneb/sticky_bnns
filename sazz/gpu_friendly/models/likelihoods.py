@@ -10,7 +10,7 @@ from torch.distributions import Normal, Bernoulli, Categorical
 
 
 def make_gaussian_likelihood(module: nn.Module, param_dict_fn, X: Tensor,
-                              y: Tensor, noise_std: Optional[float] = None,
+                              y: Tensor, noise_std: Optional[float|Tensor] = None,
                               prior_sigma_scale: float = 1.0):
     """
     Gaussian regression likelihood via functional_call.
@@ -24,7 +24,8 @@ def make_gaussian_likelihood(module: nn.Module, param_dict_fn, X: Tensor,
     per-point variant used by warmup.py's empirical Fisher estimate.
     """
     if noise_std is not None:
-        def log_prob_single(beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
+        noise_std = torch.as_tensor(noise_std, dtype=X.dtype, device=X.device)
+        def log_prob_single(beta, X_i, y_i):
             preds = torch.func.functional_call(module, param_dict_fn(beta), (X_i,)).squeeze(-1)
             return Normal(preds, noise_std).log_prob(y_i).sum()
     else:

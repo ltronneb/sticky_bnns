@@ -67,6 +67,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         alpha_plus: float = 1.01,
         alpha_minus: float = 1.04,
         alpha_violation: float = 2.0,
+        chunk_size: Optional[int] = None,
         grid_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
@@ -81,6 +82,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
             alpha_plus=alpha_plus,
             alpha_minus=alpha_minus,
             alpha_violation=alpha_violation,
+            chunk_size=chunk_size,
             grid_kwargs=grid_kwargs,
             dtype=dtype,
             device=device,
@@ -310,7 +312,8 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
 
         def rate_and_grad_fn(t_batch: Tensor):
             y, dy = torch.func.vmap(
-                lambda ti: torch.func.jvp(g_scalar, (ti,), (torch.ones_like(ti),))
+                lambda ti: torch.func.jvp(g_scalar, (ti,), (torch.ones_like(ti),)),
+                chunk_size=self.chunk_size,
             )(t_batch)
             return y, dy
 
@@ -351,6 +354,11 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         )
         stats["binding"] = binding
         stats["n_segments"] = n_segments
+
+        # Capture the horizon THIS call actually used to draw tau BEFORE the
+        # Algorithm-4 adaptation below mutates self._grid_t_max in place --
+        # same reasoning as the base class's _grid_bound (see its comment).
+        stats["horizon"] = horizon
 
         # --- t_max adaptation (Algorithm 4), extended to 4 candidates ---
         if stats["violated"]:
@@ -428,7 +436,15 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
             grid_t_max_log.append(self._grid_t_max)
 
             n_frozen = int(self.frozen_mask.sum())
-            horizon_used = min(self._grid_t_max, dt_refresh, dt_hit, dt_thaw)
+            # stats["horizon"] is the horizon _grid_bound actually used to
+            # draw tau, captured BEFORE its Algorithm-4 adaptation mutated
+            # self._grid_t_max -- a fresh min(self._grid_t_max, dt_refresh,
+            # dt_hit, dt_thaw) recomputed here would use the ALREADY-MUTATED
+            # self._grid_t_max, which can silently fail `tau < horizon_used`
+            # for a genuinely accepted tau and misroute it into the
+            # freeze/thaw/no_event branch below (same bug as the base
+            # class's sample(), see its comment).
+            horizon_used = stats["horizon"]
 
             row = {
                 "rate_evals": stats.get("rate_evals", 0),
@@ -445,12 +461,15 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                 "max_ratio": stats.get("max_ratio", 0.0),
             }
 
-            event_accepted = False
+            # Branch on stats["accepted"], NEVER on a re-derived
+            # tau < horizon_used using the (possibly stale) horizon_used
+            # above -- stats["accepted"] is set inside grid_thinning at the
+            # moment tau was drawn, before any subsequent mutation.
+            event_accepted = bool(stats["accepted"])
 
-            if tau < horizon_used:
+            if event_accepted:
                 row["event_type"] = "bounce"
                 row["accepted"] = True
-                event_accepted = True
             else:
                 # No bounce accepted: figure out whether this was a freeze,
                 # thaw, or plain no-event, using effective_horizon (NOT the

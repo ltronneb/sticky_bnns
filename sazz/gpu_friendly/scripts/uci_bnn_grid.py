@@ -8,8 +8,9 @@ BayesianModel/AutomaticBoomerangSampler. Boston is the primary target
 if their local data files are present. Activation is tanh by default
 (smoother rate function for the grid bound than relu's kinks).
 
-Four samplers: "grid_boomerang", "grid_sticky_boomerang", "nuts",
-"nuts_horseshoe" (horseshoe prior on weights via NumPyro).
+Six samplers: "grid_zigzag", "grid_sticky_zigzag", "grid_boomerang",
+"grid_sticky_boomerang", "nuts", "nuts_horseshoe" (horseshoe prior on
+weights via NumPyro).
 
 Isolated from sazz/scripts/bnns/uci_bnn.py's model/sampler/warmup imports;
 data loading (sklearn/pandas) is independent, not shared code. Model/
@@ -45,10 +46,14 @@ from sazz.gpu_friendly.models.priors import (
 )
 from sazz.gpu_friendly.utils.warmup import find_reference_bnn
 from sazz.gpu_friendly.utils.resample import (
+    resample_zigzag_path_torch, resample_zigzag_path_sticky_torch,
     resample_boomerang_path_torch, resample_boomerang_path_sticky_torch,
 )
+from sazz.gpu_friendly.samplers.grid_zigzag import GridZigZagSampler
+from sazz.gpu_friendly.samplers.grid_sticky_zigzag import GridStickyZigZagSampler
 from sazz.gpu_friendly.samplers.grid_boomerang import GridBoomerangSampler
 from sazz.gpu_friendly.samplers.grid_sticky_boomerang import GridStickyBoomerangSampler
+
 
 
 # ===========================================================================
@@ -63,7 +68,7 @@ DEVICE = (
     #else "mps" if torch.backends.mps.is_available()
     else "cpu"
 )
-DTYPE = torch.float32 if DEVICE == "mps" else torch.float64
+DTYPE = torch.float32 if DEVICE == "cuda" else torch.float64
 torch.set_default_dtype(torch.float32)
 
 N_SKELETON  = 100_000
@@ -73,14 +78,30 @@ BASE_SEED   = 42
 
 SIGMA_INV_SCALE = 1.0 #10.0
 REFRESH_RATE = 1.0
+GAMMA = 0.01
 
 GRID_N_SEGMENTS = 60
-GRID_T_MAX_INIT = math.pi / 4
+GRID_T_MAX_INIT_BOOM = math.pi / 4
+# ZigZag's rate has no periodic structure to anchor grid_t_max_init to
+# (unlike Boomerang's pi/4). Checked directly against real UCI BNN targets
+# (D~750 on boston): the D*gamma floor plus target curvature drive the
+# Algorithm-4 equilibrium horizon down to roughly 1e-3 scale -- starting
+# from 1.0 (the CPU ZigZag sampler's own default, no BNN-scale meaning)
+# wastes the first several hundred skeleton points collapsing ~3 orders of
+# magnitude before settling, pinning n_segments at its floor of 2 the whole
+# time. 0.002/0.0002 keeps n_segments around 7-10 from the start (checked
+# on both toy-scale D~300 and UCI-scale D~750) -- still target-dependent
+# (see grid_zigzag.py's own docstring), retune here if D changes substantially.
+GRID_T_MAX_INIT_ZIGZAG = 0.002
 GRID_ALPHA_PLUS = 1.01
 GRID_ALPHA_MINUS = 1.04
-GRID_SPACING = math.pi / 16
 
-GRID_STICKY_SPACING = math.pi / 16
+GRID_SPACING_ZIGZAG = 0.0002
+GRID_SPACING_BOOM = math.pi / 16
+GRID_STICKY_BOOM_SPACING = math.pi / 16
+GRID_STICKY_ZIGZAG_SPACING = GRID_SPACING_ZIGZAG
+
+
 GRID_STICKY_COLD_START_THRESHOLD = None
 
 NUTS_DRAWS  = 2_000
@@ -93,7 +114,7 @@ HIDDEN = [50]
 OUT_DIR = Path("results/grid/uci_bnn")
 
 UCI_DATASETS  = ("boston", "naval", "energy")
-SAMPLER_NAMES = ("grid_boomerang", "grid_sticky_boomerang", "nuts", "nuts_horseshoe")
+SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "nuts_horseshoe")
 
 
 @dataclass
@@ -210,15 +231,68 @@ def build_target(data: dict[str, Any], cfg: BNNConfig, dtype=DTYPE, device=DEVIC
 # ===========================================================================
 # Samplers
 # ===========================================================================
+def build_zigzag_sampler(bm: BayesianModule):
+    sampler = GridZigZagSampler(
+        grad_target=torch.func.grad(bm.energy),
+        D=bm.D,
+        gamma=GAMMA,
+        grid_t_max_init=GRID_T_MAX_INIT_ZIGZAG,
+        n_segments=GRID_N_SEGMENTS,
+        grid_spacing=GRID_SPACING_ZIGZAG,
+        alpha_plus=GRID_ALPHA_PLUS,
+        alpha_minus=GRID_ALPHA_MINUS,
+        dtype=DTYPE,
+        device=bm.device,
+    )
+    return sampler
 
-def build_grid_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: torch.Tensor):
+
+def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: BNNConfig):
+    """
+    kappa/can_freeze constructed identically to build_sticky_boomerang_sampler.
+    ZigZag has no x_ref/Sigma_inv dependency, so unlike its Boomerang
+    counterpart this builder only needs bm/cfg -- x_ref is still used by the
+    caller as sample()'s x0 warm-start, but that's independent of construction.
+    """
+    kappa_net = build_kappa_from_inclusion(
+        bm.module, cfg.prior_std_weight, cfg.prior_inclusion_weight,
+        cfg.fan_in_scaling, dtype=DTYPE, device=bm.device,
+    )
+    can_freeze_net = build_can_freeze_mask(bm.module, device=bm.device)
+
+    if bm.learns_noise:
+        kappa = torch.cat([kappa_net, torch.zeros(1, dtype=DTYPE, device=bm.device)])
+        can_freeze = torch.cat([can_freeze_net, torch.zeros(1, dtype=torch.bool, device=bm.device)])
+    else:
+        kappa = kappa_net
+        can_freeze = can_freeze_net
+
+    sampler = GridStickyZigZagSampler(
+        grad_target=torch.func.grad(bm.energy),
+        D=bm.D,
+        kappa=kappa,
+        can_freeze=can_freeze,
+        cold_start_threshold=GRID_STICKY_COLD_START_THRESHOLD,
+        gamma=GAMMA,
+        grid_t_max_init=GRID_T_MAX_INIT_ZIGZAG,
+        n_segments=GRID_N_SEGMENTS,
+        grid_spacing=GRID_STICKY_ZIGZAG_SPACING,
+        alpha_plus=GRID_ALPHA_PLUS,
+        alpha_minus=GRID_ALPHA_MINUS,
+        dtype=DTYPE,
+        device=bm.device,
+    )
+    return sampler
+
+
+def build_boomerang_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: torch.Tensor):
     sampler = GridBoomerangSampler(
         grad_target=torch.func.grad(bm.energy),
         D=bm.D,
         refresh_rate=REFRESH_RATE,
-        grid_t_max_init=GRID_T_MAX_INIT,
+        grid_t_max_init=GRID_T_MAX_INIT_BOOM,
         n_segments=GRID_N_SEGMENTS,
-        grid_spacing=GRID_SPACING,
+        grid_spacing=GRID_SPACING_BOOM,
         alpha_plus=GRID_ALPHA_PLUS,
         alpha_minus=GRID_ALPHA_MINUS,
         dtype=DTYPE,
@@ -228,7 +302,7 @@ def build_grid_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: torch
     return sampler
 
 
-def build_sticky_grid_sampler(bm: BayesianModule, cfg: BNNConfig,
+def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
                                x_ref: torch.Tensor, Sigma_inv: torch.Tensor):
     kappa_net = build_kappa_from_inclusion(
         bm.module, cfg.prior_std_weight, cfg.prior_inclusion_weight,
@@ -249,9 +323,9 @@ def build_sticky_grid_sampler(bm: BayesianModule, cfg: BNNConfig,
         kappa=kappa,
         can_freeze=can_freeze,
         cold_start_threshold=GRID_STICKY_COLD_START_THRESHOLD,
-        grid_spacing=GRID_STICKY_SPACING,
+        grid_spacing=GRID_STICKY_BOOM_SPACING,
         refresh_rate=REFRESH_RATE,
-        grid_t_max_init=GRID_T_MAX_INIT,
+        grid_t_max_init=GRID_T_MAX_INIT_BOOM,
         n_segments=GRID_N_SEGMENTS,
         alpha_plus=GRID_ALPHA_PLUS,
         alpha_minus=GRID_ALPHA_MINUS,
@@ -399,8 +473,8 @@ def run_nuts_horseshoe(data: dict[str, Any], cfg: BNNConfig, seed: int,
                 else:
                     raise ValueError(f"Unsupported activation: {activation}")
         # Learned noise -- same HalfNormal(prior_sigma_scale) prior as the
-        # PDMP samplers and plain NUTS, so all four samplers here target the
-        # identical model.
+        # PDMP samplers and plain NUTS, so every sampler in this script
+        # targets the identical model.
         sigma = numpyro.sample("sigma", dist.HalfNormal(cfg.prior_sigma_scale))
         with numpyro.plate("data", X.shape[0]):
             numpyro.sample("y", dist.Normal(h.squeeze(-1), sigma), obs=y)
@@ -495,9 +569,67 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
 # only build the target once per split_id if needed (see run_split).
 # ===========================================================================
 
+def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
+                        cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
+    sampler = build_zigzag_sampler(bm)
+
+    t0 = time.perf_counter()
+    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True)
+    elapsed = time.perf_counter() - t0
+
+    samples = resample_zigzag_path_torch(
+        result["positions"], result["velocities"], result["times"],
+        N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
+    )
+
+    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+          f"({result['bound_violations']} bound violations)")
+
+    out_path = sd / "grid_zigzag.pt"
+    save_run(
+        out_path, dataset=dataset_name, split_id=split_id, sampler="grid_zigzag",
+        samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
+        elapsed_sec=elapsed, n_events=N_SKELETON,
+        bound_violations=result["bound_violations"],
+        gradient_evals=result["gradient_evals"],
+        grid_t_max_log=result["grid_t_max_log"],
+    )
+    print(f"      saved {samples.shape[0]} samples (thinned to {N_SAVE}) -> {out_path}")
+
+
+def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
+                            cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
+    sampler = build_sticky_zigzag_sampler(bm, cfg)
+
+    t0 = time.perf_counter()
+    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True)
+    elapsed = time.perf_counter() - t0
+
+    samples = resample_zigzag_path_sticky_torch(
+        result["positions"], result["velocities"], result["times"],
+        N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
+    )
+
+    sparsity = float(result["frozen_mask_final"].float().mean())
+    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+          f"({result['bound_violations']} bound violations, "
+          f"final sparsity {sparsity:.2f})")
+
+    out_path = sd / "grid_sticky_zigzag.pt"
+    save_run(
+        out_path, dataset=dataset_name, split_id=split_id, sampler="grid_sticky_zigzag",
+        samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
+        elapsed_sec=elapsed, n_events=N_SKELETON,
+        bound_violations=result["bound_violations"],
+        gradient_evals=result["gradient_evals"],
+        grid_t_max_log=result["grid_t_max_log"],
+    )
+    print(f"      saved {samples.shape[0]} samples (thinned to {N_SAVE}) -> {out_path}")
+
+
 def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
                         cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
-    sampler = build_grid_sampler(bm, x_ref, Sigma_inv)
+    sampler = build_boomerang_sampler(bm, x_ref, Sigma_inv)
 
     t0 = time.perf_counter()
     result = sampler.sample(N=N_SKELETON, diagnostics=True)
@@ -525,7 +657,7 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
 
 def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
                                cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
-    sampler = build_sticky_grid_sampler(bm, cfg, x_ref, Sigma_inv)
+    sampler = build_sticky_boomerang_sampler(bm, cfg, x_ref, Sigma_inv)
 
     t0 = time.perf_counter()
     result = sampler.sample(N=N_SKELETON, diagnostics=True)
@@ -592,6 +724,8 @@ def run_nuts_horseshoe_dataset(dataset_name: str, split_id: int, data: dict[str,
 
 
 SAMPLER_RUNNERS = {
+    "grid_zigzag": run_grid_zigzag,
+    "grid_sticky_zigzag": run_grid_sticky_zigzag,
     "grid_boomerang": run_grid_boomerang,
     "grid_sticky_boomerang": run_grid_sticky_boomerang,
     "nuts": run_nuts_dataset,
@@ -620,8 +754,9 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
         return
 
     # One MAP/Laplace build per split, shared by every sampler that runs
-    # this split (all four samplers use x_ref -- PDMP for the reference
-    # measure, NUTS/NUTS-HS for chain initialization).
+    # this split (all six samplers use x_ref -- Boomerang-family PDMP for
+    # the reference measure, ZigZag-family PDMP purely as an x0 warm-start,
+    # NUTS/NUTS-HS for chain initialization).
     seed = BASE_SEED + split_id
     torch.manual_seed(seed)
     np.random.seed(seed)
