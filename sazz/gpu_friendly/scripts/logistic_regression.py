@@ -62,6 +62,7 @@ def main():
         refresh_rate=0.2,
         grid_t_max_init=math.pi / 4,
         n_segments=20,
+        grid_spacing=math.pi / 16,
         dtype=dtype,
     )
     sampler.preprocess(x_ref=x_ref, Sigma_inv=Sigma_inv)

@@ -6,17 +6,18 @@ pre-drawn thaw deadline), never Poisson-thinned, so `grid_bound.py` needs no
 change: only the bounce rate is thinned, exactly as in the base class, just
 evaluated on a trajectory with frozen coordinates pinned to zero.
 
-n_segments here means something different than in the base class: instead
-of a fixed count, it's the CAP on a per-call segment count derived from
-`grid_spacing` (see _grid_bound). This is necessary because each active
-coordinate's trajectory crosses zero at most twice per 2*pi, so with D_active
-active coordinates the hitting-time horizon dt_hit ~ 2*pi/D_active shrinks by
-orders of magnitude as sparsity increases -- a fixed segment count would be
-either wildly over-resolved early (when D_active is large, dt_hit tiny) or
-too coarse late (when D_active is small, dt_hit large). grid_spacing is
-anchored to the rate's first-harmonic curvature scale (pi/4), not to
-grid_t_max_init/n_segments, precisely to avoid re-coupling this new knob to
-parameters that have nothing to do with the rate's curvature.
+n_segments is the CAP on a per-call segment count derived from grid_spacing,
+same as in the base class (see _grid_bound there) -- this class only adds
+extra horizon candidates (dt_hit, dt_thaw) to the min() that produces the
+horizon the formula is applied to. This is necessary here because each
+active coordinate's trajectory crosses zero at most twice per 2*pi, so with
+D_active active coordinates the hitting-time horizon dt_hit ~ 2*pi/D_active
+shrinks by orders of magnitude as sparsity increases -- a fixed segment
+count would be either wildly over-resolved early (when D_active is large,
+dt_hit tiny) or too coarse late (when D_active is small, dt_hit large).
+grid_spacing is anchored to the rate's first-harmonic curvature scale
+(pi/4), not to grid_t_max_init/n_segments, precisely to avoid re-coupling
+this knob to parameters that have nothing to do with the rate's curvature.
 """
 
 import math
@@ -42,12 +43,14 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
     can_freeze: bool Tensor[D], coordinates eligible to freeze (default: all).
     cold_start_threshold: if set, coordinates with |x0_i| below it are
         frozen at init with a synthetic thaw deadline.
-    grid_spacing: target grid-node spacing (NOT segment count -- see module
-        docstring), anchored to the rate's first-harmonic scale, independent
-        of grid_t_max_init/n_segments. Default pi/16 (a 4x margin on the
-        Boomerang's delta=pi/4 first harmonic).
-    n_segments (inherited): reinterpreted here as the CAP on the per-call
-        segment count computed from grid_spacing, not a fixed count.
+    grid_spacing (inherited): target grid-node spacing (NOT segment count --
+        see module docstring), anchored to the rate's first-harmonic scale,
+        independent of grid_t_max_init/n_segments. Default pi/16 (a 4x
+        margin on the Boomerang's delta=pi/4 first harmonic).
+    n_segments (inherited): the CAP on the per-call segment count computed
+        from grid_spacing, not a fixed count -- same as the base class,
+        just applied to a horizon that additionally accounts for dt_hit/
+        dt_thaw (see this class's _grid_bound override).
     """
 
     def __init__(
@@ -74,6 +77,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
             refresh_rate=refresh_rate,
             grid_t_max_init=grid_t_max_init,
             n_segments=n_segments,
+            grid_spacing=grid_spacing,
             alpha_plus=alpha_plus,
             alpha_minus=alpha_minus,
             alpha_violation=alpha_violation,
@@ -81,7 +85,6 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
             dtype=dtype,
             device=device,
         )
-        self.grid_spacing = grid_spacing
 
         if isinstance(kappa, (int, float)):
             self.kappa = torch.full((D,), float(kappa), dtype=dtype, device=self.device)

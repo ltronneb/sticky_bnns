@@ -41,6 +41,13 @@ class GridBoomerangSampler(nn.Module):
     when the grid horizon (not refresh clock) was binding with no event;
     shrunk on ordinary rejections.
     alpha_violation: separate, more aggressive shrink on a bound violation.
+    grid_spacing: target grid-node spacing (NOT segment count). n_segments
+    is the CAP on a per-call segment count derived from grid_spacing, not a
+    fixed count -- as t_max adapts, a fixed count would be either wildly
+    over-resolved (t_max small) or too coarse (t_max large). Anchored to the
+    rate's first-harmonic curvature scale, independent of grid_t_max_init/
+    n_segments. Default pi/16 (a 4x margin on the Boomerang's delta=pi/4
+    first harmonic).
     grid_kwargs: forwarded to grid_thinning (max_iter, min_window,
     max_violations, eps).
     """
@@ -52,6 +59,7 @@ class GridBoomerangSampler(nn.Module):
         refresh_rate: float = 0.1,
         grid_t_max_init: float = math.pi / 4,
         n_segments: int = 20,
+        grid_spacing: float = math.pi / 16,
         alpha_plus: float = 1.01,
         alpha_minus: float = 1.04,
         alpha_violation: float = 2.0,
@@ -64,6 +72,7 @@ class GridBoomerangSampler(nn.Module):
         self.grad_target = grad_target
         self.refresh_rate = refresh_rate
         self.n_segments = n_segments
+        self.grid_spacing = grid_spacing
         self.alpha_plus = alpha_plus
         self.alpha_minus = alpha_minus
         self.alpha_violation = alpha_violation
@@ -195,14 +204,23 @@ class GridBoomerangSampler(nn.Module):
         grid_was_binding = self._grid_t_max <= dt_refresh
         horizon = min(self._grid_t_max, dt_refresh)
 
+        # n_segments computed ONCE from the incoming horizon and held fixed
+        # for the lifetime of this grid_thinning call -- including across
+        # any internal Section 4.7 shrink/rebuild on a bound violation.
+        # Recomputing it per-shrink would hold effective per-segment
+        # spacing constant instead of shrinking it, so a violation would
+        # never actually resolve (see grid_sticky_boomerang_plan.md #2b).
+        n_segments = int(min(max(math.ceil(horizon / self.grid_spacing), 2), self.n_segments))
+
         rate_and_grad_fn = self._make_rate_and_grad_fn(pos, vel)
         rate_scalar_fn = partial(self._rate_scalar, x=pos.detach(), v=vel.detach())
 
         tau, stats = grid_thinning(
             rate_and_grad_fn, rate_scalar_fn, horizon,
-            n_segments=self.n_segments, device=self.device, dtype=self.dtype,
+            n_segments=n_segments, device=self.device, dtype=self.dtype,
             diagnostics=True, **self.grid_kwargs,
         )
+        stats["n_segments"] = n_segments
 
         # --- t_max adaptation (Algorithm 4) ---
         if stats["violated"]:

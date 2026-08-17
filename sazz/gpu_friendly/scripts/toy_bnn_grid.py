@@ -63,7 +63,7 @@ from sazz.gpu_friendly.samplers.grid_sticky_boomerang import GridStickyBoomerang
 # fail inside sampler.sample() -- if that happens, fall back to "cpu".
 DEVICE = (
     "cuda" if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available()
+    #else "mps" if torch.backends.mps.is_available()
     else "cpu"
 )
 # grid bound needs float64 for the Adam MAP + Fisher step to be numerically
@@ -82,13 +82,14 @@ N_RESAMPLE  = 10_000
 BURNIN_FRAC = 0.2
 BASE_SEED   = 42
 
-SIGMA_INV_SCALE = 10.0
+SIGMA_INV_SCALE = 1.0 #10.0
 REFRESH_RATE = 1.0
 
 GRID_N_SEGMENTS = 60
 GRID_T_MAX_INIT = math.pi / 4
 GRID_ALPHA_PLUS = 1.01
 GRID_ALPHA_MINUS = 1.04
+GRID_SPACING = math.pi / 16
 
 # grid_sticky_boomerang-specific: grid_spacing replaces n_segments as the
 # resolution knob (see grid_sticky_boomerang.py's module docstring) --
@@ -202,6 +203,7 @@ def build_grid_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: torch
         refresh_rate=REFRESH_RATE,
         grid_t_max_init=GRID_T_MAX_INIT,
         n_segments=GRID_N_SEGMENTS,
+        grid_spacing=GRID_SPACING,
         alpha_plus=GRID_ALPHA_PLUS,
         alpha_minus=GRID_ALPHA_MINUS,
         dtype=DTYPE,
@@ -261,7 +263,7 @@ def build_sticky_grid_sampler(bm: BayesianModule, cfg: BNNConfig,
 # NUTS via NumPyro
 # ===========================================================================
 
-def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarray, float]:
+def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarray, float, int]:
     import jax
     import jax.numpy as jnp
     import numpyro
@@ -300,8 +302,13 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarra
                 num_chains=NUTS_CHAINS, progress_bar=True)
 
     t0 = time.perf_counter()
-    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y)
+    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y, extra_fields=("num_steps",))
     elapsed = time.perf_counter() - t0
+
+    # num_steps = leapfrog steps per post-warmup sample; summing across
+    # samples/chains gives total gradient evaluations, the same currency
+    # as the PDMP samplers' gradient_evals (see grid_boomerang.py).
+    gradient_evals = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
 
     posterior = mcmc.get_samples()
     flat = []
@@ -310,7 +317,7 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarra
         b = np.asarray(posterior[f"b{i}"])  # [n, n_out]
         flat.append(W.reshape(W.shape[0], -1))
         flat.append(b)
-    return np.concatenate(flat, axis=1).astype(np.float64), elapsed
+    return np.concatenate(flat, axis=1).astype(np.float64), elapsed, gradient_evals
 
 
 # ===========================================================================
@@ -333,7 +340,8 @@ def split_dir(out_dir: Path, dataset: str, split_id: int) -> Path:
 def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
              samples: torch.Tensor, x_ref: Optional[torch.Tensor], cfg: BNNConfig,
              y_std: float, elapsed_sec: float, n_events: int,
-             bound_violations: int) -> None:
+             bound_violations: int, gradient_evals: Optional[int] = None,
+             grid_t_max_log: Optional[list[float]] = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "dataset":          dataset,
@@ -348,6 +356,8 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
         "n_events":         n_events,
         "elapsed_sec":      elapsed_sec,
         "bound_violations": bound_violations,
+        "gradient_evals":   gradient_evals,
+        "grid_t_max_log":   grid_t_max_log,
     }, out_path)
 
 
@@ -385,6 +395,8 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
         elapsed_sec=elapsed, n_events=N_SKELETON,
         bound_violations=result["bound_violations"],
+        gradient_evals=result["gradient_evals"],
+        grid_t_max_log=result["grid_t_max_log"],
     )
     print(f"      saved {samples.shape[0]} samples (thinned to {N_SAVE}) -> {out_path}")
 
@@ -420,6 +432,8 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
         elapsed_sec=elapsed, n_events=N_SKELETON,
         bound_violations=result["bound_violations"],
+        gradient_evals=result["gradient_evals"],
+        grid_t_max_log=result["grid_t_max_log"],
     )
     print(f"      saved {samples.shape[0]} samples (thinned to {N_SAVE}) -> {out_path}")
 
@@ -428,16 +442,18 @@ def run_nuts_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
                       cfg: BNNConfig, sd: Path) -> None:
     seed = BASE_SEED + split_id
 
-    samples_np, elapsed = run_nuts(data, cfg, seed)
+    samples_np, elapsed, gradient_evals = run_nuts(data, cfg, seed)
     samples = torch.tensor(samples_np)
 
-    print(f"      sampled {samples.shape[0]} NUTS draws in {elapsed:.1f}s")
+    print(f"      sampled {samples.shape[0]} NUTS draws in {elapsed:.1f}s "
+          f"({gradient_evals} gradient evals)")
 
     out_path = sd / "nuts.pt"
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="nuts",
         samples=samples, x_ref=None, cfg=cfg, y_std=data["y_std"],
         elapsed_sec=elapsed, n_events=samples.shape[0], bound_violations=0,
+        gradient_evals=gradient_evals,
     )
     print(f"      saved {samples.shape[0]} samples -> {out_path}")
 
