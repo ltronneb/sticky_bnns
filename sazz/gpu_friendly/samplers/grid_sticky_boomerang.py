@@ -41,8 +41,13 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
 
     kappa: thaw-rate multiplier, scalar or per-coordinate Tensor[D].
     can_freeze: bool Tensor[D], coordinates eligible to freeze (default: all).
-    cold_start_threshold: if set, coordinates with |x0_i| below it are
-        frozen at init with a synthetic thaw deadline.
+    cold_start_threshold: if a float, coordinates with |x0_i| below it are
+        frozen at init with a synthetic thaw deadline. If a bool Tensor[D],
+        used directly as the freeze-at-init mask instead of thresholding
+        |x0_i| -- lets a caller freeze exactly the coordinates it already
+        pruned (e.g. per-layer, prior-std-relative), rather than the
+        uniform absolute threshold the float form applies indiscriminately
+        across layers of very different scale.
     grid_spacing (inherited): target grid-node spacing (NOT segment count --
         see module docstring), anchored to the rate's first-harmonic scale,
         independent of grid_t_max_init/n_segments. Default pi/16 (a 4x
@@ -59,7 +64,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         D: int,
         kappa: float | Tensor = 1.0,
         can_freeze: Optional[Tensor] = None,
-        cold_start_threshold: Optional[float] = None,
+        cold_start_threshold: Optional[float | Tensor] = None,
         grid_spacing: float = math.pi / 16,
         refresh_rate: float = 0.1,
         grid_t_max_init: float = math.pi / 4,
@@ -98,7 +103,10 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         else:
             self.can_freeze = torch.as_tensor(can_freeze, dtype=torch.bool, device=self.device)
 
-        self.cold_start_threshold = cold_start_threshold
+        if isinstance(cold_start_threshold, Tensor):
+            self.cold_start_threshold = cold_start_threshold.to(dtype=torch.bool, device=self.device)
+        else:
+            self.cold_start_threshold = cold_start_threshold
 
         # Mutable sticky state (reset by _reset_sticky_state at sample() start)
         self.frozen_mask = torch.zeros(D, dtype=torch.bool, device=self.device)
@@ -228,7 +236,10 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         x0 = positions[0]
         v0 = velocities[0]
 
-        near_zero = x0.abs() < self.cold_start_threshold
+        if isinstance(self.cold_start_threshold, Tensor):
+            near_zero = self.cold_start_threshold
+        else:
+            near_zero = x0.abs() < self.cold_start_threshold
         rate = self.kappa * v0.abs()
         mask = near_zero & self.can_freeze & (rate > 1e-14)
 

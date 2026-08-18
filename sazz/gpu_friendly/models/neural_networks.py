@@ -54,32 +54,92 @@ class FFN(nn.Module):
 class CNN(nn.Module):
     """LeNet-style CNN for ~28x28 grayscale images. Adaptive pooling means
     input size is somewhat flexible, but the channel/class count is fixed
-    at construction."""
+    at construction.
+
+    pool: "avg" (default) uses F.avg_pool2d, "max" uses F.max_pool2d (the
+    original hardcoded behavior). Exposed as a constructor param rather
+    than a forward()-only choice so switching pooling never requires
+    editing this class again -- a grid-bound PDMP target wants "avg"
+    (max_pool2d is non-smooth, a second kink source independent of
+    activation choice), while "max" stays available for a relu+max_pool2d
+    ablation against the original architecture. Changes no shapes/D either
+    way, but the target's rate function does depend on it -- a checkpoint
+    trained against one choice is not a valid reference for the other.
+    """
     def __init__(
         self,
         activation: Union[str, callable] = "relu",
+        pool: str = "avg",
     ):
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1)
         # after global average pooling we have 64 features
         self.fc = nn.Linear(64, 10)
-        
+
         if isinstance(activation, str):
                 activation = get_activation(activation)
         self.activation = activation
+
+        if pool not in ("avg", "max"):
+            raise ValueError(f"Unknown pool '{pool}'. Choose from ('avg', 'max')")
+        self.pool = pool
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.activation(x)
         x = self.conv2(x)
         x = self.activation(x)
-        x = F.max_pool2d(x, 2)
+        x = F.avg_pool2d(x, 2) if self.pool == "avg" else F.max_pool2d(x, 2)
         # (batch, 64, 12, 12) -> (batch, 64, 1, 1)
         x = F.adaptive_avg_pool2d(x, 1)
         # (batch, 64)
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
-    
+
+
+class LeNet5(nn.Module):
+    """Classic LeCun et al. (1998) LeNet-5, ~61.7k params. Input is padded
+    2px on each side (28x28 -> 32x32) inside forward() so this drops
+    straight into this repo's 28x28 MNIST pipeline while preserving the
+    original architecture's exact layer shapes and parameter count.
+
+    pool: "avg" (default, matches the original subsampling layers) or
+    "max" -- same rationale as CNN.pool (max_pool2d is non-smooth, a
+    second kink source independent of activation choice).
+    """
+    def __init__(
+        self,
+        activation: Union[str, callable] = "tanh",
+        pool: str = "avg",
+    ):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 6, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv2d(6, 16, kernel_size=5, stride=1)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+        if isinstance(activation, str):
+            activation = get_activation(activation)
+        self.activation = activation
+
+        if pool not in ("avg", "max"):
+            raise ValueError(f"Unknown pool '{pool}'. Choose from ('avg', 'max')")
+        self.pool = pool
+
+    def forward(self, x):
+        x = F.pad(x, [2, 2, 2, 2])  # 28x28 -> 32x32, LeCun's original convention
+        x = self.conv1(x)
+        x = self.activation(x)
+        x = F.avg_pool2d(x, 2) if self.pool == "avg" else F.max_pool2d(x, 2)
+        x = self.conv2(x)
+        x = self.activation(x)
+        x = F.avg_pool2d(x, 2) if self.pool == "avg" else F.max_pool2d(x, 2)
+        x = torch.flatten(x, 1)
+        x = self.activation(self.fc1(x))
+        x = self.activation(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
