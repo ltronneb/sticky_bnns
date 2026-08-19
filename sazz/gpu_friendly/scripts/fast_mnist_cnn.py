@@ -110,7 +110,7 @@ N_ACCURACY_DRAWS = 300      # subsample for softmax-averaging specifically --
                             # N_RESAMPLE draws, independent of N_RESAMPLE.
 BASE_SEED = 42
 
-GAMMA = 0.01
+GAMMA = 1e-5
 PRIOR_STD_W = 2.0
 PRIOR_STD_B = 2.0            # NOT the old mnist_cnn.py's 5.0 -- that value
                             # was tuned for relu; under tanh + fan-in scaling
@@ -149,14 +149,14 @@ N_SWEEP = 2000   # held-out MNIST-test points (disjoint from this script's
 # knob to SKELETON_CHUNK_SIZE below (how many skeleton rows are buffered
 # before a disk flush). Different axis entirely; do not conflate them.
 GRID_CHUNK_SIZE = 4
-GRID_T_MAX_INIT_ZIGZAG = 0.0005
-GRID_SPACING_ZIGZAG = 0.00005
+GRID_T_MAX_INIT_ZIGZAG = 0.002
+GRID_SPACING_ZIGZAG = 1e-5
 GRID_T_MAX_INIT_BOOM = math.pi / 4   # unchanged -- period-anchored, D-independent
-GRID_SPACING_BOOM = math.pi / 16     # unchanged
-GRID_N_SEGMENTS = 60
+GRID_SPACING_BOOM = math.pi / 64     # unchanged
+GRID_N_SEGMENTS = 20
 GRID_ALPHA_PLUS = 1.01
 GRID_ALPHA_MINUS = 1.04
-GRID_ALPHA_VIOLATION = 2.0
+GRID_ALPHA_VIOLATION = 1.2
 
 # Skeleton-chunking knobs (new -- see radiant-finding-church.md). None
 # disables chunking entirely (sample()'s original full-[N,D] behavior).
