@@ -68,7 +68,7 @@ def make_categorical_likelihood(module: nn.Module, param_dict_fn, X: Tensor,
 
     def log_prob_single(beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
         logits = torch.func.functional_call(module, param_dict_fn(beta), (X_i,))
-        return Categorical(logits=logits).log_prob(y_i.long()).sum()
+        return Categorical(logits=logits, validate_args=False).log_prob(y_i.long()).sum()
 
     def log_prob(beta: Tensor) -> Tensor:
         return log_prob_single(beta, X, y)
