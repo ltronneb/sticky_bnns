@@ -9,8 +9,36 @@ numpy anywhere, so no host round-trip is needed regardless of device.
 
 sazz/utils/sampling.py is left untouched (isolation requirement) -- these
 are new, independent functions, not a replacement of that file.
+
+---
+
+The four *_chunked_torch functions below are ADDITIONS ONLY -- the four
+functions above are never modified. They resample directly from a
+sequence of chunk .pt files (as written by fast_grid_sticky_zigzag.py /
+fast_grid_sticky_boomerang.py's chunked sample()) without ever
+materializing the full [N, D] trajectory in memory, per the chunked-
+checkpointing plan (radiant-finding-church.md).
+
+CLAMP BOUND, the one place these functions genuinely differ from the four
+above, not just restructure them: within a single chunk, the clamp is
+`indices.clamp(0, tim.shape[0] - 1)`, NOT `- 2`. The `-2` bound above is
+correct for a WHOLE trajectory (the final skeleton row can never be a left
+endpoint -- there's no successor interval past it). Applied per-chunk,
+that's wrong: a chunk's last row legitimately IS a valid left endpoint for
+any sample time up to the next chunk's first row. Using `-2` per-chunk
+would silently exclude it, anchoring those draws to the second-to-last row
+and producing an over-long, incorrect dt -- see the plan's review history
+for how this was caught.
+
+No carry-over/prefix row is needed at chunk boundaries: the interpolation
+formulas below (like the four functions above) are functions of the LEFT
+endpoint and dt only -- there is no right-endpoint term anywhere in the
+math, so a sample time in [chunk_k's last row, chunk_{k+1}'s first row)
+anchors correctly to chunk k's own last row, already present in chunk k.
 """
 
+import bisect
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -202,3 +230,234 @@ def resample_zigzag_path_sticky_torch(
     samples = torch.where(frozen, torch.zeros_like(samples), samples)
 
     return samples
+
+
+# ===========================================================================
+# Chunk-aware resamplers — new additions, see module docstring.
+# ===========================================================================
+
+def _load_manifest(chunk_files: list[Path] | list[str], manifest_path: Optional[Path | str]) -> list[dict]:
+    """
+    Returns the manifest's per-chunk metadata list, sorted by chunk_idx.
+    Prefers manifest_path (a single small file written once per flush by
+    sample() -- see fast_grid_sticky_zigzag.py's _write_manifest) so this
+    never has to open a chunk file (which contains the full [rows, D]
+    tensors) just to learn its time range. Falls back to opening every
+    chunk file's metadata fields directly (still loads the tensor payload
+    in the process, since torch.load has no partial-read mode -- slower,
+    but correct) only if no manifest_path is given.
+    """
+    if manifest_path is not None:
+        manifest = torch.load(manifest_path, weights_only=False)
+        return sorted(manifest["chunks"], key=lambda e: e["chunk_idx"])
+
+    entries = []
+    for cf in chunk_files:
+        chunk = torch.load(cf, weights_only=False, map_location="cpu")
+        entries.append({
+            "chunk_idx": chunk["chunk_idx"],
+            "row_count": chunk["row_count"],
+            "t_start": chunk["t_start"],
+            "t_end": chunk["t_end"],
+            "global_row_start": chunk["global_row_start"],
+            "path": str(cf),
+        })
+    return sorted(entries, key=lambda e: e["chunk_idx"])
+
+
+def _find_burnin_t_start(chunk_entries: list[dict], n_burn: int) -> float:
+    """
+    Returns times[n_burn] (the global skeleton row index n_burn's time
+    value) by loading ONLY the one chunk file containing that row --
+    never the full trajectory. n_burn falls in chunk k iff
+    chunk_k.global_row_start <= n_burn < chunk_k.global_row_start + row_count.
+    """
+    for entry in chunk_entries:
+        start = entry["global_row_start"]
+        end = start + entry["row_count"]
+        if start <= n_burn < end:
+            chunk = torch.load(entry["path"], weights_only=False, map_location="cpu")
+            local_idx = n_burn - start
+            return float(chunk["times"][local_idx])
+    # n_burn >= total row count (e.g. burnin_frac close to/at 1.0, or a
+    # single-row final chunk) -- fall back to the last chunk's last row.
+    last = chunk_entries[-1]
+    chunk = torch.load(last["path"], weights_only=False, map_location="cpu")
+    return float(chunk["times"][-1])
+
+
+def _resample_chunked_core(
+    chunk_files: list[Path] | list[str], N_resample: int, burnin_frac: float,
+    dtype: torch.dtype, device: torch.device | str, manifest_path: Optional[Path | str],
+    interpolate_fn,
+) -> Tensor:
+    """
+    Shared core for all four *_chunked_torch functions below -- mirrors
+    the four in-memory resamplers' shared searchsorted-and-gather skeleton
+    (see module docstring), just batched per-chunk instead of once over a
+    full [N, D] tensor. `interpolate_fn(k_pos, k_vel, k_tim, sample_times)
+    -> samples` supplies the one piece that differs between ZigZag/
+    Boomerang and sticky/non-sticky -- identical in spirit to the shared
+    dt/k_pos/k_vel gather these four functions already do, just factored
+    out so this core doesn't need to know which dynamics it's serving.
+    """
+    chunk_entries = _load_manifest(chunk_files, manifest_path)
+    if not chunk_entries:
+        raise ValueError("No chunks found -- chunk_files/manifest_path is empty.")
+
+    N = sum(e["row_count"] for e in chunk_entries)
+    n_burn = int(burnin_frac * N)
+
+    T_start = _find_burnin_t_start(chunk_entries, n_burn)
+    T_end = chunk_entries[-1]["t_end"]
+    if T_end <= T_start:
+        raise ValueError("Skeleton times are not increasing after burnin.")
+
+    sample_times = torch.rand(N_resample, dtype=dtype, device=device) * (T_end - T_start) + T_start
+    # NOTE: the four in-memory resamplers above do
+    # `sample_times, _ = torch.sort(sample_times)` and DISCARD the sort
+    # index -- their output row k is the k-th SMALLEST drawn time, not the
+    # k-th DRAWN time. This function must match that exact convention
+    # (output in sorted-time order), not "unsort" back to draw order, or
+    # its output would silently permute relative to the in-memory
+    # resamplers' for the same draws.
+    sample_times, _ = torch.sort(sample_times)
+
+    # Chunk lookup: searchsorted against chunk START times (NOT t_end --
+    # see module docstring's off-by-one warning), right=True then -1,
+    # matching the exact convention the per-chunk searchsorted below
+    # applies to skeleton times within a chunk. Vectorized over every
+    # sample_time in one call.
+    starts = torch.tensor([e["t_start"] for e in chunk_entries], dtype=dtype, device=device)
+    chunk_id = torch.searchsorted(starts, sample_times, right=True) - 1
+    chunk_id = chunk_id.clamp_min(0)
+    chunk_id_list = chunk_id.tolist()
+
+    D = None
+    output: Optional[Tensor] = None
+
+    # sample_times (and therefore chunk_id) came out of torch.sort already
+    # sorted, and chunk time-ranges are monotonic/non-overlapping, so
+    # chunk_id is itself non-decreasing -- grouping into contiguous runs
+    # is a single linear pass, not a full groupby.
+    i = 0
+    n_samples = sample_times.shape[0]
+    while i < n_samples:
+        cid = chunk_id_list[i]
+        j = i
+        while j < n_samples and chunk_id_list[j] == cid:
+            j += 1
+        # sample_times[i:j] all belong to chunk cid -- load it once.
+        entry = chunk_entries[cid]
+        chunk = torch.load(entry["path"], weights_only=False, map_location="cpu")
+        pos = chunk["positions"].to(dtype=dtype, device=device)
+        vel = chunk["velocities"].to(dtype=dtype, device=device)
+        tim = chunk["times"].to(dtype=dtype, device=device)
+
+        if D is None:
+            D = pos.shape[1]
+            output = torch.zeros(N_resample, D, dtype=dtype, device=device)
+
+        sub_times = sample_times[i:j]
+
+        # tim[idx-1] <= t < tim[idx]; -1 clamp bound (NOT -2 -- see module
+        # docstring), since within a single chunk the last row IS a valid
+        # left endpoint for times up to the next chunk's first row.
+        indices = torch.searchsorted(tim, sub_times, right=True) - 1
+        indices = indices.clamp(0, tim.shape[0] - 1)
+
+        k_pos = pos[indices]
+        k_vel = vel[indices]
+        k_tim = tim[indices]
+
+        sub_samples = interpolate_fn(k_pos, k_vel, k_tim, sub_times)
+
+        # Write directly at [i:j] -- sample_times (and therefore this
+        # loop's positions) are already in the sorted-time order the
+        # in-memory resamplers return their output in (see the sort note
+        # above); no unsort/scatter needed.
+        output[i:j] = sub_samples
+
+        i = j
+
+    return output
+
+
+def resample_zigzag_path_chunked_torch(
+    chunk_files: list[Path] | list[str], N_resample: int, burnin_frac: float = 0.1,
+    manifest_path: Optional[Path | str] = None,
+    dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
+) -> Tensor:
+    """
+    Chunk-aware equivalent of resample_zigzag_path_torch -- reads directly
+    from chunk_files (as written by a chunked sample() call) instead of a
+    single in-memory [N, D] trajectory. dtype/device are explicit required-
+    in-spirit parameters (defaulted, not inherited) since no full tensor
+    is in hand up front to infer them from -- see module docstring.
+    """
+    def interpolate_fn(k_pos, k_vel, k_tim, sample_times):
+        dt = (sample_times - k_tim).unsqueeze(-1)
+        return k_pos + k_vel * dt
+
+    return _resample_chunked_core(
+        chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+    )
+
+
+def resample_zigzag_path_sticky_chunked_torch(
+    chunk_files: list[Path] | list[str], N_resample: int, burnin_frac: float = 0.1,
+    zero_tol: float = 1e-12, manifest_path: Optional[Path | str] = None,
+    dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
+) -> Tensor:
+    """
+    Sticky, chunk-aware equivalent of resample_zigzag_path_sticky_torch --
+    same left-endpoint frozen-detection convention (see that function's
+    docstring), applied per-chunk.
+    """
+    def interpolate_fn(k_pos, k_vel, k_tim, sample_times):
+        dt = (sample_times - k_tim).unsqueeze(-1)
+        samples = k_pos + k_vel * dt
+        frozen = (k_pos.abs() < zero_tol) & (k_vel.abs() < zero_tol)
+        return torch.where(frozen, torch.zeros_like(samples), samples)
+
+    return _resample_chunked_core(
+        chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+    )
+
+
+def resample_boomerang_path_chunked_torch(
+    chunk_files: list[Path] | list[str], x_ref: Tensor, N_resample: int, burnin_frac: float = 0.1,
+    manifest_path: Optional[Path | str] = None,
+    dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
+) -> Tensor:
+    """
+    Chunk-aware equivalent of resample_boomerang_path_torch.
+    """
+    def interpolate_fn(k_pos, k_vel, k_tim, sample_times):
+        dt = (sample_times - k_tim).unsqueeze(-1)
+        dx = k_pos - x_ref
+        return x_ref + dx * torch.cos(dt) + k_vel * torch.sin(dt)
+
+    return _resample_chunked_core(
+        chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+    )
+
+
+def resample_boomerang_path_sticky_chunked_torch(
+    chunk_files: list[Path] | list[str], x_ref: Tensor, N_resample: int, burnin_frac: float = 0.1,
+    zero_tol: float = 1e-12, manifest_path: Optional[Path | str] = None,
+    dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
+) -> Tensor:
+    """
+    Sticky, chunk-aware equivalent of resample_boomerang_path_sticky_torch.
+    """
+    def interpolate_fn(k_pos, k_vel, k_tim, sample_times):
+        dt = (sample_times - k_tim).unsqueeze(-1)
+        dx = k_pos - x_ref
+        samples = x_ref + dx * torch.cos(dt) + k_vel * torch.sin(dt)
+        frozen = (k_pos.abs() < zero_tol) & (k_vel.abs() < zero_tol)
+        return torch.where(frozen, torch.zeros_like(samples), samples)
+
+    return _resample_chunked_core(
+        chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+    )
