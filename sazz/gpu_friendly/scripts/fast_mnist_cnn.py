@@ -298,9 +298,13 @@ def build_target(data: dict[str, Any], cfg: CNNConfig, dtype=DTYPE, device=DEVIC
         )
         x_ref = ckpt["x_ref"].to(dtype=dtype, device=device)
         Sigma_inv = ckpt["Sigma_inv"].to(dtype=dtype, device=device)
+        cold_start_mask = ckpt.get("cold_start_mask")
+        if cold_start_mask is not None:
+            cold_start_mask = cold_start_mask.to(dtype=torch.bool, device=device)
         print(f"  loaded  architecture={architecture}  sigma_inv_source={ckpt.get('sigma_inv_source', 'UNKNOWN')}  "
               f"||x_ref||_inf={x_ref.abs().max():.3f}  "
-              f"(train_acc={ckpt.get('train_acc', float('nan')):.3f})")
+              f"(train_acc={ckpt.get('train_acc', float('nan')):.3f})"
+              + ("  [pre-pruned+refit checkpoint]" if cold_start_mask is not None else ""))
 
         # Sigma_inv = prior_precision + N_ckpt * fisher_mean was computed at
         # checkpoint time against N_ckpt = the CHECKPOINT's own training-set
@@ -332,8 +336,9 @@ def build_target(data: dict[str, Any], cfg: CNNConfig, dtype=DTYPE, device=DEVIC
         x_ref, Sigma_inv = find_reference_bnn(
             bm, n_steps=cfg.adam_steps, lr=1e-2, dtype=dtype, device=torch.device(device),
         )
+        cold_start_mask = None
 
-    return bm, x_ref, Sigma_inv
+    return bm, x_ref, Sigma_inv, cold_start_mask
 
 
 # ===========================================================================
@@ -738,15 +743,19 @@ def run_dataset(split_id: int, data: dict[str, Any], cfg: CNNConfig, out_dir: Pa
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    bm, x_ref, Sigma_inv = build_target(data, cfg, map_path=map_path, architecture=architecture)
+    bm, x_ref, Sigma_inv, cold_start_mask = build_target(data, cfg, map_path=map_path, architecture=architecture)
     print(f"  D = {bm.D}")
 
     print_preactivation_diagnostic(bm, x_ref, cfg)
 
-    _, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
-    x_pruned, cold_start_mask = prune_x_ref(
-        bm, x_ref, data["X_sweep"], data["y_sweep"], can_freeze,
-    )
+    if cold_start_mask is not None:
+        print("  using pre-pruned+refit checkpoint's x_ref/cold_start_mask directly (skipping prune_x_ref)")
+        x_pruned = x_ref
+    else:
+        _, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
+        x_pruned, cold_start_mask = prune_x_ref(
+            bm, x_ref, data["X_sweep"], data["y_sweep"], can_freeze,
+        )
 
     grad_target = torch.func.grad(bm.energy)
     grad_norm_unpruned = grad_target(x_ref).abs().max().item()
