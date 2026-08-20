@@ -730,6 +730,7 @@ class FastGridStickyZigZagSampler(GridZigZagSampler):
                 "wall_seconds": None,
                 "bound_seconds": bound_seconds,
                 "bound_violations": stats.get("bound_violations", 0),
+                "rejected_in_window": stats.get("rejected_in_window", False),
                 "max_ratio": stats.get("max_ratio", 0.0),
                 "curvature_ratio": stats.get("curvature_ratio", 0.0),
                 "n_segments": stats.get("n_segments"),

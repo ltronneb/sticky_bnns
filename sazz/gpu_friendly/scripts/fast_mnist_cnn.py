@@ -149,14 +149,14 @@ N_SWEEP = 2000   # held-out MNIST-test points (disjoint from this script's
 # knob to SKELETON_CHUNK_SIZE below (how many skeleton rows are buffered
 # before a disk flush). Different axis entirely; do not conflate them.
 GRID_CHUNK_SIZE = 4
-GRID_T_MAX_INIT_ZIGZAG = 0.002
+GRID_T_MAX_INIT_ZIGZAG = 0.005
 GRID_SPACING_ZIGZAG = 1e-5
 GRID_T_MAX_INIT_BOOM = math.pi / 4   # unchanged -- period-anchored, D-independent
 GRID_SPACING_BOOM = math.pi / 64     # unchanged
 GRID_N_SEGMENTS = 100
-GRID_ALPHA_PLUS = 1.01
+GRID_ALPHA_PLUS = 1.02
 GRID_ALPHA_MINUS = 1.04
-GRID_ALPHA_VIOLATION = 1.2
+GRID_ALPHA_VIOLATION = 1.1
 
 # Skeleton-chunking knobs (new -- see radiant-finding-church.md). None
 # disables chunking entirely (sample()'s original full-[N,D] behavior).
@@ -560,12 +560,22 @@ def save_run(out_path: Path, *, sampler: str, samples: Tensor, x_ref: Optional[T
              cfg: CNNConfig, elapsed_sec: float, n_events: int, bound_violations: int,
              gradient_evals: Optional[int] = None, grid_t_max_log: Optional[list[float]] = None,
              test_accuracy: Optional[float] = None, sparsity_frac: Optional[float] = None,
-             prune_frac: Optional[float] = None, cold_start_mask: Optional[Tensor] = None) -> None:
+             prune_frac: Optional[float] = None, cold_start_mask: Optional[Tensor] = None,
+             diagnostics: Optional[list[dict]] = None) -> None:
     """
     x_ref here is whatever the caller actually sampled from/anchored to --
     for the sticky runners this MUST be the pruned x_ref (x_pruned), not
     the raw checkpoint vector, so a saved run's recorded provenance matches
     the vector that was actually used.
+
+    diagnostics: the full per-iteration diag_log list from sample()'s
+    return dict (small dicts of floats/ints/strings, no tensors -- cheap,
+    a few MB at typical N_SKELETON), or None. Only ever non-None for a
+    non-chunked sample() call (chunk_size=None) -- chunked runs already
+    flush their diag_log to chunk_dir/diag_*.pt periodically specifically
+    to bound memory (see sample()'s docstring), so result["diagnostics"]
+    is None in that mode and there is nothing here to save; the chunked
+    diag_*.pt files are the analysis path for that case, not this field.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -583,6 +593,7 @@ def save_run(out_path: Path, *, sampler: str, samples: Tensor, x_ref: Optional[T
         "sparsity_frac": sparsity_frac,
         "prune_frac": prune_frac,
         "cold_start_mask": cold_start_mask.cpu() if cold_start_mask is not None else None,
+        "diagnostics": diagnostics,
     }, out_path)
 
 
@@ -664,6 +675,7 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
         gradient_evals=result["gradient_evals"], grid_t_max_log=result["grid_t_max_log"],
         test_accuracy=acc, sparsity_frac=sparsity,
         prune_frac=n_frozen_init / max(n_freezable, 1), cold_start_mask=cold_start_mask,
+        diagnostics=result.get("diagnostics"),
     )
     print(f"      saved -> {out_path}")
 
