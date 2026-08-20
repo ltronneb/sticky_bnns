@@ -42,7 +42,8 @@ import torch.nn as nn
 from torch import Tensor
 from tqdm import tqdm
 
-from ..utils.grid_bound import grid_thinning, build_grid_bound_vectorized
+# from ..utils.grid_bound import grid_thinning, build_grid_bound_vectorized
+from ..utils.fast_grid_bound import grid_thinning, build_grid_bound_vectorized
 
 
 class GridZigZagSampler(nn.Module):

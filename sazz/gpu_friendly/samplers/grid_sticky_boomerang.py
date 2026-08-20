@@ -30,7 +30,8 @@ from torch import Tensor
 from tqdm import tqdm
 
 from .grid_boomerang import GridBoomerangSampler
-from ..utils.grid_bound import grid_thinning
+# from ..utils.grid_bound import grid_thinning
+from ..utils.fast_grid_bound import grid_thinning
 
 
 class GridStickyBoomerangSampler(GridBoomerangSampler):

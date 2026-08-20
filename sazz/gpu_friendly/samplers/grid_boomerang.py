@@ -23,7 +23,8 @@ import torch.nn as nn
 from torch import Tensor
 from tqdm import tqdm
 
-from ..utils.grid_bound import grid_thinning
+# from ..utils.grid_bound import grid_thinning
+from ..utils.fast_grid_bound import grid_thinning
 
 
 class GridBoomerangSampler(nn.Module):

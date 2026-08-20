@@ -45,7 +45,8 @@ from torch import Tensor
 from tqdm import tqdm
 
 from .grid_zigzag import GridZigZagSampler
-from ..utils.grid_bound import grid_thinning, build_grid_bound_vectorized
+# from ..utils.grid_bound import grid_thinning, build_grid_bound_vectorized
+from ..utils.fast_grid_bound import grid_thinning, build_grid_bound_vectorized
 
 
 class GridStickyZigZagSampler(GridZigZagSampler):

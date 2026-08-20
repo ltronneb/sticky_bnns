@@ -109,7 +109,19 @@ NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
 N_SAVE      = NUTS_DRAWS * NUTS_CHAINS
 
-HIDDEN = [50]
+# Three architecture variants for a size-sensitivity comparison across the
+# UCI tables -- "small" matches Izmailov et al.'s 1x50 shape (and is what
+# HIDDEN used to be unconditionally), "deep_narrow" keeps that width but
+# adds depth, "deep_wide" mirrors Goan et al.'s 3-hidden-layer shape
+# (512-256-128) scaled down by half for tractability. Selected via
+# --hidden-variant; see configs_for/split_dir for how this threads into
+# per-config output paths.
+HIDDEN_VARIANTS = {
+    "small":       [50],
+    "deep_narrow": [50, 50, 50],
+    "deep_wide":   [256, 128, 64],
+}
+DEFAULT_HIDDEN_VARIANT = "small"
 
 OUT_DIR = Path("results/grid/uci_bnn")
 
@@ -135,12 +147,12 @@ class BNNConfig:
     prior_inclusion_weight: float = 0.7  # sticky-only: spike-and-slab inclusion prob for kappa
 
 
-def configs_for(input_dims: dict[str, int]) -> dict[str, BNNConfig]:
+def configs_for(input_dims: dict[str, int], hidden: list[int]) -> dict[str, BNNConfig]:
     cfgs: dict[str, BNNConfig] = {}
     for name in UCI_DATASETS:
         if name in input_dims:
             cfgs[name] = BNNConfig(
-                layer_sizes=[input_dims[name], *HIDDEN, 1],
+                layer_sizes=[input_dims[name], *hidden, 1],
                 prior_sigma_scale=0.01 if name == "naval" else 0.3,
                 prior_inclusion_weight=0.7,
             )
@@ -787,9 +799,21 @@ def main():
     parser.add_argument("--splits", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--out", type=Path, default=OUT_DIR)
+    parser.add_argument("--hidden-variant", choices=list(HIDDEN_VARIANTS),
+                         default=DEFAULT_HIDDEN_VARIANT,
+                         help="Architecture size for this run -- see HIDDEN_VARIANTS. "
+                              "Results are written under <out>/<hidden-variant>/... so "
+                              "runs at different sizes never collide on disk.")
     args = parser.parse_args()
 
-    args.out.mkdir(parents=True, exist_ok=True)
+    hidden = HIDDEN_VARIANTS[args.hidden_variant]
+    # "small" keeps writing to the original flat <out>/<dataset>/... layout
+    # (matches the pre-existing boston/energy results already on disk under
+    # results/grid/uci_bnn/<dataset>/...) -- every other variant gets its
+    # own <out>/<variant>/<dataset>/... subtree so the three architectures
+    # never collide.
+    out_dir = args.out if args.hidden_variant == DEFAULT_HIDDEN_VARIANT else args.out / args.hidden_variant
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading raw UCI datasets...")
     raw = load_raw_datasets(tuple(args.datasets))
@@ -798,15 +822,16 @@ def main():
         print(f"  (skipping {missing} -- data file(s) not found)")
     datasets_to_run = [d for d in args.datasets if d in raw]
 
-    cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()})
+    cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden)
 
-    print(f"\nRunning {datasets_to_run} | samplers: {args.samplers} | splits: {args.splits}")
+    print(f"\nRunning {datasets_to_run} | samplers: {args.samplers} | splits: {args.splits} | "
+          f"hidden_variant={args.hidden_variant} ({hidden})")
     for ds in datasets_to_run:
         X, y = raw[ds]
         cfg = cfgs[ds]
         for split_id in args.splits:
             data = make_split(X, y, seed=BASE_SEED + split_id, dtype=DTYPE, device=DEVICE)
-            run_split(ds, split_id, data, cfg, args.out, list(args.samplers), resume=args.resume)
+            run_split(ds, split_id, data, cfg, out_dir, list(args.samplers), resume=args.resume)
 
 
 if __name__ == "__main__":
