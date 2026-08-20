@@ -110,7 +110,7 @@ N_ACCURACY_DRAWS = 300      # subsample for softmax-averaging specifically --
                             # N_RESAMPLE draws, independent of N_RESAMPLE.
 BASE_SEED = 42
 
-GAMMA = 1e-5
+GAMMA = 1e-6
 PRIOR_STD_W = 2.0
 PRIOR_STD_B = 2.0            # NOT the old mnist_cnn.py's 5.0 -- that value
                             # was tuned for relu; under tanh + fan-in scaling
