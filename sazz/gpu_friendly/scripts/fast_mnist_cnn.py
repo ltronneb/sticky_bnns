@@ -5,11 +5,12 @@ Usage:
     The reference is fit with the full dataset.
     It is then pruned, and the pruned version is refit
     This refitting used the full dataset
+    
     python3 -m sazz.gpu_friendly.scripts.fast_mnist_cnn 
     --map-path results/maps/lenet_reference_N60000_pruned_refit_N60k.pt 
     --n-skeleton 5_000 --n-resample 5_000 --n-save 5_000 --n-train 10_000
     
-    This refitting used the a 10k dataset
+    This refitting used the a 10k dataset (have only ran this one so far)
     python3 -m sazz.gpu_friendly.scripts.fast_mnist_cnn 
     --map-path results/maps/lenet_reference_N60000_pruned_refit_N10k.pt 
     --n-skeleton 5_000 --n-resample 5_000 --n-save 5_000 --n-train 10_000
@@ -70,11 +71,15 @@ PRUNE_N_THRESHOLDS = 60
 N_SWEEP = 2000 
 
 GRID_CHUNK_SIZE = 4
+
 GAMMA = 1e-6
 GRID_T_MAX_INIT_ZIGZAG = 0.005
 GRID_SPACING_ZIGZAG = 1e-5
-GRID_T_MAX_INIT_BOOM = math.pi / 4  
-GRID_SPACING_BOOM = math.pi / 64    
+
+REFRESH_RATE = 5e2
+GRID_T_MAX_INIT_BOOM = math.pi / 64  
+GRID_SPACING_BOOM = math.pi / 64  
+  
 GRID_N_SEGMENTS = 100
 GRID_ALPHA_PLUS = 1.02
 GRID_ALPHA_MINUS = 1.04
