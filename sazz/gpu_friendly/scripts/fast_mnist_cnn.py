@@ -51,7 +51,7 @@ N_ACCURACY_DRAWS = 300      # subsample for softmax-averaging specifically
 
 PRIOR_STD_W = 2.0
 PRIOR_STD_B = 2.0
-PRIOR_INCLUSION_WEIGHT = 0.13
+PRIOR_INCLUSION_WEIGHT = 0.1
 ACTIVATION = "tanh"
 POOL = "avg"
 
@@ -59,9 +59,9 @@ PRUNE_ACC_DROP_TOLERANCE = 0.01   # max acceptable (baseline_acc - pruned_acc)
 PRUNE_N_THRESHOLDS = 60
 N_SWEEP = 2000 
 
-GRID_CHUNK_SIZE = 2
+GRID_CHUNK_SIZE = 4
 GAMMA = 1e-6
-GRID_T_MAX_INIT_ZIGZAG = 0.005
+GRID_T_MAX_INIT_ZIGZAG = 0.01
 GRID_SPACING_ZIGZAG = 1e-5
 GRID_T_MAX_INIT_BOOM = math.pi / 4  
 GRID_SPACING_BOOM = math.pi / 64    
