@@ -1,30 +1,4 @@
 """
-Grid-bound sticky ZigZag/Boomerang (Andral & Kamatani 2024) on MNIST via a
-CNN or LeNet5 -- the primary target for this whole gpu_friendly effort: does
-sticky freeze/thaw sparsity survive on a real conv architecture, and is it
-fast on GPU. Mirrors uci_bnn_grid.py's shape; ports
-sazz/scripts/bnns/mnist_cnn.py's known-working target construction onto the
-gpu_friendly stack (BayesianModule + grid samplers) instead of the old
-ParamSpec/BayesianModel stack.
-
-This pass is deliberately scoped to a SMALL N_SKELETON to validate
-correctness -- skeleton storage at these D (19466 CNN / 61706 LeNet5) is a
-real memory constraint at any serious N_SKELETON (positions+velocities
-alone are 2*N*D*4B in float32), and writing skeletons to disk instead of
-holding them in device memory is planned as a separate, later change, not
-attempted here.
-
-Sticky-only: "grid_sticky_zigzag", "grid_sticky_boomerang" -- both take
-x_ref as their cold-start initialization. x_ref is pruned per-coordinate
-(relative to each coordinate's own prior std, restricted to freezable
-weight coordinates) before use, and the resulting freeze mask is passed
-directly as each sampler's cold_start_threshold instead of the uniform
-scalar threshold the samplers otherwise apply -- see prune_x_ref. For
-sticky Boomerang this is a correctness requirement (the pruned x_ref is
-also the reference-measure anchor via preprocess()), not merely a
-warm-start convenience; for sticky ZigZag (which has no reference measure)
-it is a cold-start-quality choice only.
-
 Usage:
     python -m sazz.gpu_friendly.scripts.mnist_cnn_grid --samplers grid_sticky_zigzag
     python -m sazz.gpu_friendly.scripts.mnist_cnn_grid --map-path results/maps/cnn_reference_N60000_steps10000.pt
@@ -61,102 +35,36 @@ from sazz.gpu_friendly.scripts.cnn_reference import eval_accuracy
 
 ARCHITECTURES = {"cnn": CNN, "lenet5": LeNet5}
 
-
-# ===========================================================================
-# Config -- see toy_bnn_grid.py/uci_bnn_grid.py for the documented MPS
-# jvp(grad(...)) blocker; same pattern copied verbatim here.
-# ===========================================================================
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float32 if DEVICE == "cuda" else torch.float64
 torch.set_default_dtype(torch.float32)
 
-N_TRAIN, N_TEST = 60_000, 500
-
-# N_TRAIN=60000 (the full MNIST training pool) matches what
-# refit_pruned_lenet_reference.py's --full flag rebuilds bm against when
-# pruning/refitting the reference checkpoint -- keeping them in sync
-# matters because bm.X (hence Sigma_inv's N-rescale and every gradient
-# evaluation here) must be built from the SAME data the prune/refit step
-# used, or the pruning threshold and refit stationarity point are only
-# valid for a different bm than the one actually sampled from. The
-# original per-N_TRAIN timing-probe note below predates this change (was
-# tuned at N_TRAIN=100 on CPU) and no longer reflects the default scale --
-# retune N_SKELETON/grid_* constants empirically at N_TRAIN=60000 on GPU
-# rather than trusting the old note's numbers.
-N_SKELETON = 50
-
-# N_RESAMPLE is now an INDEPENDENT knob, not derived from N_SKELETON --
-# see radiant-finding-church.md sec 5. Coupling N_RESAMPLE = N_SKELETON
-# (the original mnist_cnn_grid.py convention) meant that chunking
-# N_SKELETON's memory (this file's whole point) still left the resample
-# step allocating a full [N_SKELETON, D] output tensor -- the exact
-# ceiling chunking exists to remove, just moved a few lines down. Kept
-# small here for the same reason the original's comment gave (resample_*
-# materializes [N_resample, D] arrays; at CNN scale (D~19466) a
-# UCI-scale N_RESAMPLE (50k) would be ~3.9GB PER ARRAY, worse at LeNet5's
-# D~61706), but now independently settable via --n-resample regardless of
-# how large --n-skeleton grows.
-N_RESAMPLE = 2000
-
-# N_SAVE is a SEPARATE decoupling from N_RESAMPLE (not just carried along
-# from it, per the plan) -- save_run's thin_to(samples, N_SAVE).cpu()
-# writes a full [N_SAVE, D] pickle to disk; at LeNet5 scale even a modest
-# N_RESAMPLE default produces a multi-GB pickle per sampler per run if
-# N_SAVE just inherits it. N_SAVE feeds saved-artifact size for
-# downstream analysis, not the accuracy computation (evaluate_accuracy
-# already subsamples to N_ACCURACY_DRAWS=300 regardless), so there's no
-# correctness reason to keep it as large as N_RESAMPLE.
-N_SAVE = 500
-BURNIN_FRAC = 0.2
-N_ACCURACY_DRAWS = 300      # subsample for softmax-averaging specifically --
-                            # posterior-mean-of-softmax converges well before
-                            # N_RESAMPLE draws, independent of N_RESAMPLE.
 BASE_SEED = 42
 
-GAMMA = 1e-6
-PRIOR_STD_W = 2.0
-PRIOR_STD_B = 2.0            # NOT the old mnist_cnn.py's 5.0 -- that value
-                            # was tuned for relu; under tanh + fan-in scaling
-                            # it puts typical pre-activations at |z|~5, where
-                            # tanh'(5)~1.8e-4 (near-saturated). 2.0 keeps
-                            # pre-activations closer to this tree's
-                            # established tanh convention (uci_bnn_grid.py
-                            # uses 1.0, toy_bnn_grid.py uses 3.0) -- confirm
-                            # via the |z|>2 pre-activation diagnostic
-                            # (print_preactivation_diagnostic, called once
-                            # per split in run_dataset) before trusting a
-                            # full sampler run.
-PRIOR_INCLUSION_WEIGHT = 0.13
-ACTIVATION = "tanh"          # NOT relu -- relu's kinked gradient causes
-                            # bound_violations for a grid-bound rate; every
-                            # other script in this tree already defaults to
-                            # tanh for this exact reason.
-POOL = "avg"                # NOT max -- max_pool2d is a second, independent
-                            # kink source; must match cnn_reference.py's POOL.
+N_TRAIN, N_TEST = 60_000, 500
+N_SKELETON = 50
+N_RESAMPLE = 2000
+N_SAVE = 500
 
-# Both sticky samplers' cold_start_threshold now takes the boolean mask
-# prune_x_ref returns (per-layer, prior-std-relative), not a uniform scalar
-# threshold -- see prune_x_ref and the module docstring.
+BURNIN_FRAC = 0.2
+N_ACCURACY_DRAWS = 300      # subsample for softmax-averaging specifically 
+
+PRIOR_STD_W = 2.0
+PRIOR_STD_B = 2.0
+PRIOR_INCLUSION_WEIGHT = 0.13
+ACTIVATION = "tanh"
+POOL = "avg"
+
 PRUNE_ACC_DROP_TOLERANCE = 0.01   # max acceptable (baseline_acc - pruned_acc)
 PRUNE_N_THRESHOLDS = 60
-N_SWEEP = 2000   # held-out MNIST-test points (disjoint from this script's
-                 # own test_idx AND from any --map-path checkpoint's fit,
-                 # since checkpoints are fit on MNIST's TRAIN pool only --
-                 # see prune_x_ref) used solely to pick the prune threshold.
+N_SWEEP = 2000 
 
-# Provisional -- retune once a timing probe (see notebooks/ or an ad-hoc
-# script) has been run against the real CNN target at this D. Kept small/
-# conservative for this pass rather than copied from UCI/toy scale.
-# NOTE: GRID_CHUNK_SIZE is the vmap batch size inside grid-bound rate
-# evaluation (torch.func.vmap's chunk_size) -- an existing, UNRELATED
-# knob to SKELETON_CHUNK_SIZE below (how many skeleton rows are buffered
-# before a disk flush). Different axis entirely; do not conflate them.
-GRID_CHUNK_SIZE = 4
+GRID_CHUNK_SIZE = 2
+GAMMA = 1e-6
 GRID_T_MAX_INIT_ZIGZAG = 0.005
 GRID_SPACING_ZIGZAG = 1e-5
-GRID_T_MAX_INIT_BOOM = math.pi / 4   # unchanged -- period-anchored, D-independent
-GRID_SPACING_BOOM = math.pi / 64     # unchanged
+GRID_T_MAX_INIT_BOOM = math.pi / 4  
+GRID_SPACING_BOOM = math.pi / 64    
 GRID_N_SEGMENTS = 100
 GRID_ALPHA_PLUS = 1.02
 GRID_ALPHA_MINUS = 1.04
@@ -851,10 +759,28 @@ def main():
     print(f"\nRunning MNIST-CNN | samplers: {args.samplers} | splits: {args.splits} | "
           f"N_SKELETON={N_SKELETON} | device={DEVICE} dtype={DTYPE}")
 
+    # Sweep data (X_sweep/y_sweep) is only needed if run_dataset ends up
+    # calling prune_x_ref -- i.e. the loaded checkpoint has no saved
+    # cold_start_mask (an old, unpruned checkpoint, or no --map-path at
+    # all). A pre-pruned+refit checkpoint (refit_pruned_lenet_reference.py's
+    # output, the expected common case now) already carries its own
+    # cold_start_mask, so build_target's skip-prune branch never touches
+    # X_sweep/y_sweep -- loading n_sweep=N_SWEEP extra MNIST-test images in
+    # that case is pure waste, not just unused. Peek at the checkpoint here
+    # (cheap: a state dict, not the training data) purely to decide whether
+    # sweep data is worth drawing; build_target reloads it properly below.
+    needs_sweep = True
+    if args.map_path is not None:
+        _ckpt_peek = torch.load(args.map_path, map_location="cpu", weights_only=False)
+        needs_sweep = _ckpt_peek.get("cold_start_mask") is None
+    n_sweep = N_SWEEP if needs_sweep else 0
+    if not needs_sweep:
+        print("  checkpoint carries its own cold_start_mask -- skipping sweep-data load (no pruning needed)")
+
     for split_id in args.splits:
         data = load_mnist_subset(
             args.n_train, args.n_test, args.seed + split_id, args.data_dir, DTYPE, DEVICE,
-            n_sweep=N_SWEEP,
+            n_sweep=n_sweep,
         )
         run_dataset(split_id, data, cfg, args.out, args.samplers, args.map_path, args.architecture)
 
