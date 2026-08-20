@@ -27,13 +27,13 @@ def make_gaussian_likelihood(module: nn.Module, param_dict_fn, X: Tensor,
         noise_std = torch.as_tensor(noise_std, dtype=X.dtype, device=X.device)
         def log_prob_single(beta, X_i, y_i):
             preds = torch.func.functional_call(module, param_dict_fn(beta), (X_i,)).squeeze(-1)
-            return Normal(preds, noise_std).log_prob(y_i).sum()
+            return Normal(preds, noise_std, validate_args=False).log_prob(y_i).sum()
     else:
         def log_prob_single(beta: Tensor, X_i: Tensor, y_i: Tensor) -> Tensor:
             weights, log_sigma = beta[:-1], beta[-1]
             sigma = log_sigma.exp()
             preds = torch.func.functional_call(module, param_dict_fn(weights), (X_i,)).squeeze(-1)
-            log_lik = Normal(preds, sigma).log_prob(y_i).sum()
+            log_lik = Normal(preds, sigma, validate_args=False).log_prob(y_i).sum()
             # HalfNormal(prior_sigma_scale) on sigma, with Jacobian to log_sigma:
             log_prior = -0.5 * (sigma / prior_sigma_scale) ** 2 + log_sigma
             return log_lik + log_prior
