@@ -124,6 +124,7 @@ def build_grid_bound(
     dtype: torch.dtype,
     eps: Optional[float] = None,
     t_offset: float = 0.0,
+    bound_inflation: float = 0.01,
 ):
     """
     Algorithm 2: piecewise-constant upper bound of signed rate g(t) over
@@ -143,6 +144,14 @@ def build_grid_bound(
     global time (window_start) but must still evaluate the caller's closure
     at that global time, not at a re-zeroed local time -- default 0.0 is a
     no-op, preserving the original (pre-fix) behavior when omitted.
+
+    bound_inflation: multiplicative safety margin, applied to the scalar
+    seg_bounds (post tangent-line construction). Same rationale as
+    build_grid_bound_vectorized's identically-named parameter: inflating
+    an upper bound can only produce more proposals/rejections, never fewer
+    true events -- grid_thinning's accept/reject ratio check is exact
+    regardless of how loose the bound is, so this cannot bias the sampled
+    target. Default 0.01 matches build_grid_bound_vectorized's default.
 
     Returns knot_times[n_segments+1], seg_bounds[n_segments] (unclamped
     Lambda_i per segment), cum_bound[n_segments+1] (cumulative integral of
@@ -178,7 +187,7 @@ def build_grid_bound(
     m_i = d0 * x_i + y0 - d0 * t0
     m_i = torch.where(torch.isfinite(m_i), m_i, torch.minimum(y0, y1))
 
-    seg_bounds = torch.maximum(torch.maximum(y0, y1), m_i)  # unclamped (design decision #4)
+    seg_bounds = torch.maximum(torch.maximum(y0, y1), m_i) * (1.0 + bound_inflation)  # unclamped (design decision #4)
 
     seg_widths = t1 - t0
     seg_integrals = torch.clamp(seg_bounds, min=0.0) * seg_widths

@@ -133,7 +133,15 @@ def main():
                          help="Training pool size for rebuilding bm -- should match the "
                               "sampling script's --n-train so Sigma_inv's rescale and "
                               "prune/refit decisions are made against the same data bm "
-                              "will actually be sampled against.")
+                              "will actually be sampled against. Ignored if --full is given.")
+    parser.add_argument("--full", action="store_true",
+                         help="Use the full 60k MNIST training set (equivalent to --n-train 60000, "
+                              "MNIST's actual training-pool size). Overrides --n-train -- mirrors "
+                              "lenet_reference.py's --full flag, so the pruning/refit step here "
+                              "runs against the SAME training data the original MAP checkpoint was "
+                              "fit on (when that checkpoint was itself produced with --full), "
+                              "rather than a subsample that silently changes what Sigma_inv's "
+                              "N-rescale and the prune/refit gradient are evaluated against.")
     parser.add_argument("--n-test", type=int, default=500)
     parser.add_argument("--n-sweep", type=int, default=N_SWEEP)
     parser.add_argument("--prune-acc-drop-tolerance", type=float, default=PRUNE_ACC_DROP_TOLERANCE)
@@ -149,6 +157,8 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    n_train = 60_000 if args.full else args.n_train
+
     print(f"Loading reference checkpoint from {args.map_path} ...")
     ckpt = torch.load(args.map_path, map_location="cpu", weights_only=False)
     architecture = ckpt.get("architecture", "cnn")
@@ -159,9 +169,10 @@ def main():
     fan_in_scaling = ckpt.get("fan_in_scaling", True)
 
     print(f"  architecture={architecture}  activation={activation}  pool={pool}  "
-          f"prior_std_weight={prior_std_weight}  prior_std_bias={prior_std_bias}")
+          f"prior_std_weight={prior_std_weight}  prior_std_bias={prior_std_bias}  "
+          f"n_train={'full (60000)' if args.full else n_train}")
 
-    data = load_mnist_subset(args.n_train, args.n_test, args.seed, args.data_dir,
+    data = load_mnist_subset(n_train, args.n_test, args.seed, args.data_dir,
                               DTYPE, DEVICE, n_sweep=args.n_sweep)
 
     module_cls = ARCHITECTURES[architecture]

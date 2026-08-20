@@ -51,7 +51,7 @@ def build_kappa_from_inclusion(
 ) -> Tensor:
     """
     Per-coordinate thaw-rate kappa for GridStickyBoomerangSampler, matching
-    a spike-and-slab prior beta_i ~ w*delta_0 + (1-w)*N(0, sigma_w^2):
+    a spike-and-slab prior beta_i ~ w*N(0, sigma_w^2) + (1-w)*delta_0:
         kappa_weight = (w / (1-w)) / (sigma_w * sqrt(2*pi))
     with sigma_w computed via the same fan-in convention as
     build_fan_in_prior_precision (so the slab here and the prior's slab

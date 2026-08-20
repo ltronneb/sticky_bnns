@@ -680,7 +680,9 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
                 "wall_seconds": None,
                 "bound_seconds": bound_seconds,
                 "bound_violations": stats.get("bound_violations", 0),
+                "rejected_in_window": stats.get("rejected_in_window", False),
                 "max_ratio": stats.get("max_ratio", 0.0),
+                "curvature_ratio": stats.get("curvature_ratio", 0.0),
             }
 
             # Branch on stats["accepted"], NEVER on a re-derived
@@ -779,7 +781,8 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
                     "event_type": "refresh", "accepted": None,
                     "n_frozen": n_frozen_r, "n_active": self.D - n_frozen_r,
                     "sparsity": n_frozen_r / self.D, "binding": None,
-                    "wall_seconds": 0.0, "bound_violations": 0, "max_ratio": 0.0,
+                    "wall_seconds": 0.0, "bound_violations": 0,
+                    "rejected_in_window": False, "max_ratio": 0.0, "curvature_ratio": 0.0,
                 }
 
                 if iteration < N:

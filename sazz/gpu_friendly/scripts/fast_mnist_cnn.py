@@ -71,15 +71,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float32 if DEVICE == "cuda" else torch.float64
 torch.set_default_dtype(torch.float32)
 
-N_TRAIN, N_TEST = 10_000, 500
+N_TRAIN, N_TEST = 60_000, 500
 
-# Deliberately small this pass -- correctness first, not a usable posterior.
-# Sized from a direct timing probe on CPU (no CUDA/MPS in this environment --
-# jvp(grad(...)) is broken on MPS, documented above): ~2.6s/skeleton-point at
-# N_TRAIN=100, curvature_ratio~1.0 and n_segments=10 already well-tuned at
-# GRID_T_MAX_INIT_ZIGZAG/GRID_SPACING_ZIGZAG below, so 50 is enough to prove
-# correctness without a multi-minute smoke test. Retune upward once running
-# on real GPU hardware (see module docstring).
+# N_TRAIN=60000 (the full MNIST training pool) matches what
+# refit_pruned_lenet_reference.py's --full flag rebuilds bm against when
+# pruning/refitting the reference checkpoint -- keeping them in sync
+# matters because bm.X (hence Sigma_inv's N-rescale and every gradient
+# evaluation here) must be built from the SAME data the prune/refit step
+# used, or the pruning threshold and refit stationarity point are only
+# valid for a different bm than the one actually sampled from. The
+# original per-N_TRAIN timing-probe note below predates this change (was
+# tuned at N_TRAIN=100 on CPU) and no longer reflects the default scale --
+# retune N_SKELETON/grid_* constants empirically at N_TRAIN=60000 on GPU
+# rather than trusting the old note's numbers.
 N_SKELETON = 50
 
 # N_RESAMPLE is now an INDEPENDENT knob, not derived from N_SKELETON --
@@ -123,7 +127,7 @@ PRIOR_STD_B = 2.0            # NOT the old mnist_cnn.py's 5.0 -- that value
                             # (print_preactivation_diagnostic, called once
                             # per split in run_dataset) before trusting a
                             # full sampler run.
-PRIOR_INCLUSION_WEIGHT = 0.5
+PRIOR_INCLUSION_WEIGHT = 0.13
 ACTIVATION = "tanh"          # NOT relu -- relu's kinked gradient causes
                             # bound_violations for a grid-bound rate; every
                             # other script in this tree already defaults to
@@ -735,6 +739,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
         gradient_evals=result["gradient_evals"], grid_t_max_log=result["grid_t_max_log"],
         test_accuracy=acc, sparsity_frac=sparsity,
         prune_frac=n_frozen_init / max(n_freezable, 1), cold_start_mask=cold_start_mask,
+        diagnostics=result.get("diagnostics"),
     )
     print(f"      saved -> {out_path}")
 
