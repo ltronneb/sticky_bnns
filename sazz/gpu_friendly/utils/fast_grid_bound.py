@@ -201,6 +201,7 @@ def build_grid_bound_vectorized(
     signed: bool = True,
     offset: float = 0.0,
     t_offset: float = 0.0,
+    bound_inflation: float = 0.01,
 ):
     """
     Per-coordinate Algorithm 2 (Andral & Kamatani Section 4.4.2), batched
@@ -276,6 +277,17 @@ def build_grid_bound_vectorized(
     physical scale (the same safe_denom construction below already
     prevents any actual division by a degenerate denom).
 
+    bound_inflation: multiplicative safety margin, applied to the FULL
+    scalar seg_bounds (post-sum, post-offset) as seg_bounds *= (1+
+    bound_inflation). Purely a validity-vs-efficiency knob: inflating an
+    upper bound can only ever produce MORE proposals/rejections, never
+    fewer true events -- grid_thinning's accept/reject ratio check is
+    exact regardless of how loose the bound is, so this cannot bias the
+    sampled target. Default 0.0 (no change from prior behavior). A small
+    positive value (e.g. 0.01-0.05) trades a bit of extra compute for
+    fewer Section 4.7 bound-violation shrinks when violations are
+    observed to be small/frequent (ratio just above 1, not wildly over).
+
     Returns knot_times[n_segments+1] (local), seg_bounds[n_segments]
     (scalar, summed over D, offset already added), cum_bound[n_segments+1],
     rate_evals (== n_segments+1).
@@ -307,7 +319,7 @@ def build_grid_bound_vectorized(
     if signed:
         seg_bounds_percoord = torch.clamp(seg_bounds_percoord, min=0.0)
 
-    seg_bounds = seg_bounds_percoord.sum(dim=0) + offset  # [K-1] scalar per segment
+    seg_bounds = (seg_bounds_percoord.sum(dim=0) + offset) * (1.0 + bound_inflation)  # [K-1] scalar per segment
 
     seg_widths = t1 - t0
     seg_integrals = torch.clamp(seg_bounds, min=0.0) * seg_widths
