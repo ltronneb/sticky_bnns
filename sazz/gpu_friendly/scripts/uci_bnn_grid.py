@@ -71,6 +71,12 @@ DEVICE = (
 DTYPE = torch.float32 if DEVICE == "cuda" else torch.float64
 torch.set_default_dtype(torch.float32)
 
+# Module-level defaults -- overridden per-invocation via --n-skeleton/
+# --n-resample (see main()'s `global` reassignment), same convention as
+# fast_mnist_cnn.py's N_SKELETON/N_RESAMPLE/N_SAVE CLI overrides. Runner
+# functions (run_grid_zigzag etc.) read N_SKELETON as a module global, not
+# a parameter -- reassigning it in main() before any runner is called is
+# what makes the override take effect.
 N_SKELETON  = 100_000
 N_RESAMPLE  = 50_000
 BURNIN_FRAC = 0.2
@@ -147,14 +153,15 @@ class BNNConfig:
     prior_inclusion_weight: float = 0.7  # sticky-only: spike-and-slab inclusion prob for kappa
 
 
-def configs_for(input_dims: dict[str, int], hidden: list[int]) -> dict[str, BNNConfig]:
+def configs_for(input_dims: dict[str, int], hidden: list[int],
+                 prior_inclusion_weight: float = 0.7) -> dict[str, BNNConfig]:
     cfgs: dict[str, BNNConfig] = {}
     for name in UCI_DATASETS:
         if name in input_dims:
             cfgs[name] = BNNConfig(
                 layer_sizes=[input_dims[name], *hidden, 1],
                 prior_sigma_scale=0.01 if name == "naval" else 0.3,
-                prior_inclusion_weight=0.7,
+                prior_inclusion_weight=prior_inclusion_weight,
             )
     return cfgs
 
@@ -788,6 +795,8 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 # ===========================================================================
 
 def main():
+    global N_SKELETON, N_RESAMPLE
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -804,7 +813,24 @@ def main():
                          help="Architecture size for this run -- see HIDDEN_VARIANTS. "
                               "Results are written under <out>/<hidden-variant>/... so "
                               "runs at different sizes never collide on disk.")
+    parser.add_argument("--n-skeleton", type=int, default=N_SKELETON,
+                         help="Overrides the module-level N_SKELETON default -- e.g. "
+                              "lower this for larger hidden-variants (more D) to keep "
+                              "per-split wall time down.")
+    parser.add_argument("--n-resample", type=int, default=N_RESAMPLE,
+                         help="Overrides the module-level N_RESAMPLE default -- independent "
+                              "of --n-skeleton.")
+    parser.add_argument("--prior-inclusion-weight", type=float, default=0.7,
+                         help="Sticky-only spike-and-slab prior inclusion probability (BNNConfig."
+                              "prior_inclusion_weight, fed to build_kappa_from_inclusion). Lower "
+                              "values shrink kappa (thaw rate), so coordinates that freeze stay "
+                              "frozen longer -- reduces the effective active-D the sticky samplers "
+                              "spend skeleton events resolving. Only affects grid_sticky_zigzag/"
+                              "grid_sticky_boomerang; plain grid_zigzag/grid_boomerang/NUTS ignore it.")
     args = parser.parse_args()
+
+    N_SKELETON = args.n_skeleton
+    N_RESAMPLE = args.n_resample
 
     hidden = HIDDEN_VARIANTS[args.hidden_variant]
     # "small" keeps writing to the original flat <out>/<dataset>/... layout
@@ -822,10 +848,13 @@ def main():
         print(f"  (skipping {missing} -- data file(s) not found)")
     datasets_to_run = [d for d in args.datasets if d in raw]
 
-    cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden)
+    cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden,
+                        prior_inclusion_weight=args.prior_inclusion_weight)
 
     print(f"\nRunning {datasets_to_run} | samplers: {args.samplers} | splits: {args.splits} | "
-          f"hidden_variant={args.hidden_variant} ({hidden})")
+          f"hidden_variant={args.hidden_variant} ({hidden}) | "
+          f"N_SKELETON={N_SKELETON} N_RESAMPLE={N_RESAMPLE} "
+          f"prior_inclusion_weight={args.prior_inclusion_weight}")
     for ds in datasets_to_run:
         X, y = raw[ds]
         cfg = cfgs[ds]
