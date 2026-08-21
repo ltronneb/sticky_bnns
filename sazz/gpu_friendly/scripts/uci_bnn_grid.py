@@ -24,6 +24,8 @@ Usage:
     python -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston --splits 0
     python -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston --splits 0 --samplers grid_boomerang
     python -m sazz.gpu_friendly.scripts.uci_bnn_grid --samplers nuts nuts_horseshoe
+    
+python3 -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston energy naval --samplers nuts nuts_horseshoe
 """
 
 from __future__ import annotations
