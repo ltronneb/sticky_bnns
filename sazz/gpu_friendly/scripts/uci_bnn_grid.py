@@ -133,7 +133,7 @@ DEFAULT_HIDDEN_VARIANT = "small"
 
 OUT_DIR = Path("results/grid/uci_bnn")
 
-UCI_DATASETS  = ("boston", "naval", "energy")
+UCI_DATASETS  = ("boston", "naval", "energy", "yacht", "concrete")
 SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "nuts_horseshoe")
 
 
@@ -196,6 +196,25 @@ def load_raw_datasets(datasets: tuple[str, ...]) -> dict[str, tuple[np.ndarray, 
         raw["energy"] = (
             df_energy.iloc[:, :8].values.astype(float),
             df_energy.iloc[:, 8].values.astype(float),
+        )
+
+    if "yacht" in datasets:
+        df_yacht = pd.read_csv("datasets/yacht_hydrodynamics.data", sep=r"\s+", header=None)
+        raw["yacht"] = (
+            df_yacht.iloc[:, :6].values.astype(float),
+            df_yacht.iloc[:, 6].values.astype(float),
+        )
+
+    if "concrete" in datasets:
+        # Legacy .xls (not .xlsx) -- needs the xlrd engine, not openpyxl
+        # (energy_data.xlsx above uses openpyxl's default automatically).
+        # pip install xlrd if this raises ImportError.
+        df_concrete = pd.read_excel(
+            "datasets/concrete+compressive+strength 3/Concrete_Data.xls", engine="xlrd",
+        )
+        raw["concrete"] = (
+            df_concrete.iloc[:, :8].values.astype(float),
+            df_concrete.iloc[:, 8].values.astype(float),
         )
 
     return raw

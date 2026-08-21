@@ -1,17 +1,17 @@
 """
 Grid-bound Boomerang/ZigZag (Andral & Kamatani 2024) on the same toy 1-D BNN
 regression benchmarks as sazz/scripts/bnns/toy_bnn.py -- same FFN
-architecture, datasets, and per-dataset hyperparameters. Five samplers
+architecture, datasets, and per-dataset hyperparameters. Six samplers
 available: "grid_zigzag" (GridZigZagSampler), "grid_sticky_zigzag"
 (GridStickyZigZagSampler, sparsity via freeze/thaw), "grid_boomerang"
 (GridBoomerangSampler), "grid_sticky_boomerang" (GridStickyBoomerangSampler),
-and "nuts" (NumPyro).
+"nuts" (NumPyro NUTS), and "svi" (NumPyro mean-field SVI with
+TraceMeanField_ELBO, on the same model as "nuts").
 
 Isolated from sazz/scripts/bnns/toy_bnn.py's model/sampler/warmup imports;
 only reads pure utilities from the existing tree (generate_toys.GENERATORS,
 sampling.resample_boomerang_path[_sticky]). Model/likelihood/prior wiring,
 the reference-measure finder, and the grid samplers are gpu_friendly-tree-native.
-
 Usage:
     python -m sazz.gpu_friendly.scripts.toy_bnn_grid
     python -m sazz.gpu_friendly.scripts.toy_bnn_grid --datasets hernandez gap
@@ -121,37 +121,38 @@ N_SAVE = 8_000  # matches the existing results/toy_bnns/*/split_00/*.pt files
 NUTS_DRAWS  = 2_000
 NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
+PRIOR_INCLUSION_WEIGHT = 0.1
 
 OUT_DIR = Path("results/grid/toy_bnns")
 TOY_DIR = Path("datasets/toy_1d")
 
 TOY_DATASETS = ("hernandez", "gap", "sharp", "multiscale")
-SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts")
+SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "svi")
 
 DATASET_CONFIGS = {
     "hernandez": dict(
         layer_sizes=[1, 100, 1], activation="tanh",
         prior_std_weight=3.0, prior_std_bias=3.0,
         fan_in_scaling=True, adam_steps=10000,
-        prior_inclusion_weight=0.5,
+        prior_inclusion_weight=PRIOR_INCLUSION_WEIGHT,
     ),
     "gap": dict(
         layer_sizes=[1, 100, 1], activation="tanh",
         prior_std_weight=3.0, prior_std_bias=3.0,
         fan_in_scaling=True, adam_steps=10000,
-        prior_inclusion_weight=0.5,
+        prior_inclusion_weight=PRIOR_INCLUSION_WEIGHT,
     ),
     "sharp": dict(
         layer_sizes=[1, 100, 1], activation="tanh",
         prior_std_weight=3.0, prior_std_bias=3.0,
         fan_in_scaling=True, adam_steps=10000,
-        prior_inclusion_weight=0.5,
+        prior_inclusion_weight=PRIOR_INCLUSION_WEIGHT,
     ),
     "multiscale": dict(
         layer_sizes=[1, 100, 1], activation="tanh",
         prior_std_weight=3.0, prior_std_bias=3.0,
         fan_in_scaling=True, adam_steps=10000,
-        prior_inclusion_weight=0.5,
+        prior_inclusion_weight=PRIOR_INCLUSION_WEIGHT,
     ),
 }
 
@@ -393,6 +394,89 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarra
         flat.append(b)
     return np.concatenate(flat, axis=1).astype(np.float64), elapsed, gradient_evals
 
+SVI_STEPS   = 30_000
+SVI_LR      = 1e-2
+SVI_DRAWS   = NUTS_DRAWS * NUTS_CHAINS  # match NUTS's total posterior-draw count
+SVI_RANK    = 20  # low-rank covariance factor count; D~150-300 here, so this is a strong compression
+
+
+def run_svi(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarray, float, int]:
+    """
+    SVI on the same `bnn` model as run_nuts, using AutoLowRankMultivariateNormal
+    (mean + diagonal + low-rank factor covariance) as the guide -- unlike a
+    mean-field guide, this lets the approximate posterior capture weight-weight
+    correlation, closer in spirit to the Boomerang samplers' Gaussian reference
+    measure (x_ref/Sigma_inv) than a diagonal guide would be, at O(D*rank) cost
+    instead of full AutoMultivariateNormal's O(D^2).
+
+    Uses Trace_ELBO, not TraceMeanField_ELBO: internally this guide reparameterizes
+    per-site samples as Delta distributions hung off one joint "_auto_latent"
+    LowRankMultivariateNormal site, so TraceMeanField_ELBO's analytic-KL fast path
+    (which needs a registered analytic KL(guide_site, model_site) per site, e.g.
+    Normal-vs-Normal) never applies here -- it silently falls back to the same
+    single-sample surrogate Trace_ELBO already computes, just with extra
+    bookkeeping overhead for no variance-reduction benefit.
+    """
+    import jax
+    import jax.numpy as jnp
+    import numpyro
+    import numpyro.distributions as dist
+    from numpyro.infer import SVI, Trace_ELBO
+    from numpyro.infer.autoguide import AutoLowRankMultivariateNormal
+    from numpyro.optim import Adam
+
+    layer_sizes, activation = cfg.layer_sizes, cfg.activation
+    prior_std, prior_std_bias = cfg.prior_std_weight, cfg.prior_std_bias
+
+    X = jnp.asarray(data["X_train"].cpu().numpy())
+    y = jnp.asarray(data["y_train"].cpu().numpy())
+
+    def bnn(X, y=None):
+        h = X
+        for i, (n_in, n_out) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+            scale = prior_std / jnp.sqrt(n_in if cfg.fan_in_scaling else 1)
+            W = numpyro.sample(
+                f"W{i}", dist.Normal(jnp.zeros((n_out, n_in)), scale).to_event(2),
+            )
+            b = numpyro.sample(
+                f"b{i}", dist.Normal(jnp.zeros(n_out), prior_std_bias).to_event(1),
+            )
+            h = h @ W.T + b
+            if i < len(layer_sizes) - 2:
+                if activation == "tanh":
+                    h = jnp.tanh(h)
+                elif activation == "relu":
+                    h = jnp.maximum(0.0, h)
+                else:
+                    raise ValueError(f"Unsupported activation: {activation}")
+        with numpyro.plate("data", X.shape[0]):
+            numpyro.sample("y", dist.Normal(h.squeeze(-1), cfg.noise_std), obs=y)
+
+    guide = AutoLowRankMultivariateNormal(bnn, rank=SVI_RANK)
+    svi = SVI(bnn, guide, Adam(SVI_LR), Trace_ELBO())
+
+    rng_key, sample_key = jax.random.split(jax.random.PRNGKey(seed))
+
+    t0 = time.perf_counter()
+    svi_result = svi.run(rng_key, SVI_STEPS, X=X, y=y, progress_bar=True)
+    elapsed = time.perf_counter() - t0
+
+    # One gradient evaluation per optimization step -- the SVI analogue
+    # of NUTS's leapfrog-step count, same currency as the PDMP samplers'
+    # gradient_evals (see grid_boomerang.py).
+    gradient_evals = SVI_STEPS
+
+    posterior = guide.sample_posterior(
+        sample_key, svi_result.params, sample_shape=(SVI_DRAWS,),
+    )
+    flat = []
+    for i in range(len(layer_sizes) - 1):
+        W = np.asarray(posterior[f"W{i}"])  # [n, n_out, n_in]
+        b = np.asarray(posterior[f"b{i}"])  # [n, n_out]
+        flat.append(W.reshape(W.shape[0], -1))
+        flat.append(b)
+    return np.concatenate(flat, axis=1).astype(np.float64), elapsed, gradient_evals
+
 
 # ===========================================================================
 # Persistence -- same payload schema as toy_bnn.py's save_run, so results
@@ -448,6 +532,7 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
 
     bm, x_ref, _ = build_target(data, cfg)
     print(f"  D = {bm.D}")
+    
 
     sampler = build_zigzag_sampler(bm)
 
@@ -483,6 +568,7 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
 
     bm, x_ref, _ = build_target(data, cfg)
     print(f"  D = {bm.D}")
+    print(f"  Sticky inclusion prob = {PRIOR_INCLUSION_WEIGHT}")
 
     sampler = build_sticky_zigzag_sampler(bm, cfg)
 
@@ -523,6 +609,7 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
 
     bm, x_ref, Sigma_inv = build_target(data, cfg)
     print(f"  D = {bm.D}")
+    print(f"  Sticky inclusion prob = {PRIOR_INCLUSION_WEIGHT}")
 
     sampler = build_boomerang_sampler(bm, x_ref, Sigma_inv)
 
@@ -607,12 +694,33 @@ def run_nuts_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
     print(f"      saved {samples.shape[0]} samples -> {out_path}")
 
 
+def run_svi_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
+                     cfg: BNNConfig, sd: Path) -> None:
+    seed = BASE_SEED + split_id
+
+    samples_np, elapsed, gradient_evals = run_svi(data, cfg, seed)
+    samples = torch.tensor(samples_np)
+
+    print(f"      sampled {samples.shape[0]} SVI draws in {elapsed:.1f}s "
+          f"({gradient_evals} gradient evals)")
+
+    out_path = sd / "svi.pt"
+    save_run(
+        out_path, dataset=dataset_name, split_id=split_id, sampler="svi",
+        samples=samples, x_ref=None, cfg=cfg, y_std=data["y_std"],
+        elapsed_sec=elapsed, n_events=samples.shape[0], bound_violations=0,
+        gradient_evals=gradient_evals,
+    )
+    print(f"      saved {samples.shape[0]} samples -> {out_path}")
+
+
 SAMPLER_RUNNERS = {
     "grid_zigzag": run_grid_zigzag,
     "grid_sticky_zigzag": run_grid_sticky_zigzag,
     "grid_boomerang": run_grid_boomerang,
     "grid_sticky_boomerang": run_grid_sticky_boomerang,
     "nuts": run_nuts_dataset,
+    "svi": run_svi_dataset,
 }
 
 
