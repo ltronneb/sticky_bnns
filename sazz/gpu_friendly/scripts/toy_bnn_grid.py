@@ -89,32 +89,21 @@ N_RESAMPLE  = 10_000
 BURNIN_FRAC = 0.2
 BASE_SEED   = 42
 
-SIGMA_INV_SCALE = 1.0 #10.0
+SIGMA_INV_SCALE = 0.1 #1.0 10.0
 REFRESH_RATE = 1.0
 GAMMA = 0.01
 
 GRID_N_SEGMENTS = 60
-GRID_T_MAX_INIT_BOOM = math.pi / 4
-# ZigZag's rate has no periodic structure to anchor grid_t_max_init to
-# (unlike Boomerang's pi/4). Empirically (checked directly against a real
-# BNN target, D~300 on the toy datasets here), the D*gamma floor plus the
-# target's curvature drive the Algorithm-4 equilibrium horizon down to
-# roughly 1e-3 scale at this D -- starting from 1.0 (the CPU ZigZag
-# sampler's own default, with no BNN-scale meaning) wastes the first
-# several hundred skeleton points collapsing ~3 orders of magnitude before
-# settling, and pins n_segments at its floor of 2 for that entire stretch.
-# 0.002/0.0002 keeps n_segments in the 7-12 range from the start across the
-# toy datasets tried (D~150-300) -- still target-dependent (see
-# grid_zigzag.py's own docstring), retune here if D changes substantially.
 GRID_T_MAX_INIT_ZIGZAG = 0.002
 GRID_ALPHA_PLUS = 1.01
 GRID_ALPHA_MINUS = 1.04
 GRID_SPACING_ZIGZAG = 0.0002
-GRID_SPACING_BOOM = math.pi / 16
-GRID_STICKY_BOOM_SPACING = math.pi / 16
+GRID_T_MAX_INIT_BOOM = 2e-2
+GRID_SPACING_BOOM = 3e-3
+GRID_STICKY_BOOM_SPACING = GRID_SPACING_BOOM
 GRID_STICKY_ZIGZAG_SPACING = GRID_SPACING_ZIGZAG
 
-GRID_STICKY_COLD_START_THRESHOLD = None  # set to a float to freeze near-zero coords at init
+GRID_STICKY_COLD_START_THRESHOLD = None 
 
 N_SAVE = 8_000  # matches the existing results/toy_bnns/*/split_00/*.pt files
 
@@ -166,7 +155,7 @@ class BNNConfig:
     prior_std_bias: float = 3.0
     fan_in_scaling: bool = True
     adam_steps: int = 10000
-    prior_inclusion_weight: float = 0.5  # sticky-only: spike-and-slab inclusion prob for kappa
+    prior_inclusion_weight: float = PRIOR_INCLUSION_WEIGHT
 
 
 # ===========================================================================
