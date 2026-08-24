@@ -318,6 +318,10 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
         positions[0, idx] = 0.0
         velocities[0, idx] = 0.0
 
+        # Absolute deadline with no "+ current_time" term -- correct only
+        # because cold start always runs at t=0. Contrast with the general
+        # case in _refresh_velocity_sticky, which redraws deadlines as
+        # current_time + Exp(...) since it can fire at any t.
         deadlines = torch.distributions.Exponential(rate[idx]).sample()
         self.thaw_deadline[idx] = deadlines
 
@@ -351,9 +355,29 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
         return v_new
 
     @torch.no_grad()
-    def _refresh_velocity_sticky(self) -> Tensor:
+    def _refresh_velocity_sticky(self, current_time: float) -> Tensor:
+        """
+        Eq. (B.1): active coords get a fresh Z_i ~ N(0,1); frozen coords keep
+        their sign and get a fresh |Z_i| magnitude (sign(v_i)|Z_i|), so a
+        refreshment event can never flip a frozen coordinate's direction of
+        travel. The magnitude change also changes the frozen coordinate's
+        thaw rate kappa_i*|v_i|, so thaw_deadline must be redrawn from
+        current_time at the new rate -- leaving it at the old rate would
+        decouple the sojourn (drawn at the old |v|) from the subsequent
+        excursion (at the new |v|), biasing mu({0}) (see plan doc). Frozen
+        coordinates with kappa_i*|v_new| underflowing 1e-14 go back to inf,
+        mirroring _freeze's own threshold.
+        """
+        if self.Sigma.ndim != 1 and torch.any(self.frozen_mask):
+            raise NotImplementedError(
+                "Sticky refresh with a full (non-diagonal) Sigma has no well-defined "
+                "per-coordinate marginal std to plug into the sign(v_i)|Z_i| rule -- "
+                "only diagonal Sigma is supported once coordinates can freeze."
+            )
+
         v = torch.zeros(self.D, dtype=self.dtype, device=self.device)
         active = ~self.frozen_mask
+        frozen = self.frozen_mask
 
         if torch.any(active):
             if self.Sigma.ndim == 1:
@@ -366,6 +390,30 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
                 chol_a = torch.linalg.cholesky(Sigma_a + jitter)
                 z = torch.randn(n_active, dtype=self.dtype, device=self.device)
                 v[active] = chol_a @ z
+
+        if torch.any(frozen):
+            n_frozen = int(frozen.sum())
+            z = torch.randn(n_frozen, dtype=self.dtype, device=self.device)
+            mag = self.Sigma_sqrt[frozen] * z.abs()
+
+            old_v = self.frozen_velocity[frozen]
+            sign = torch.sign(old_v)
+            zero_sign = sign == 0
+            if torch.any(zero_sign):
+                rand_sign = torch.randint(0, 2, (int(zero_sign.sum()),), device=self.device).to(self.dtype) * 2 - 1
+                sign = torch.where(zero_sign, rand_sign, sign)
+
+            new_v = sign * mag
+            self.frozen_velocity[frozen] = new_v
+
+            rate = self.kappa[frozen] * new_v.abs()
+            underflow = rate <= 1e-14
+            deadlines = torch.where(
+                underflow,
+                torch.full_like(rate, float("inf")),
+                current_time + torch.distributions.Exponential(rate.clamp_min(1e-14)).sample(),
+            )
+            self.thaw_deadline[frozen] = deadlines
 
         return v
 
@@ -792,7 +840,8 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
                     with torch.no_grad():
                         self._time_scalar.fill_(time_passed)
                         pos_ref, _ = self.trajectory_sticky(self._time_scalar, x_prev_refresh, v_prev_refresh)
-                    vel_ref = self._refresh_velocity_sticky()
+                    assert abs(current_time - float(t_prev_refresh) - time_passed) < 1e-9
+                    vel_ref = self._refresh_velocity_sticky(current_time)
 
                     write_row(pos_ref, vel_ref, t_prev_refresh + time_passed)
 

@@ -56,7 +56,7 @@ SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_st
 
 def save_skeleton(out_path: Path, *, dataset: str, split_id: int, sampler: str,
                    result: dict, cfg: BNNConfig, y_std: float, elapsed_sec: float,
-                   n_skeleton: int, n_save: int) -> None:
+                   n_skeleton: int, n_save: int, x_ref=None, Sigma_inv=None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tail = slice(-n_save, None)
 
@@ -95,6 +95,21 @@ def save_skeleton(out_path: Path, *, dataset: str, split_id: int, sampler: str,
         "gradient_evals":    result["gradient_evals"],
         "grid_t_max_log":    t_max_tail,
     }
+    # x_ref/Sigma_inv -- the exact reference-measure params this sampler ran
+    # with (shared across all samplers in a split, see run_split's single
+    # build_target call). Boomerang-family only (ZigZag has no reference
+    # measure). Needed to recompute the conserved Hamiltonian
+    # H(x,v) = U(x) + 0.5|v|^2_{Sigma^-1} downstream (e.g. continuous-time
+    # ESS via batch means, Bierkens et al. Appendix) without refitting the
+    # MAP estimate -- build_target's Adam refit is not bit-exact
+    # reproducible run-to-run, so recomputing x_ref from scratch produces a
+    # slightly different reference point whose small errors get amplified
+    # by reflect_velocity's sensitivity to gradient direction, silently
+    # breaking H-conservation in any downstream reconstruction.
+    if x_ref is not None:
+        payload["x_ref"] = x_ref.detach().cpu()
+    if Sigma_inv is not None:
+        payload["Sigma_inv"] = Sigma_inv.detach().cpu()
     if "frozen_mask_final" in result:
         payload["frozen_mask_final"] = result["frozen_mask_final"].cpu()
     torch.save(payload, out_path)
@@ -163,6 +178,7 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_boomerang",
         result=result, cfg=cfg, y_std=data["y_std"], elapsed_sec=elapsed,
         n_skeleton=N_SKELETON, n_save=N_SKELETON_SAVE,
+        x_ref=x_ref, Sigma_inv=Sigma_inv,
     )
     print(f"      saved last {min(N_SKELETON_SAVE, N_SKELETON)} skeleton events -> {out_path}")
 
@@ -185,6 +201,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_sticky_boomerang",
         result=result, cfg=cfg, y_std=data["y_std"], elapsed_sec=elapsed,
         n_skeleton=N_SKELETON, n_save=N_SKELETON_SAVE,
+        x_ref=x_ref, Sigma_inv=Sigma_inv,
     )
     print(f"      saved last {min(N_SKELETON_SAVE, N_SKELETON)} skeleton events -> {out_path}")
 

@@ -45,6 +45,21 @@ import torch
 from torch import Tensor
 
 
+def _burnin_cut(positions: Tensor, velocities: Tensor, times: Tensor,
+                 burnin_frac: float) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Burn in by ELAPSED TIME, not skeleton-row count: skeleton density isn't
+    uniform in time (e.g. sticky freeze/thaw churn is denser early in a run
+    as sparsity climbs from 0), so cutting the first `burnin_frac * N` ROWS
+    discards a different (often smaller) fraction of simulated time than
+    burnin_frac names -- silently biasing resampled draws toward the early,
+    less-equilibrated part of the trajectory.
+    """
+    t_cut = times[0] + burnin_frac * (times[-1] - times[0])
+    n_burn = int(torch.searchsorted(times, t_cut).clamp(max=times.shape[0] - 2))
+    return positions[n_burn:], velocities[n_burn:], times[n_burn:]
+
+
 def resample_boomerang_path_torch(
     positions: Tensor, velocities: Tensor, times: Tensor, x_ref: Tensor,
     N_resample: int, burnin_frac: float = 0.1,
@@ -59,11 +74,7 @@ def resample_boomerang_path_torch(
     """
     device = positions.device
     dtype = positions.dtype
-    N = positions.shape[0]
-    n_burn = int(burnin_frac * N)
-    pos = positions[n_burn:]
-    vel = velocities[n_burn:]
-    tim = times[n_burn:]
+    pos, vel, tim = _burnin_cut(positions, velocities, times, burnin_frac)
 
     T_start = tim[0]
     T_end = tim[-1]
@@ -100,11 +111,7 @@ def resample_boomerang_path_sticky_torch(
     """
     device = positions.device
     dtype = positions.dtype
-    N = positions.shape[0]
-    n_burn = int(burnin_frac * N)
-    pos = positions[n_burn:]
-    vel = velocities[n_burn:]
-    tim = times[n_burn:]
+    pos, vel, tim = _burnin_cut(positions, velocities, times, burnin_frac)
 
     T_start = tim[0]
     T_end = tim[-1]
@@ -145,19 +152,11 @@ def resample_zigzag_path_torch(
     Mirrors sazz.utils.sampling.resample_zigzag_path exactly, batched
     (same searchsorted pattern resample_boomerang_path_torch already uses).
 
-    Note: burnin_frac cuts by SKELETON INDEX, while resampling itself is
-    uniform in TIME -- since skeleton points are not evenly spaced in time,
-    the actual discarded time duration is not exactly burnin_frac of the
-    total simulated clock (same caveat implicitly true of the existing
-    Boomerang resamplers above).
+    burnin_frac cuts by ELAPSED TIME (see _burnin_cut), not skeleton index.
     """
     device = positions.device
     dtype = positions.dtype
-    N = positions.shape[0]
-    n_burn = int(burnin_frac * N)
-    pos = positions[n_burn:]
-    vel = velocities[n_burn:]
-    tim = times[n_burn:]
+    pos, vel, tim = _burnin_cut(positions, velocities, times, burnin_frac)
 
     T_start = tim[0]
     T_end = tim[-1]
@@ -202,11 +201,7 @@ def resample_zigzag_path_sticky_torch(
     """
     device = positions.device
     dtype = positions.dtype
-    N = positions.shape[0]
-    n_burn = int(burnin_frac * N)
-    pos = positions[n_burn:]
-    vel = velocities[n_burn:]
-    tim = times[n_burn:]
+    pos, vel, tim = _burnin_cut(positions, velocities, times, burnin_frac)
 
     T_start = tim[0]
     T_end = tim[-1]

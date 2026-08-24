@@ -1,22 +1,10 @@
 """
-Grid-bound Boomerang (Andral & Kamatani 2024) on UCI regression BNN
-benchmarks -- mirrors sazz/scripts/bnns/uci_bnn.py's data/config/CLI shape,
-but built on this tree's device-threaded BayesianModule/find_reference_bnn/
-GridBoomerangSampler/GridStickyBoomerangSampler instead of ParamSpec/
-BayesianModel/AutomaticBoomerangSampler. Boston is the primary target
-(fast, small, always available via sklearn); naval/energy also supported
-if their local data files are present. Activation is tanh by default
-(smoother rate function for the grid bound than relu's kinks).
+Grid-bound Boomerang (Andral & Kamatani 2024) on UCI regression BNN benchmarks 
+Activation is tanh by default, as this is smooth
+.
 
 Six samplers: "grid_zigzag", "grid_sticky_zigzag", "grid_boomerang",
-"grid_sticky_boomerang", "nuts", "nuts_horseshoe" (horseshoe prior on
-weights via NumPyro).
-
-Isolated from sazz/scripts/bnns/uci_bnn.py's model/sampler/warmup imports;
-data loading (sklearn/pandas) is independent, not shared code. Model/
-likelihood/prior wiring, the reference-measure finder, and the grid
-samplers are gpu_friendly-tree-native (see toy_bnn_grid.py, which this
-mirrors closely).
+"grid_sticky_boomerang", "nuts", "nuts_horseshoe"
 
 Usage:
     python -m sazz.gpu_friendly.scripts.uci_bnn_grid
@@ -61,10 +49,6 @@ from sazz.gpu_friendly.samplers.grid_sticky_boomerang import GridStickyBoomerang
 # ===========================================================================
 # Config
 # ===========================================================================
-
-# See toy_bnn_grid.py for the full explanation of this device/dtype logic,
-# including the documented MPS jvp(grad(...)) blocker (model construction
-# and warmup work fine on MPS; the sampler's rate closure currently does not).
 DEVICE = (
     "cuda" if torch.cuda.is_available()
     #else "mps" if torch.backends.mps.is_available()
@@ -73,12 +57,7 @@ DEVICE = (
 DTYPE = torch.float32 if DEVICE == "cuda" else torch.float64
 torch.set_default_dtype(torch.float32)
 
-# Module-level defaults -- overridden per-invocation via --n-skeleton/
-# --n-resample (see main()'s `global` reassignment), same convention as
-# fast_mnist_cnn.py's N_SKELETON/N_RESAMPLE/N_SAVE CLI overrides. Runner
-# functions (run_grid_zigzag etc.) read N_SKELETON as a module global, not
-# a parameter -- reassigning it in main() before any runner is called is
-# what makes the override take effect.
+
 N_SKELETON  = 100_000
 N_RESAMPLE  = 50_000
 BURNIN_FRAC = 0.2
@@ -89,24 +68,16 @@ REFRESH_RATE = 1.0
 GAMMA = 0.01
 
 GRID_N_SEGMENTS = 60
-GRID_T_MAX_INIT_BOOM = math.pi / 4
-# ZigZag's rate has no periodic structure to anchor grid_t_max_init to
-# (unlike Boomerang's pi/4). Checked directly against real UCI BNN targets
-# (D~750 on boston): the D*gamma floor plus target curvature drive the
-# Algorithm-4 equilibrium horizon down to roughly 1e-3 scale -- starting
-# from 1.0 (the CPU ZigZag sampler's own default, no BNN-scale meaning)
-# wastes the first several hundred skeleton points collapsing ~3 orders of
-# magnitude before settling, pinning n_segments at its floor of 2 the whole
-# time. 0.002/0.0002 keeps n_segments around 7-10 from the start (checked
-# on both toy-scale D~300 and UCI-scale D~750) -- still target-dependent
-# (see grid_zigzag.py's own docstring), retune here if D changes substantially.
-GRID_T_MAX_INIT_ZIGZAG = 0.002
 GRID_ALPHA_PLUS = 1.01
 GRID_ALPHA_MINUS = 1.04
 
+GRID_T_MAX_INIT_ZIGZAG = 0.002
 GRID_SPACING_ZIGZAG = 0.0002
-GRID_SPACING_BOOM = math.pi / 16
-GRID_STICKY_BOOM_SPACING = math.pi / 16
+
+GRID_T_MAX_INIT_BOOM = 2e-2
+GRID_SPACING_BOOM = 3e-3 #math.pi / 128
+
+GRID_STICKY_BOOM_SPACING = GRID_SPACING_BOOM
 GRID_STICKY_ZIGZAG_SPACING = GRID_SPACING_ZIGZAG
 
 
@@ -117,13 +88,12 @@ NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
 N_SAVE      = NUTS_DRAWS * NUTS_CHAINS
 
-# Three architecture variants for a size-sensitivity comparison across the
-# UCI tables -- "small" matches Izmailov et al.'s 1x50 shape (and is what
-# HIDDEN used to be unconditionally), "deep_narrow" keeps that width but
-# adds depth, "deep_wide" mirrors Goan et al.'s 3-hidden-layer shape
-# (512-256-128) scaled down by half for tractability. Selected via
-# --hidden-variant; see configs_for/split_dir for how this threads into
-# per-config output paths.
+# Three architecture variants for a size-sensitivity comparison across the UCI tables 
+# -- "small" matches Izmailov et al.'s 1x50 shape 
+# "deep_narrow" keeps that width but adds depth, 
+# "deep_wide" mirrors Goan et al.'s 3-hidden-layer shape
+# (512-256-128) scaled down by half for tractability. 
+# Selected via --hidden-variant; 
 HIDDEN_VARIANTS = {
     "small":       [50],
     "deep_narrow": [50, 50, 50],
