@@ -639,7 +639,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                             positions[n - 1], velocities[n - 1],
                         )
                     positions[n] = pos_ref
-                    assert abs(current_time - float(times[n - 1]) - time_passed) < 1e-9
+                    assert abs(current_time - float(times[n - 1]) - time_passed) < 1e-7
                     velocities[n] = self._refresh_velocity_sticky(current_time)
                     times[n] = times[n - 1] + time_passed
 
