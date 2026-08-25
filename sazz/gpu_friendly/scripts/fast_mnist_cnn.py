@@ -279,28 +279,51 @@ def build_target(data: dict[str, Any], cfg: CNNConfig, dtype=DTYPE, device=DEVIC
 
 def build_minibatch_grad_target(bm: BayesianModule, batch_size: int):
     """
-    grad_target(x) closure that evaluates the energy on a FRESH random
-    minibatch of size batch_size drawn from bm.X/bm.y on every call, in
-    place of the full N_train dataset -- a raw subsampled-gradient PDMP
-    with no exactness correction (no control variates, no subsampling
-    bound tightening). log_likelihood.single(beta, X_i, y_i) sums log-probs
-    over whatever batch it's given, so the minibatch term is rescaled by
-    N_full/batch_size to keep the energy's overall scale comparable to the
-    full-batch target this script's GAMMA/grid spacing/etc. were tuned
-    against. Batch is redrawn independently on every call (no fixed epoch
-    order), matching plain SGD-style minibatching.
+    Returns (grad_target, resample_fn).
+
+    grad_target(x) evaluates the energy against whatever minibatch is
+    CURRENTLY cached (X_batch/y_batch below), NOT a fresh random draw on
+    every call -- it must stay a fixed function of x for the duration of
+    one sampler _grid_bound episode (the grid-thinning bound is only valid
+    if every rate evaluation within that episode, eager and vmapped alike,
+    sees the same rate function; see FastGridStickyZigZagSampler's
+    resample_grad_batch docstring). Also, torch.randint cannot run inside
+    the sampler's torch.func.vmap call at all ("called random operation
+    while in randomness error mode"), so the draw can never happen inside
+    grad_target's own body regardless.
+
+    resample_fn() -- a plain, non-batched, non-vmapped call -- draws a new
+    minibatch and overwrites the cache in place. Passed as
+    resample_grad_batch= to the sampler constructor, which calls it once
+    per sample() loop iteration, immediately before _grid_bound: exactly
+    the right cadence (one fresh minibatch per Poisson-thinning proposal).
+
+    Likelihood term rescaled by N_full/batch_size (log_likelihood.single
+    sums log-probs over whatever batch it's given) to keep the energy's
+    overall scale comparable to the full-batch target this script's GAMMA/
+    grid spacing/etc. were tuned against. This is a raw subsampled-gradient
+    PDMP with no exactness correction (no control variates, no subsampling
+    bound tightening) -- traded for throughput, not statistically exact.
     """
     N_full = bm.X.shape[0]
     scale = N_full / batch_size
     log_prior_fn = make_gaussian_prior(bm.prior_precision)
 
+    idx0 = torch.randint(0, N_full, (batch_size,), device=bm.device)
+    cache = {"X": bm.X[idx0], "y": bm.y[idx0]}
+
     def energy_minibatch(beta: Tensor) -> Tensor:
-        idx = torch.randint(0, N_full, (batch_size,), device=bm.device)
-        X_batch, y_batch = bm.X[idx], bm.y[idx]
-        log_lik_batch = bm.log_likelihood.single(beta, X_batch, y_batch) * scale
+        log_lik_batch = bm.log_likelihood.single(beta, cache["X"], cache["y"]) * scale
         return -(log_prior_fn(beta) + log_lik_batch)
 
-    return torch.func.grad(energy_minibatch)
+    grad_target = torch.func.grad(energy_minibatch)
+
+    def resample_fn() -> None:
+        idx = torch.randint(0, N_full, (batch_size,), device=bm.device)
+        cache["X"] = bm.X[idx]
+        cache["y"] = bm.y[idx]
+
+    return grad_target, resample_fn
 
 
 def _build_sticky_kappa_can_freeze(bm: BayesianModule, cfg: CNNConfig):
@@ -321,10 +344,10 @@ def _build_sticky_kappa_can_freeze(bm: BayesianModule, cfg: CNNConfig):
 
 def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: CNNConfig, cold_start_mask: Tensor):
     kappa, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
-    grad_target = (
-        build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
-        if GRAD_BATCH_SIZE is not None else torch.func.grad(bm.energy)
-    )
+    if GRAD_BATCH_SIZE is not None:
+        grad_target, resample_grad_batch = build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
+    else:
+        grad_target, resample_grad_batch = torch.func.grad(bm.energy), None
     return FastGridStickyZigZagSampler(
         grad_target=grad_target,
         D=bm.D,
@@ -341,16 +364,17 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: CNNConfig, cold_start_m
         chunk_size=GRID_CHUNK_SIZE,
         dtype=DTYPE,
         device=bm.device,
+        resample_grad_batch=resample_grad_batch,
     )
 
 
 def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: CNNConfig,
                                     x_ref: Tensor, Sigma_inv: Tensor, cold_start_mask: Tensor):
     kappa, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
-    grad_target = (
-        build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
-        if GRAD_BATCH_SIZE is not None else torch.func.grad(bm.energy)
-    )
+    if GRAD_BATCH_SIZE is not None:
+        grad_target, resample_grad_batch = build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
+    else:
+        grad_target, resample_grad_batch = torch.func.grad(bm.energy), None
     sampler = FastGridStickyBoomerangSampler(
         grad_target=grad_target,
         D=bm.D,
@@ -367,6 +391,7 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: CNNConfig,
         chunk_size=GRID_CHUNK_SIZE,
         dtype=DTYPE,
         device=bm.device,
+        resample_grad_batch=resample_grad_batch,
     )
     sampler.preprocess(x_ref=x_ref, Sigma_inv=Sigma_inv)
     return sampler

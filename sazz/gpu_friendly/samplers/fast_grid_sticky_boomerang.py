@@ -56,7 +56,7 @@ import math
 import os
 import time as _time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -110,6 +110,7 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
         grid_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
+        resample_grad_batch: Optional[Callable[[], None]] = None,
     ):
         super().__init__(
             grad_target=grad_target,
@@ -126,6 +127,15 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
             dtype=dtype,
             device=device,
         )
+
+        # See FastGridStickyZigZagSampler's identical hook for the full
+        # rationale -- called once per sample() loop iteration (immediately
+        # before _grid_bound), NOT on every grad_target(x) call, since
+        # grad_target must stay a fixed function of x for the whole
+        # _grid_bound episode (eager + vmapped/jvp'd rate evaluations
+        # within one episode all bound the same rate function). None
+        # (default): no-op, exactly today's behavior.
+        self._resample_grad_batch = resample_grad_batch
 
         if isinstance(kappa, (int, float)):
             self.kappa = torch.full((D,), float(kappa), dtype=dtype, device=self.device)
@@ -688,6 +698,9 @@ class FastGridStickyBoomerangSampler(GridBoomerangSampler):
 
             dt_hit, i_hit = self._next_hitting_event(pos, vel)
             dt_thaw, i_thaw = self._next_thaw_event(current_time)
+
+            if self._resample_grad_batch is not None:
+                self._resample_grad_batch()
 
             # Bound-time vs loop-time split, gating whether the sync
             # reduction in fast_grid_bound.py is a meaningful fraction of

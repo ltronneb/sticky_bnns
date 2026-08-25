@@ -61,7 +61,7 @@ import os
 import time as _time
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -121,6 +121,7 @@ class FastGridStickyZigZagSampler(GridZigZagSampler):
         grid_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
+        resample_grad_batch: Optional[Callable[[], None]] = None,
     ):
         super().__init__(
             grad_target=grad_target,
@@ -138,6 +139,18 @@ class FastGridStickyZigZagSampler(GridZigZagSampler):
             dtype=dtype,
             device=device,
         )
+
+        # Optional zero-arg hook, called once per sample() loop iteration
+        # (immediately before _grid_bound) -- lets a caller using a
+        # subsampled-gradient grad_target pick a fresh minibatch exactly
+        # once per Poisson-thinning proposal. grad_target itself must stay
+        # a fixed function of x for the ENTIRE _grid_bound call: it's
+        # evaluated both eagerly (_rate_scalar_sticky) and inside
+        # torch.func.vmap/jvp over a batch of candidate grid times
+        # (_make_rate_and_grad_fn_sticky), and the grid-thinning bound is
+        # only valid if every one of those evaluations sees the same rate
+        # function. None (default): no-op, exactly today's behavior.
+        self._resample_grad_batch = resample_grad_batch
 
         if isinstance(kappa, (int, float)):
             self.kappa = torch.full((D,), float(kappa), dtype=dtype, device=self.device)
@@ -697,6 +710,9 @@ class FastGridStickyZigZagSampler(GridZigZagSampler):
 
             n_frozen = int(self.frozen_mask.sum())
             n_active = self.D - n_frozen
+
+            if self._resample_grad_batch is not None:
+                self._resample_grad_batch()
 
             # Bound-time vs loop-time split, gating whether the sync
             # reduction in fast_grid_bound.py is a meaningful fraction of
