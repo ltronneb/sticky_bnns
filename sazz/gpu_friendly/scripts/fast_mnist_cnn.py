@@ -36,6 +36,7 @@ from sazz.gpu_friendly.models.neural_networks import CNN, LeNet5
 from sazz.gpu_friendly.models.model import BayesianModule
 from sazz.gpu_friendly.models.priors import (
     build_fan_in_prior_precision, build_kappa_from_inclusion, build_can_freeze_mask,
+    make_gaussian_prior,
 )
 from sazz.gpu_friendly.utils.warmup import find_reference_bnn
 from sazz.gpu_friendly.utils.resample import (
@@ -91,6 +92,8 @@ GRID_ALPHA_VIOLATION = 1.1
 # disables chunking entirely (sample()'s original full-[N,D] behavior).
 SKELETON_CHUNK_SIZE: Optional[int] = None
 SKELETON_CHUNK_DIR: Optional[Path] = None
+
+GRAD_BATCH_SIZE: Optional[int] = None
 
 DATA_DIR = Path("datasets")
 OUT_DIR = Path("results/grid/mnist_cnn")
@@ -274,6 +277,32 @@ def build_target(data: dict[str, Any], cfg: CNNConfig, dtype=DTYPE, device=DEVIC
 # Samplers
 # ===========================================================================
 
+def build_minibatch_grad_target(bm: BayesianModule, batch_size: int):
+    """
+    grad_target(x) closure that evaluates the energy on a FRESH random
+    minibatch of size batch_size drawn from bm.X/bm.y on every call, in
+    place of the full N_train dataset -- a raw subsampled-gradient PDMP
+    with no exactness correction (no control variates, no subsampling
+    bound tightening). log_likelihood.single(beta, X_i, y_i) sums log-probs
+    over whatever batch it's given, so the minibatch term is rescaled by
+    N_full/batch_size to keep the energy's overall scale comparable to the
+    full-batch target this script's GAMMA/grid spacing/etc. were tuned
+    against. Batch is redrawn independently on every call (no fixed epoch
+    order), matching plain SGD-style minibatching.
+    """
+    N_full = bm.X.shape[0]
+    scale = N_full / batch_size
+    log_prior_fn = make_gaussian_prior(bm.prior_precision)
+
+    def energy_minibatch(beta: Tensor) -> Tensor:
+        idx = torch.randint(0, N_full, (batch_size,), device=bm.device)
+        X_batch, y_batch = bm.X[idx], bm.y[idx]
+        log_lik_batch = bm.log_likelihood.single(beta, X_batch, y_batch) * scale
+        return -(log_prior_fn(beta) + log_lik_batch)
+
+    return torch.func.grad(energy_minibatch)
+
+
 def _build_sticky_kappa_can_freeze(bm: BayesianModule, cfg: CNNConfig):
     kappa_net = build_kappa_from_inclusion(
         bm.module, cfg.prior_std_weight, cfg.prior_inclusion_weight,
@@ -292,8 +321,12 @@ def _build_sticky_kappa_can_freeze(bm: BayesianModule, cfg: CNNConfig):
 
 def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: CNNConfig, cold_start_mask: Tensor):
     kappa, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
+    grad_target = (
+        build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
+        if GRAD_BATCH_SIZE is not None else torch.func.grad(bm.energy)
+    )
     return FastGridStickyZigZagSampler(
-        grad_target=torch.func.grad(bm.energy),
+        grad_target=grad_target,
         D=bm.D,
         kappa=kappa,
         can_freeze=can_freeze,
@@ -314,8 +347,12 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: CNNConfig, cold_start_m
 def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: CNNConfig,
                                     x_ref: Tensor, Sigma_inv: Tensor, cold_start_mask: Tensor):
     kappa, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
+    grad_target = (
+        build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
+        if GRAD_BATCH_SIZE is not None else torch.func.grad(bm.energy)
+    )
     sampler = FastGridStickyBoomerangSampler(
-        grad_target=torch.func.grad(bm.energy),
+        grad_target=grad_target,
         D=bm.D,
         kappa=kappa,
         can_freeze=can_freeze,
@@ -724,7 +761,7 @@ def run_dataset(split_id: int, data: dict[str, Any], cfg: CNNConfig, out_dir: Pa
 # ===========================================================================
 
 def main():
-    global N_SKELETON, N_RESAMPLE, N_SAVE, SKELETON_CHUNK_SIZE, SKELETON_CHUNK_DIR
+    global N_SKELETON, N_RESAMPLE, N_SAVE, SKELETON_CHUNK_SIZE, SKELETON_CHUNK_DIR, GRAD_BATCH_SIZE
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -761,6 +798,12 @@ def main():
     parser.add_argument("--skeleton-chunk-dir", type=Path, default=None,
                          help="Base directory for chunk files -- required if --skeleton-chunk-size "
                               "is set. Defaults to <out>/chunks if omitted.")
+    parser.add_argument("--grad-batch-size", type=int, default=None,
+                         help="If set, every grad_target(x) call is served from a fresh random "
+                              "minibatch of this size (drawn from bm.X/bm.y, rescaled by "
+                              "N_full/batch_size) instead of the full training set -- a "
+                              "statistically uncorrected subsampled-gradient PDMP, traded for "
+                              "throughput. None (default) preserves exact full-batch behavior.")
     args = parser.parse_args()
 
     N_SKELETON = args.n_skeleton
@@ -768,6 +811,7 @@ def main():
     N_SAVE = args.n_save
     SKELETON_CHUNK_SIZE = args.skeleton_chunk_size
     SKELETON_CHUNK_DIR = args.skeleton_chunk_dir if args.skeleton_chunk_dir is not None else args.out / "chunks"
+    GRAD_BATCH_SIZE = args.grad_batch_size
 
     args.out.mkdir(parents=True, exist_ok=True)
 

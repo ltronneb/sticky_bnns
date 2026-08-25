@@ -111,22 +111,16 @@ SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_st
 class BNNConfig:
     layer_sizes: list[int]
     activation: str = "tanh"
-    # Observation noise is LEARNED (default, per BayesianModule.build) for
-    # every sampler here, PDMP and NUTS alike -- prior_sigma_scale is the
-    # HalfNormal(prior_sigma_scale) prior scale on sigma, not a fixed value.
-    # Naval's target is already tiny-scale (post-standardization) so its
-    # noise prior is tightened accordingly; the rest use a weakly informative
-    # scale of 0.3.
     prior_sigma_scale: float = 0.3
     prior_std_weight: float = 1.0
     prior_std_bias: float = 1.0
     fan_in_scaling: bool = True
     adam_steps: int = 20000
-    prior_inclusion_weight: float = 0.7  # sticky-only: spike-and-slab inclusion prob for kappa
+    prior_inclusion_weight: float = 0.3  # sticky-only: spike-and-slab inclusion prob for kappa
 
 
 def configs_for(input_dims: dict[str, int], hidden: list[int],
-                 prior_inclusion_weight: float = 0.7) -> dict[str, BNNConfig]:
+                 prior_inclusion_weight: float = 0.3) -> dict[str, BNNConfig]:
     cfgs: dict[str, BNNConfig] = {}
     for name in UCI_DATASETS:
         if name in input_dims:
@@ -811,7 +805,7 @@ def main():
     parser.add_argument("--n-resample", type=int, default=N_RESAMPLE,
                          help="Overrides the module-level N_RESAMPLE default -- independent "
                               "of --n-skeleton.")
-    parser.add_argument("--prior-inclusion-weight", type=float, default=0.7,
+    parser.add_argument("--prior-inclusion-weight", type=float, default=0.3,
                          help="Sticky-only spike-and-slab prior inclusion probability (BNNConfig."
                               "prior_inclusion_weight, fed to build_kappa_from_inclusion). Lower "
                               "values shrink kappa (thaw rate), so coordinates that freeze stay "

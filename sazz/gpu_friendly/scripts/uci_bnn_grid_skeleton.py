@@ -274,7 +274,7 @@ def main():
     parser.add_argument("--n-skeleton-save", type=int, default=N_SKELETON_SAVE,
                          help="How many of the *last* skeleton events to save to disk "
                               "(default 20_000).")
-    parser.add_argument("--prior-inclusion-weight", type=float, default=0.7,
+    parser.add_argument("--prior-inclusion-weight", type=float, default=0.3,
                          help="Sticky-only spike-and-slab prior inclusion probability. "
                               "Only affects grid_sticky_zigzag/grid_sticky_boomerang.")
     args = parser.parse_args()
