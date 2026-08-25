@@ -14,6 +14,8 @@ Usage:
     python3 -m sazz.gpu_friendly.scripts.fast_mnist_cnn 
     --map-path results/maps/lenet_reference_N60000_pruned_refit_N10k.pt 
     --n-skeleton 5_000 --n-resample 5_000 --n-save 5_000 --n-train 10_000
+    
+CUDA_VISIBLE_DEVICES=3 python -m sazz.gpu_friendly.scripts.fast_mnist_cnn --map-path results/maps/lenet_reference_N60000_pruned_refit_N60k.pt --skeleton-chunk-size 2000
 """
 
 from __future__ import annotations
@@ -52,17 +54,17 @@ torch.set_default_dtype(torch.float32)
 
 BASE_SEED = 42
 
-N_TRAIN, N_TEST = 60_000, 500
-N_SKELETON = 50
-N_RESAMPLE = 2000
-N_SAVE = 500
+N_TRAIN, N_TEST = 60_000, 1_000
+N_SKELETON = 50_000
+N_RESAMPLE = 5_000
+N_SAVE = 1_000
 
 BURNIN_FRAC = 0.2
 N_ACCURACY_DRAWS = 300      # subsample for softmax-averaging specifically 
 
 PRIOR_STD_W = 2.0
 PRIOR_STD_B = 2.0
-PRIOR_INCLUSION_WEIGHT = 0.1
+PRIOR_INCLUSION_WEIGHT = 0.05
 ACTIVATION = "tanh"
 POOL = "avg"
 
@@ -73,12 +75,12 @@ N_SWEEP = 2000
 GRID_CHUNK_SIZE = 4
 
 GAMMA = 1e-6
-GRID_T_MAX_INIT_ZIGZAG = 0.005
+GRID_T_MAX_INIT_ZIGZAG = 0.001
 GRID_SPACING_ZIGZAG = 1e-5
 
 REFRESH_RATE = 5e2
-GRID_T_MAX_INIT_BOOM = math.pi / 64  
-GRID_SPACING_BOOM = math.pi / 64  
+GRID_T_MAX_INIT_BOOM = 0.01 #math.pi / 64  
+GRID_SPACING_BOOM = 1e-3 #math.pi / 64  
   
 GRID_N_SEGMENTS = 100
 GRID_ALPHA_PLUS = 1.02
