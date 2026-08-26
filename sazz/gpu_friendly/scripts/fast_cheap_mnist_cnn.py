@@ -712,7 +712,15 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
             burnin_frac=(BURNIN_FRAC if stage == 0 else 0.0),
             manifest_path=result["manifest_path"], dtype=DTYPE, device=DEVICE,
         )
-        all_draws.append(stage_draws)
+        # Move off GPU immediately -- accumulating n_stages worth of
+        # on-device draws in all_draws (and then torch.cat'ing them, which
+        # transiently needs a SECOND full-size allocation on top of that)
+        # is what caused a real CUDA OOM on a 100-stage/1M-skeleton run:
+        # by the last stage, GPU memory held the ENTIRE accumulated
+        # posterior sample plus the concatenation target at once. System
+        # RAM (hundreds of GB on the training box) has no such ceiling for
+        # a tensor this size, unlike GPU VRAM.
+        all_draws.append(stage_draws.cpu())
 
         total_grad_evals += result["gradient_evals"]
         total_bound_violations += result["bound_violations"]
@@ -811,7 +819,11 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
             burnin_frac=(BURNIN_FRAC if stage == 0 else 0.0),
             manifest_path=result["manifest_path"], dtype=DTYPE, device=DEVICE,
         )
-        all_draws.append(stage_draws)
+        # See run_grid_sticky_zigzag's identical .cpu() move for why --
+        # accumulating n_stages worth of on-device draws (plus the final
+        # torch.cat's own transient full-size allocation) is what caused a
+        # real CUDA OOM on the ZigZag side of a 100-stage/1M-skeleton run.
+        all_draws.append(stage_draws.cpu())
 
         total_grad_evals += result["gradient_evals"]
         total_bound_violations += result["bound_violations"]

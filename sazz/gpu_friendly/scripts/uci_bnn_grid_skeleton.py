@@ -34,7 +34,8 @@ from sazz.gpu_friendly.scripts.uci_bnn_grid import (
     N_SKELETON, BASE_SEED,
     HIDDEN_VARIANTS, DEFAULT_HIDDEN_VARIANT,
     UCI_DATASETS,
-    BNNConfig, configs_for,
+    BNNConfig,
+    configs_for,
     load_raw_datasets, make_split, build_target,
     build_zigzag_sampler, build_sticky_zigzag_sampler,
     build_boomerang_sampler, build_sticky_boomerang_sampler,
@@ -277,6 +278,9 @@ def main():
     parser.add_argument("--prior-inclusion-weight", type=float, default=0.3,
                          help="Sticky-only spike-and-slab prior inclusion probability. "
                               "Only affects grid_sticky_zigzag/grid_sticky_boomerang.")
+    parser.add_argument("--activation", choices=["tanh", "relu"], default="tanh",
+                         help="Overrides configs_for's BNNConfig.activation default "
+                              "(uci_bnn_grid.py always builds tanh configs otherwise).")
     args = parser.parse_args()
 
     N_SKELETON = args.n_skeleton
@@ -284,6 +288,7 @@ def main():
 
     hidden = HIDDEN_VARIANTS[args.hidden_variant]
     out_dir = args.out if args.hidden_variant == DEFAULT_HIDDEN_VARIANT else args.out / args.hidden_variant
+    out_dir = out_dir / args.activation
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading raw UCI datasets...")
@@ -295,6 +300,8 @@ def main():
 
     cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden,
                         prior_inclusion_weight=args.prior_inclusion_weight)
+    for cfg in cfgs.values():
+        cfg.activation = args.activation
 
     print(f"\nRunning {datasets_to_run} | samplers: {args.samplers} | splits: {args.splits} | "
           f"hidden_variant={args.hidden_variant} ({hidden}) | "
