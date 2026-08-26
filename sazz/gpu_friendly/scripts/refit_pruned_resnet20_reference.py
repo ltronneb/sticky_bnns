@@ -130,16 +130,35 @@ def load_cifar10_subset(n_train: int, n_test: int, seed: int, data_dir: Path,
 
 def prune_x_ref(bm: BayesianModule, x_ref: Tensor, X_sweep: Tensor, y_sweep: Tensor,
                  can_freeze: Tensor, acc_drop_tolerance: float = PRUNE_ACC_DROP_TOLERANCE,
-                 n_thresholds: int = PRUNE_N_THRESHOLDS) -> tuple[Tensor, Tensor]:
+                 n_thresholds: int = PRUNE_N_THRESHOLDS, eval_chunk: int = 256) -> tuple[Tensor, Tensor]:
+    """
+    eval_chunk (passed through to eval_accuracy's own chunk= param, NOT
+    cnn_reference.py's default of 2048): ResNet-20's per-image activation
+    memory (19 conv layers x 21 BatchNorm layers of intermediate feature
+    maps) is much larger than LeNet5/CNN's, so 2048-image forward passes
+    that were fine on MNIST-scale targets can OOM here -- this loop calls
+    eval_accuracy ~n_thresholds+1 times (61 by default), and observed on
+    a shared/contended A10 GPU to accumulate allocator fragmentation
+    across repeated calls even under eval_accuracy's own @torch.no_grad(),
+    eventually OOMing partway through the sweep despite nvidia-smi showing
+    free memory beforehand. torch.cuda.empty_cache() after each call is a
+    second, complementary mitigation -- releases cached-but-unused blocks
+    back to the driver between iterations rather than letting them pile up
+    across all 61 forward passes.
+    """
     prior_std = bm.prior_precision.clamp(min=1e-12).rsqrt()
-    baseline_acc = eval_accuracy(bm, x_ref, X_sweep, y_sweep)
+    baseline_acc = eval_accuracy(bm, x_ref, X_sweep, y_sweep, chunk=eval_chunk)
+    if bm.device.type == "cuda":
+        torch.cuda.empty_cache()
 
     sweep_multipliers = np.logspace(-3, 0, n_thresholds)
     best_frac, best_mask, best_acc, best_mult = 0.0, torch.zeros_like(can_freeze), baseline_acc, 0.0
     for m in sweep_multipliers:
         mask = (x_ref.abs() < m * prior_std) & can_freeze
         x_pruned = torch.where(mask, torch.zeros_like(x_ref), x_ref)
-        acc = eval_accuracy(bm, x_pruned, X_sweep, y_sweep)
+        acc = eval_accuracy(bm, x_pruned, X_sweep, y_sweep, chunk=eval_chunk)
+        if bm.device.type == "cuda":
+            torch.cuda.empty_cache()
         if acc >= baseline_acc - acc_drop_tolerance:
             best_frac = float(mask.float().mean())
             best_mask = mask
