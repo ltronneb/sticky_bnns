@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -62,6 +62,7 @@ from sazz.gpu_friendly.models.priors import (
     assert_eval_mode_if_batchnorm,
 )
 from sazz.gpu_friendly.scripts.cnn_reference import eval_accuracy
+from sazz.gpu_friendly.scripts.fast_mnist_cnn import build_minibatch_grad_target
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float32 if DEVICE == "cuda" else torch.float64
@@ -177,15 +178,42 @@ def prune_x_ref(bm: BayesianModule, x_ref: Tensor, X_sweep: Tensor, y_sweep: Ten
 
 
 def refit_active_coords(bm: BayesianModule, x_pruned: Tensor, frozen_mask: Tensor,
-                         n_steps: int = REFIT_N_STEPS, lr: float = REFIT_LR) -> Tensor:
+                         n_steps: int = REFIT_N_STEPS, lr: float = REFIT_LR,
+                         batch_size: Optional[int] = None) -> Tensor:
+    """
+    batch_size=None (default): full-batch bm.energy(beta) every step, same
+    as refit_pruned_lenet_reference.py's original behavior -- fine for
+    LeNet5/CNN-scale targets and small MNIST images, but at CIFAR-10 scale
+    (--full = 50,000 images) through ResNet-20's 19 conv/21 BatchNorm
+    layers, a full-batch backward pass on EVERY one of n_steps (default
+    200) iterations is what actually OOMs, not (as first suspected) the
+    prune_x_ref sweep loop above. batch_size=B: minibatch gradient via the
+    same unbiased-subsampling rescale run_map (cnn_reference.py) already
+    uses for MAP fitting -- loss = -log_prior - (N/B)*log_lik_batch, fresh
+    random batch drawn every step (plain SGD-style, no vmap involved here,
+    so there's no fixed-batch-per-episode constraint like the sticky
+    sampler's grad_target has).
+    """
     active_mask = ~frozen_mask
     beta = x_pruned.clone().requires_grad_(True)
     optimizer = torch.optim.Adam([beta], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_steps, eta_min=lr * 0.1)
 
+    N = bm.X.shape[0]
+    minibatch = batch_size is not None and batch_size < N
+    if minibatch:
+        assert not bm.learns_noise, "minibatch rescale double-counts the sigma prior"
+        scale = N / batch_size
+
     for _ in range(n_steps):
         optimizer.zero_grad()
-        loss = bm.energy(beta)
+        if minibatch:
+            idx = torch.randint(0, N, (batch_size,), device=bm.X.device)
+            ll = bm.log_likelihood.single(beta, bm.X[idx], bm.y[idx])
+            log_prior = -0.5 * (bm.prior_precision * beta ** 2).sum()
+            loss = -log_prior - scale * ll
+        else:
+            loss = bm.energy(beta)
         loss.backward()
         with torch.no_grad():
             beta.grad.mul_(active_mask.to(beta.grad.dtype))
@@ -221,6 +249,22 @@ def main():
     parser.add_argument("--prune-acc-drop-tolerance", type=float, default=PRUNE_ACC_DROP_TOLERANCE)
     parser.add_argument("--refit-n-steps", type=int, default=REFIT_N_STEPS)
     parser.add_argument("--refit-lr", type=float, default=REFIT_LR)
+    parser.add_argument("--refit-batch-size", type=int, default=256,
+                         help="Minibatch size for refit_active_coords' Adam loop. Default "
+                              "256, NOT None/full-batch -- at CIFAR-10 scale (--full), a "
+                              "full-batch backward pass through ResNet-20 on every one of "
+                              "--refit-n-steps iterations is what OOMs. Pass --refit-batch-size "
+                              "0 (or any value >= --n-train) to force full-batch behavior.")
+    parser.add_argument("--diag-batch-size", type=int, default=256,
+                         help="Minibatch size for the three ||grad_target||_inf sanity-check "
+                              "prints (informational only, nothing downstream depends on "
+                              "them) -- avoids a full-batch backward pass just for a diagnostic.")
+    parser.add_argument("--eval-chunk", type=int, default=256,
+                         help="Forward-pass chunk size for prune_x_ref's threshold-sweep "
+                              "eval_accuracy calls (passed through to eval_accuracy's own "
+                              "chunk= param). Lower than cnn_reference.py's MNIST-tuned "
+                              "default of 2048 -- ResNet-20's per-image activation memory "
+                              "is much larger.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-dir", type=Path, default=Path("datasets"))
     parser.add_argument("--out", type=Path, default=None,
@@ -278,9 +322,23 @@ def main():
     x_ref = ckpt["x_ref"].to(dtype=DTYPE, device=DEVICE)
     Sigma_inv = ckpt["Sigma_inv"].to(dtype=DTYPE, device=DEVICE)
 
-    grad_target = torch.func.grad(bm.energy)
-    grad_norm_unpruned = grad_target(x_ref).abs().max().item()
-    print(f"  ||grad_target||_inf at unpruned x_ref = {grad_norm_unpruned:.4e}")
+    # ||grad_target||_inf diagnostic below is deliberately evaluated on a
+    # MINIBATCH, not bm.energy's full training set -- with --full (50,000
+    # images) through ResNet-20, a single full-batch torch.func.grad(bm.energy)
+    # backward pass is exactly what was OOMing here (confirmed: crashed on
+    # the FIRST such call, before prune_x_ref's sweep loop even starts).
+    # These three prints are informational sanity checks only (nothing
+    # downstream branches on their value), so a minibatch estimate is a
+    # fine substitute -- same build_minibatch_grad_target helper
+    # fast_mnist_cnn.py's sticky samplers use, just called for its
+    # resample_fn side effect here (redraw before each print) rather than
+    # threaded into a sampler.
+    diag_batch_size = min(args.diag_batch_size, bm.X.shape[0])
+    diag_grad_target, diag_resample = build_minibatch_grad_target(bm, diag_batch_size)
+
+    diag_resample()
+    grad_norm_unpruned = diag_grad_target(x_ref).abs().max().item()
+    print(f"  ||grad_target||_inf at unpruned x_ref (minibatch={diag_batch_size}) = {grad_norm_unpruned:.4e}")
 
     can_freeze = build_can_freeze_mask_resnet(bm.module, device=bm.device)
     if bm.learns_noise:
@@ -290,17 +348,21 @@ def main():
     rm_before_prune = module.stem_bn.running_mean.clone()
     x_pruned, freeze_mask = prune_x_ref(
         bm, x_ref, data["X_sweep"], data["y_sweep"], can_freeze,
-        acc_drop_tolerance=args.prune_acc_drop_tolerance,
+        acc_drop_tolerance=args.prune_acc_drop_tolerance, eval_chunk=args.eval_chunk,
     )
-    grad_norm_pruned = grad_target(x_pruned).abs().max().item()
-    print(f"  ||grad_target||_inf at x_pruned (before refit) = {grad_norm_pruned:.4e}")
+    diag_resample()
+    grad_norm_pruned = diag_grad_target(x_pruned).abs().max().item()
+    print(f"  ||grad_target||_inf at x_pruned (before refit, minibatch={diag_batch_size}) = {grad_norm_pruned:.4e}")
 
     print("\n[refit]")
     x_refit = refit_active_coords(bm, x_pruned, freeze_mask,
-                                   n_steps=args.refit_n_steps, lr=args.refit_lr)
-    grad_norm_refit = grad_target(x_refit).abs().max().item()
-    print(f"  ||grad_target||_inf at x_pruned (after {args.refit_n_steps} refit steps) = "
-          f"{grad_norm_refit:.4e}  (unpruned baseline was {grad_norm_unpruned:.4e})")
+                                   n_steps=args.refit_n_steps, lr=args.refit_lr,
+                                   batch_size=args.refit_batch_size or None)
+    diag_resample()
+    grad_norm_refit = diag_grad_target(x_refit).abs().max().item()
+    print(f"  ||grad_target||_inf at x_pruned (after {args.refit_n_steps} refit steps, "
+          f"minibatch={diag_batch_size}) = {grad_norm_refit:.4e}  "
+          f"(unpruned baseline was {grad_norm_unpruned:.4e})")
 
     rm_after_prune = module.stem_bn.running_mean.clone()
     bn_frozen = torch.equal(rm_before_prune, rm_after_prune)
