@@ -585,9 +585,19 @@ def run_dataset(split_id: int, data: dict[str, Any], cfg: CNNConfig, out_dir: Pa
     else:
         print("  using checkpoint's cold_start_mask directly")
 
-    grad_target = torch.func.grad(bm.energy)
-    grad_norm = grad_target(x_ref).abs().max().item()
-    print(f"  ||grad_target||_inf: at x_ref={grad_norm:.4e}  "
+    # Deliberately a MINIBATCH gradient here, not torch.func.grad(bm.energy)
+    # directly -- with --n-train at CIFAR-10 scale (up to 50,000 images),
+    # a full-batch backward pass through ResNet-20's 19 conv/21 BatchNorm
+    # layers is exactly what OOMs (confirmed: this line crashed on its
+    # first call, before any sampler/staging code ever runs -- same root
+    # cause as refit_pruned_resnet20_reference.py's identical bug, fixed
+    # there the same way). This print is informational only -- nothing
+    # downstream branches on its value -- so a minibatch estimate is a
+    # fine substitute for a full-dataset one.
+    diag_batch_size = min(1024, bm.X.shape[0])
+    diag_grad_target, _ = build_minibatch_grad_target(bm, diag_batch_size)
+    grad_norm = diag_grad_target(x_ref).abs().max().item()
+    print(f"  ||grad_target||_inf: at x_ref (minibatch={diag_batch_size}) = {grad_norm:.4e}  "
           f"(large values mean the excess gradient is far from zero near the "
           f"sampler's actual reference point -- expect inflated bounce rate / "
           f"bound_violations)")
