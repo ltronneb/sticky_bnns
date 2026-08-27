@@ -33,7 +33,7 @@ Usage (same flags as fast_cifar_resnet.py, plus --stage-size):
     python -m sazz.gpu_friendly.scripts.fast_cheap_cifar_resnet \\
         --map-path results/maps/resnet20_reference_N50000_steps2000_pruned_refit.pt \\
         --n-skeleton 100_000 --stage-size 2_000 \\
-        --n-resample 20_000 --n-save 5_000 --grad-batch-size 1024
+        --n-resample 20_000 --n-save 5_000 --grad-batch-size 128
 """
 
 from __future__ import annotations
@@ -88,13 +88,13 @@ GRID_CHUNK_SIZE = 4
 
 GAMMA = 1e-6
 GRID_T_MAX_INIT_ZIGZAG = 1e-4
-GRID_SPACING_ZIGZAG = 1e-6
+GRID_SPACING_ZIGZAG = 1e-5
 
 REFRESH_RATE = 5e2
 GRID_T_MAX_INIT_BOOM = 1e-3
 GRID_SPACING_BOOM = 1e-4
 
-GRID_N_SEGMENTS = 100
+GRID_N_SEGMENTS = 4
 GRID_ALPHA_PLUS = 1.02
 GRID_ALPHA_MINUS = 1.04
 GRID_ALPHA_VIOLATION = 1.1
