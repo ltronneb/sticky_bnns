@@ -444,7 +444,12 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
     # mistaken for a fully-examined one when deciding whether a freeze or
     # thaw actually fired (see plan decision #9).
     # ------------------------------------------------------------------
-    def sample(self, N: int, x0: Optional[Tensor] = None, diagnostics: bool = True) -> dict:
+    def sample(self, N: int, x0: Optional[Tensor] = None, diagnostics: bool = True,
+               grad_budget: Optional[int] = None) -> dict:
+        """grad_budget: see GridZigZagSampler.sample's docstring for full
+        semantics -- identical contract here (N stays a required
+        pre-allocation size / hard safety cap; positions/velocities/times
+        truncated to the actual event count if stopped early via budget)."""
         assert self.x_ref is not None, "Call preprocess() first."
 
         positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
@@ -654,6 +659,12 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                     f"sparsity={n_frozen_r / self.D:.2f} viol={total_bound_violations}",
                     refresh=False,
                 )
+                # Checked before the `continue` too, not just at the normal
+                # fall-through bottom below -- this branch skips that code
+                # entirely, and grad_evals accumulates on rejections
+                # regardless of which branch is taken.
+                if grad_budget is not None and grad_evals >= grad_budget:
+                    break
                 continue
 
             row["wall_seconds"] = _time.perf_counter() - _t0
@@ -664,10 +675,22 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
             )
             diag_log.append(row)
 
+            if grad_budget is not None and grad_evals >= grad_budget:
+                break
+
         pbar.close()
+
+        stopped_early = grad_budget is not None and iteration < N
+        if stopped_early:
+            positions = positions[:iteration]
+            velocities = velocities[:iteration]
+            times = times[:iteration]
 
         if diagnostics:
             self._print_sticky_diagnostics(diag_log, N, grad_evals, times[iteration - 1], total_bound_violations)
+            if stopped_early:
+                print(f"      stopped early: grad_budget={grad_budget} reached "
+                      f"at iteration={iteration} (grad_evals={grad_evals})")
 
         return {
             "positions": positions,

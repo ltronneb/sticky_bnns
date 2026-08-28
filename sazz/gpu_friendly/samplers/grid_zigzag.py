@@ -319,7 +319,8 @@ class GridZigZagSampler(nn.Module):
     # ------------------------------------------------------------------
     # Main sampling loop
     # ------------------------------------------------------------------
-    def sample(self, N: int, x0: Optional[Tensor] = None, diagnostics: bool = True) -> dict:
+    def sample(self, N: int, x0: Optional[Tensor] = None, diagnostics: bool = True,
+               grad_budget: Optional[int] = None) -> dict:
         """
         x0=None defaults to N(0, I) (matching the CPU AutomaticZigZagSampler's
         default -- ZigZag has no reference measure, so Boomerang's
@@ -329,6 +330,21 @@ class GridZigZagSampler(nn.Module):
         structural dependency on a reference point, so x_ref can be used
         purely as an ordinary initial position, with no preprocess() call
         needed.
+
+        grad_budget: if given, sampling stops as soon as this many real
+        gradient evaluations (grad_evals) have been spent, rather than
+        after N skeleton events -- N still acts as a pre-allocation size
+        AND a hard safety cap on skeleton events (whichever bound is hit
+        first stops the loop). N=grad_budget is always a safe, generous
+        upper bound on the number of events the budget could actually
+        produce (minimum cost per accepted event is n_segments+1 >= 3, so
+        far fewer than grad_budget events will ever be needed). The
+        returned positions/velocities/times are truncated to the actual
+        number of events produced when stopped early via budget (not
+        padded with trailing zeros) -- gradient_evals may slightly exceed
+        grad_budget (the check happens after each iteration's cost is
+        already added, since a given iteration's true cost isn't known
+        until it completes), but never falls far short of it.
         """
         positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
         velocities = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
@@ -443,10 +459,26 @@ class GridZigZagSampler(nn.Module):
             )
             diag_log.append(row)
 
+            # Checked unconditionally (not just inside the accepted branch)
+            # since grad_evals accumulates on rejections too -- a run could
+            # otherwise spend its whole budget on no_event iterations and
+            # never break.
+            if grad_budget is not None and grad_evals >= grad_budget:
+                break
+
         pbar.close()
+
+        stopped_early = grad_budget is not None and iteration < N
+        if stopped_early:
+            positions = positions[:iteration]
+            velocities = velocities[:iteration]
+            times = times[:iteration]
 
         if diagnostics:
             self._print_diagnostics(diag_log, N, grad_evals, times[iteration - 1], total_bound_violations)
+            if stopped_early:
+                print(f"      stopped early: grad_budget={grad_budget} reached "
+                      f"at iteration={iteration} (grad_evals={grad_evals})")
 
         return {
             "positions": positions,

@@ -63,6 +63,12 @@ N_RESAMPLE  = 50_000
 BURNIN_FRAC = 0.2
 BASE_SEED   = 42
 
+# If set (via --grad-budget), every sampler stops as soon as this many real
+# gradient evaluations have been spent, instead of running to N_SKELETON
+# skeleton events / NUTS_DRAWS samples. None (default) reproduces today's
+# exact event-count-driven behavior in every runner below.
+GRAD_BUDGET: Optional[int] = None
+
 SIGMA_INV_SCALE = 0.1 #1.0, 10.0
 REFRESH_RATE = 1.0
 GAMMA = 0.01
@@ -347,8 +353,51 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
 # start from the same point, same as the old script did.
 # ===========================================================================
 
+def _truncate_nuts_to_budget(sample_steps: np.ndarray, num_chains: int, num_samples: int,
+                              grad_budget: int) -> int:
+    """Given the flat per-draw leapfrog step counts from
+    get_extra_fields()["num_steps"] (shape (num_chains*num_samples,),
+    row-major -- chain 0's num_samples draws, then chain 1's, etc.,
+    confirmed to match get_samples(group_by_chain=False)'s own ordering by
+    direct comparison), find the largest k such that keeping the first k
+    draws FROM EVERY CHAIN (not a global flat prefix) stays within
+    grad_budget.
+
+    grad_budget here governs the SAMPLING phase only, not warmup -- same
+    convention as the Goan TF/TFP budget-chunked loop (see run_tf_bps/
+    run_tf_boomerang's grad_budget docstring): warmup's job is adaptation,
+    not posterior coverage, and the fixed-budget comparison's fairness
+    claim is about the *sampling* phase's gradient cost. gradient_evals in
+    the returned/saved result still reports warmup_steps + the truncated
+    sampling cost (the true total spend), it's just that warmup itself is
+    never truncated/capped by grad_budget.
+
+    Truncating per-chain-equally (not as one flat prefix across all
+    chains-concatenated) keeps every returned chain the same length --
+    a ragged "chain 0 got 50 draws, chain 1 got 3" result would be an
+    awkward, arguably-wrong thing to hand downstream code that assumes a
+    rectangular [n_chains, n_samples, ...] or flattened [n_total, ...]
+    posterior array.
+
+    Returns k (number of post-warmup draws to keep PER CHAIN), in
+    [0, num_samples]. k=num_samples means the budget was never binding
+    (the full ceiling run already fit) -- this is the "trim is a no-op"
+    case verified separately.
+    """
+    per_chain = sample_steps.reshape(num_chains, num_samples)
+    cum_per_chain = np.cumsum(per_chain, axis=1)  # [num_chains, num_samples]
+    # Total spend if we keep k draws from every chain = sum over chains of
+    # each chain's own cumulative cost at k -- NOT necessarily k times a
+    # single chain's cost, since per-draw leapfrog counts vary chain to
+    # chain (dynamic tree-doubling, no shared trajectory).
+    total_cum = cum_per_chain.sum(axis=0)  # [num_samples], summed across chains
+    fits = np.nonzero(total_cum <= grad_budget)[0]
+    return int(fits[-1]) + 1 if len(fits) > 0 else 0
+
+
 def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
-             x_ref: Optional[torch.Tensor] = None) -> tuple[np.ndarray, float, int]:
+             x_ref: Optional[torch.Tensor] = None,
+             grad_budget: Optional[int] = None) -> tuple[np.ndarray, float, int]:
     import jax
     import jax.numpy as jnp
     import numpyro
@@ -442,10 +491,32 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
     # get_extra_fields() reflects whichever of warmup()/run() ran most
     # recently, so warmup_steps was captured right after warmup() above,
     # before run() overwrites it with the post-warmup fields.
-    sample_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    sample_steps_arr = np.asarray(mcmc.get_extra_fields()["num_steps"])
+    sample_steps = int(sample_steps_arr.sum())
+
+    posterior = mcmc.get_samples(group_by_chain=(grad_budget is not None))
+
+    if grad_budget is not None:
+        # "generous ceiling, then truncate" (v1; see module docstring for
+        # why NUTS doesn't get a chunked-resumption budget loop like the
+        # grid/Goan samplers -- dynamic tree-doubling means per-sample
+        # gradient cost isn't knob-controllable ahead of time). NUTS_DRAWS
+        # is the generous ceiling; find the largest per-chain draw count k
+        # whose real summed leapfrog cost stays within grad_budget, then
+        # trim every chain to k draws before flattening. If the ceiling
+        # run never actually needed grad_budget's worth of draws, k ==
+        # NUTS_DRAWS and this is a no-op (verified separately).
+        k = _truncate_nuts_to_budget(sample_steps_arr, NUTS_CHAINS, NUTS_DRAWS, grad_budget)
+        posterior = {name: arr[:, :k] for name, arr in posterior.items()}
+        truncated_steps = sample_steps_arr.reshape(NUTS_CHAINS, NUTS_DRAWS)[:, :k].sum()
+        sample_steps = int(truncated_steps)
+        # Flatten [n_chains, k, ...] -> [n_chains*k, ...], same row-major
+        # chain-then-sample ordering get_samples(group_by_chain=False)
+        # itself uses (confirmed by direct comparison).
+        posterior = {name: arr.reshape((-1,) + arr.shape[2:]) for name, arr in posterior.items()}
+
     gradient_evals = warmup_steps + sample_steps
 
-    posterior = mcmc.get_samples()
     flat = []
     for i in range(len(layer_sizes) - 1):
         W = np.asarray(posterior[f"W{i}"])  # [n, n_out, n_in]
@@ -457,7 +528,8 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
 
 
 def run_nuts_horseshoe(data: dict[str, Any], cfg: BNNConfig, seed: int,
-                        x_ref: Optional[torch.Tensor] = None) -> tuple[np.ndarray, float, int]:
+                        x_ref: Optional[torch.Tensor] = None,
+                        grad_budget: Optional[int] = None) -> tuple[np.ndarray, float, int]:
     """
     NUTS with a horseshoe prior on weights, half-Cauchy on biases -- see
     sazz/scripts/bnns/uci_bnn.py's run_nuts_horseshoe for the full math
@@ -544,10 +616,22 @@ def run_nuts_horseshoe(data: dict[str, Any], cfg: BNNConfig, seed: int,
              extra_fields=("num_steps",))
     elapsed = time.perf_counter() - t0
 
-    sample_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    sample_steps_arr = np.asarray(mcmc.get_extra_fields()["num_steps"])
+    sample_steps = int(sample_steps_arr.sum())
+
+    posterior = mcmc.get_samples(group_by_chain=(grad_budget is not None))
+
+    if grad_budget is not None:
+        # See run_nuts's identical "generous ceiling, then truncate" logic
+        # and _truncate_nuts_to_budget's docstring for the full rationale.
+        k = _truncate_nuts_to_budget(sample_steps_arr, NUTS_CHAINS, NUTS_DRAWS, grad_budget)
+        posterior = {name: arr[:, :k] for name, arr in posterior.items()}
+        truncated_steps = sample_steps_arr.reshape(NUTS_CHAINS, NUTS_DRAWS)[:, :k].sum()
+        sample_steps = int(truncated_steps)
+        posterior = {name: arr.reshape((-1,) + arr.shape[2:]) for name, arr in posterior.items()}
+
     gradient_evals = warmup_steps + sample_steps
 
-    posterior = mcmc.get_samples()
     flat = []
     for i in range(len(layer_sizes) - 1):
         W = np.asarray(posterior[f"W{i}"])  # deterministic tau*lam*W_raw
@@ -578,7 +662,18 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
              samples: torch.Tensor, x_ref: Optional[torch.Tensor], cfg: BNNConfig,
              y_std: float, elapsed_sec: float, n_events: int,
              bound_violations: int, gradient_evals: Optional[int] = None,
-             grid_t_max_log: Optional[list[float]] = None) -> None:
+             grid_t_max_log: Optional[list[float]] = None,
+             grad_budget: Optional[int] = "unset") -> None:
+    # "unset" sentinel (not None): lets a caller explicitly pass
+    # grad_budget=None to record "definitely no budget," distinct from
+    # "caller didn't say, fall back to the module-level GRAD_BUDGET global"
+    # -- every runner in this script already reads GRAD_BUDGET implicitly
+    # for the sample()/run_nuts(...) call itself, so defaulting here to the
+    # same global (rather than requiring every one of the ~10 call sites
+    # to pass it explicitly) keeps this provenance field accurate with a
+    # single point of truth, not ten places that could drift out of sync.
+    if grad_budget == "unset":
+        grad_budget = GRAD_BUDGET
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "dataset":           dataset,
@@ -596,6 +691,7 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
         "bound_violations":  bound_violations,
         "gradient_evals":    gradient_evals,
         "grid_t_max_log":    grid_t_max_log,
+        "grad_budget":       grad_budget,  # the REQUESTED budget (provenance); gradient_evals is the actual spend
     }, out_path)
 
 
@@ -611,7 +707,7 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
     sampler = build_zigzag_sampler(bm)
 
     t0 = time.perf_counter()
-    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_zigzag_path_torch(
@@ -619,14 +715,15 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
         N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
     )
 
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations)")
 
     out_path = sd / "grid_zigzag.pt"
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_zigzag",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -639,7 +736,7 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
     sampler = build_sticky_zigzag_sampler(bm, cfg)
 
     t0 = time.perf_counter()
-    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_zigzag_path_sticky_torch(
@@ -648,7 +745,8 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
     )
 
     sparsity = float(result["frozen_mask_final"].float().mean())
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations, "
           f"final sparsity {sparsity:.2f})")
 
@@ -656,7 +754,7 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_sticky_zigzag",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -669,7 +767,7 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
     sampler = build_boomerang_sampler(bm, x_ref, Sigma_inv)
 
     t0 = time.perf_counter()
-    result = sampler.sample(N=N_SKELETON, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_boomerang_path_torch(
@@ -677,14 +775,15 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
         N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
     )
 
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations)")
 
     out_path = sd / "grid_boomerang.pt"
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_boomerang",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -697,7 +796,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     sampler = build_sticky_boomerang_sampler(bm, cfg, x_ref, Sigma_inv)
 
     t0 = time.perf_counter()
-    result = sampler.sample(N=N_SKELETON, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_boomerang_path_sticky_torch(
@@ -706,7 +805,8 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     )
 
     sparsity = float(result["frozen_mask_final"].float().mean())
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations, "
           f"final sparsity {sparsity:.2f})")
 
@@ -714,7 +814,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_sticky_boomerang",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -725,7 +825,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
 def run_nuts_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
                       cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
     seed = BASE_SEED + split_id
-    samples_np, elapsed, gradient_evals = run_nuts(data, cfg, seed, x_ref=x_ref)
+    samples_np, elapsed, gradient_evals = run_nuts(data, cfg, seed, x_ref=x_ref, grad_budget=GRAD_BUDGET)
     samples = torch.tensor(samples_np)
 
     print(f"      sampled {samples.shape[0]} NUTS draws in {elapsed:.1f}s "
@@ -744,7 +844,7 @@ def run_nuts_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
 def run_nuts_horseshoe_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
                                 cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
     seed = BASE_SEED + split_id
-    samples_np, elapsed, gradient_evals = run_nuts_horseshoe(data, cfg, seed, x_ref=x_ref)
+    samples_np, elapsed, gradient_evals = run_nuts_horseshoe(data, cfg, seed, x_ref=x_ref, grad_budget=GRAD_BUDGET)
     samples = torch.tensor(samples_np)
 
     print(f"      sampled {samples.shape[0]} NUTS-HS draws in {elapsed:.1f}s "
@@ -813,7 +913,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 # ===========================================================================
 
 def main():
-    global N_SKELETON, N_RESAMPLE
+    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -838,6 +938,19 @@ def main():
     parser.add_argument("--n-resample", type=int, default=N_RESAMPLE,
                          help="Overrides the module-level N_RESAMPLE default -- independent "
                               "of --n-skeleton.")
+    parser.add_argument("--grad-budget", type=int, default=None,
+                         help="If set, every sampler stops as soon as this many real gradient "
+                              "evaluations have been spent, instead of running to "
+                              "--n-skeleton skeleton events / NUTS_DRAWS samples. "
+                              "--n-skeleton still acts as an outer safety cap (raise it if "
+                              "the budget is large enough to need more events than the "
+                              "default allows). For a fair cross-family comparison, run "
+                              "this script and goan_scripts/uci_bnn_tf_grid.py with the "
+                              "SAME --grad-budget value, same --datasets/--splits/"
+                              "--hidden-variant. Since .pt filenames (grid_zigzag.pt, "
+                              "nuts.pt, ...) don't encode run mode, budget runs should "
+                              "generally use a distinct --out directory rather than "
+                              "overwrite/compare in place against event-count-driven runs.")
     parser.add_argument("--prior-inclusion-weight", type=float, default=0.3,
                          help="Sticky-only spike-and-slab prior inclusion probability (BNNConfig."
                               "prior_inclusion_weight, fed to build_kappa_from_inclusion). Lower "
@@ -849,6 +962,7 @@ def main():
 
     N_SKELETON = args.n_skeleton
     N_RESAMPLE = args.n_resample
+    GRAD_BUDGET = args.grad_budget
 
     hidden = HIDDEN_VARIANTS[args.hidden_variant]
     # "small" keeps writing to the original flat <out>/<dataset>/... layout

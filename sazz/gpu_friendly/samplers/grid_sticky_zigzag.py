@@ -440,7 +440,12 @@ class GridStickyZigZagSampler(GridZigZagSampler):
     # ------------------------------------------------------------------
     # Main sampling loop
     # ------------------------------------------------------------------
-    def sample(self, N: int, x0: Optional[Tensor] = None, diagnostics: bool = True) -> dict:
+    def sample(self, N: int, x0: Optional[Tensor] = None, diagnostics: bool = True,
+               grad_budget: Optional[int] = None) -> dict:
+        """grad_budget: see GridZigZagSampler.sample's docstring for full
+        semantics -- identical contract here (N stays a required
+        pre-allocation size / hard safety cap; positions/velocities/times
+        truncated to the actual event count if stopped early via budget)."""
         positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
         velocities = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
         times = torch.zeros(N, dtype=self.dtype, device=self.device)
@@ -632,10 +637,22 @@ class GridStickyZigZagSampler(GridZigZagSampler):
             )
             diag_log.append(row)
 
+            if grad_budget is not None and grad_evals >= grad_budget:
+                break
+
         pbar.close()
+
+        stopped_early = grad_budget is not None and iteration < N
+        if stopped_early:
+            positions = positions[:iteration]
+            velocities = velocities[:iteration]
+            times = times[:iteration]
 
         if diagnostics:
             self._print_diagnostics(diag_log, N, grad_evals, times[iteration - 1], total_bound_violations)
+            if stopped_early:
+                print(f"      stopped early: grad_budget={grad_budget} reached "
+                      f"at iteration={iteration} (grad_evals={grad_evals})")
 
         return {
             "positions": positions,

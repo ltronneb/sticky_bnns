@@ -89,6 +89,13 @@ N_RESAMPLE  = 10_000
 BURNIN_FRAC = 0.2
 BASE_SEED   = 42
 
+# If set (via --grad-budget), every sampler stops as soon as this many real
+# gradient evaluations have been spent, instead of running to N_SKELETON
+# skeleton events / NUTS_DRAWS samples. None (default) reproduces today's
+# exact event-count-driven behavior in every runner below -- see
+# uci_bnn_grid.py's identical GRAD_BUDGET for the full rationale.
+GRAD_BUDGET: Optional[int] = None
+
 SIGMA_INV_SCALE = 0.1 #1.0 10.0
 REFRESH_RATE = 1.0
 GAMMA = 0.01
@@ -327,7 +334,23 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
 # NUTS via NumPyro
 # ===========================================================================
 
-def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarray, float, int]:
+def _truncate_nuts_to_budget(sample_steps: np.ndarray, num_chains: int, num_samples: int,
+                              grad_budget: int) -> int:
+    """See uci_bnn_grid.py's identical helper for the full rationale (same
+    logic, kept as a local copy here since toy_bnn_grid.py is a standalone
+    script with no shared import between the two *_grid.py scripts).
+    Returns k, the number of post-warmup draws to keep PER CHAIN such
+    that summed real leapfrog cost across all chains stays within
+    grad_budget; k == num_samples means the budget never bound."""
+    per_chain = sample_steps.reshape(num_chains, num_samples)
+    cum_per_chain = np.cumsum(per_chain, axis=1)
+    total_cum = cum_per_chain.sum(axis=0)
+    fits = np.nonzero(total_cum <= grad_budget)[0]
+    return int(fits[-1]) + 1 if len(fits) > 0 else 0
+
+
+def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
+             grad_budget: Optional[int] = None) -> tuple[np.ndarray, float, int]:
     import jax
     import jax.numpy as jnp
     import numpyro
@@ -385,10 +408,24 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarra
     # num_steps = leapfrog steps per sample; summing across samples/chains
     # (warmup AND post-warmup) gives total gradient evaluations, the same
     # currency as the PDMP samplers' gradient_evals (see grid_boomerang.py).
-    sample_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    sample_steps_arr = np.asarray(mcmc.get_extra_fields()["num_steps"])
+    sample_steps = int(sample_steps_arr.sum())
+
+    posterior = mcmc.get_samples(group_by_chain=(grad_budget is not None))
+
+    if grad_budget is not None:
+        # "generous ceiling, then truncate" (v1) -- see
+        # uci_bnn_grid.py::run_nuts's identical logic and
+        # _truncate_nuts_to_budget's docstring for the full rationale.
+        # grad_budget governs the sampling phase only, not warmup.
+        k = _truncate_nuts_to_budget(sample_steps_arr, NUTS_CHAINS, NUTS_DRAWS, grad_budget)
+        posterior = {name: arr[:, :k] for name, arr in posterior.items()}
+        truncated_steps = sample_steps_arr.reshape(NUTS_CHAINS, NUTS_DRAWS)[:, :k].sum()
+        sample_steps = int(truncated_steps)
+        posterior = {name: arr.reshape((-1,) + arr.shape[2:]) for name, arr in posterior.items()}
+
     gradient_evals = warmup_steps + sample_steps
 
-    posterior = mcmc.get_samples()
     flat = []
     for i in range(len(layer_sizes) - 1):
         W = np.asarray(posterior[f"W{i}"])  # [n, n_out, n_in]
@@ -502,7 +539,13 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
              samples: torch.Tensor, x_ref: Optional[torch.Tensor], cfg: BNNConfig,
              y_std: float, elapsed_sec: float, n_events: int,
              bound_violations: int, gradient_evals: Optional[int] = None,
-             grid_t_max_log: Optional[list[float]] = None) -> None:
+             grid_t_max_log: Optional[list[float]] = None,
+             grad_budget: Optional[int] = "unset") -> None:
+    # See uci_bnn_grid.py::save_run's identical "unset" sentinel comment
+    # for why this defaults to the module-level GRAD_BUDGET global rather
+    # than requiring every call site to pass it explicitly.
+    if grad_budget == "unset":
+        grad_budget = GRAD_BUDGET
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "dataset":          dataset,
@@ -519,6 +562,7 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
         "bound_violations": bound_violations,
         "gradient_evals":   gradient_evals,
         "grid_t_max_log":   grid_t_max_log,
+        "grad_budget":      grad_budget,
     }, out_path)
 
 
@@ -540,7 +584,7 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
     sampler = build_zigzag_sampler(bm)
 
     t0 = time.perf_counter()
-    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_zigzag_path_torch(
@@ -548,14 +592,15 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
         N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
     )
 
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations)")
 
     out_path = sd / "grid_zigzag.pt"
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_zigzag",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -579,7 +624,7 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
     # x0=x_ref: same warm-start convention as plain grid_zigzag -- ZigZag has
     # no reference measure, so x_ref is used purely as an initial position
     # here (confirmed compatible when GridZigZagSampler was first built).
-    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_zigzag_path_sticky_torch(
@@ -588,7 +633,8 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
     )
 
     sparsity = float(result["frozen_mask_final"].float().mean())
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations, "
           f"final sparsity {sparsity:.2f})")
 
@@ -596,7 +642,7 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_sticky_zigzag",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -617,7 +663,7 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
     sampler = build_boomerang_sampler(bm, x_ref, Sigma_inv)
 
     t0 = time.perf_counter()
-    result = sampler.sample(N=N_SKELETON, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_boomerang_path_torch(
@@ -625,14 +671,15 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
         N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
     )
 
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations)")
 
     out_path = sd / "grid_boomerang.pt"
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_boomerang",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -652,7 +699,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     sampler = build_sticky_boomerang_sampler(bm, cfg, x_ref, Sigma_inv)
 
     t0 = time.perf_counter()
-    result = sampler.sample(N=N_SKELETON, diagnostics=True)
+    result = sampler.sample(N=N_SKELETON, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
     samples = resample_boomerang_path_sticky_torch(
@@ -661,7 +708,8 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     )
 
     sparsity = float(result["frozen_mask_final"].float().mean())
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s "
+    n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
+    print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations, "
           f"final sparsity {sparsity:.2f})")
 
@@ -669,7 +717,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_sticky_boomerang",
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=n_events,
         bound_violations=result["bound_violations"],
         gradient_evals=result["gradient_evals"],
         grid_t_max_log=result["grid_t_max_log"],
@@ -681,7 +729,7 @@ def run_nuts_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
                       cfg: BNNConfig, sd: Path) -> None:
     seed = BASE_SEED + split_id
 
-    samples_np, elapsed, gradient_evals = run_nuts(data, cfg, seed)
+    samples_np, elapsed, gradient_evals = run_nuts(data, cfg, seed, grad_budget=GRAD_BUDGET)
     samples = torch.tensor(samples_np)
 
     print(f"      sampled {samples.shape[0]} NUTS draws in {elapsed:.1f}s "
@@ -748,6 +796,8 @@ def run_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
 # ===========================================================================
 
 def main():
+    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -760,7 +810,27 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--out", type=Path, default=OUT_DIR)
     parser.add_argument("--toy-dir", type=Path, default=TOY_DIR)
+    parser.add_argument("--n-skeleton", type=int, default=N_SKELETON,
+                         help="Overrides the module-level N_SKELETON default -- previously "
+                              "hardcoded with no CLI override; added alongside --grad-budget "
+                              "since its 'safe upper-bound N' default depends on being able "
+                              "to override N from the CLI (see uci_bnn_grid.py's identical flag).")
+    parser.add_argument("--n-resample", type=int, default=N_RESAMPLE,
+                         help="Overrides the module-level N_RESAMPLE default -- independent "
+                              "of --n-skeleton.")
+    parser.add_argument("--grad-budget", type=int, default=None,
+                         help="If set, every sampler stops as soon as this many real gradient "
+                              "evaluations have been spent, instead of running to "
+                              "--n-skeleton skeleton events / NUTS_DRAWS samples. "
+                              "--n-skeleton still acts as an outer safety cap. For a fair "
+                              "cross-family comparison, run this script and "
+                              "goan_scripts/toy_bnn_tf_grid.py with the SAME --grad-budget "
+                              "value, same --datasets/--splits.")
     args = parser.parse_args()
+
+    N_SKELETON = args.n_skeleton
+    N_RESAMPLE = args.n_resample
+    GRAD_BUDGET = args.grad_budget
 
     args.out.mkdir(parents=True, exist_ok=True)
 
