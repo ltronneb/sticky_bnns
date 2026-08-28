@@ -79,7 +79,7 @@ N_ACCURACY_DRAWS = 300
 PRIOR_STD_W = 2.0
 PRIOR_STD_B = 2.0
 PRIOR_STD_BN_WEIGHT = 1.0
-PRIOR_INCLUSION_WEIGHT = 0.05
+PRIOR_INCLUSION_WEIGHT = 0.01
 ACTIVATION = "relu"
 
 # See fast_cifar_resnet.py's module docstring -- same caveat applies here:

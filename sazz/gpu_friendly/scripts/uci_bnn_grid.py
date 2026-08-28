@@ -839,7 +839,8 @@ def main():
     print(f"\nRunning {datasets_to_run} | samplers: {args.samplers} | splits: {args.splits} | "
           f"hidden_variant={args.hidden_variant} ({hidden}) | "
           f"N_SKELETON={N_SKELETON} N_RESAMPLE={N_RESAMPLE} "
-          f"prior_inclusion_weight={args.prior_inclusion_weight}")
+          f"prior_inclusion_weight={args.prior_inclusion_weight}"
+          f"Sigma inverse scale={SIGMA_INV_SCALE}")
     for ds in datasets_to_run:
         X, y = raw[ds]
         cfg = cfgs[ds]
