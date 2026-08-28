@@ -365,14 +365,28 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int) -> tuple[np.ndarra
     mcmc = MCMC(kernel, num_warmup=NUTS_WARMUP, num_samples=NUTS_DRAWS,
                 num_chains=NUTS_CHAINS, progress_bar=True)
 
+    # Split into warmup()-then-run() (NumPyro's documented two-step pattern)
+    # instead of one mcmc.run() call, so warmup-phase leapfrog steps are
+    # visible via collect_warmup=True -- see uci_bnn_grid.py::run_nuts's
+    # identical fix for the full rationale (collect_warmup is a kwarg of
+    # MCMC.warmup(), not of MCMC.__init__()/run(); posterior samples are
+    # unaffected, only what get_extra_fields() exposes changes). run() takes
+    # post_warmup_state.rng_key (NOT a fresh PRNGKey(seed) call) -- required
+    # for bit-identical posterior samples vs. a single run() call, verified
+    # directly; re-passing the original seed silently reuses/collides the
+    # RNG stream and produces a genuinely different trajectory instead.
     t0 = time.perf_counter()
-    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y, extra_fields=("num_steps",))
+    mcmc.warmup(jax.random.PRNGKey(seed), X=X, y=y,
+                extra_fields=("num_steps",), collect_warmup=True)
+    warmup_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    mcmc.run(mcmc.post_warmup_state.rng_key, X=X, y=y, extra_fields=("num_steps",))
     elapsed = time.perf_counter() - t0
 
-    # num_steps = leapfrog steps per post-warmup sample; summing across
-    # samples/chains gives total gradient evaluations, the same currency
-    # as the PDMP samplers' gradient_evals (see grid_boomerang.py).
-    gradient_evals = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    # num_steps = leapfrog steps per sample; summing across samples/chains
+    # (warmup AND post-warmup) gives total gradient evaluations, the same
+    # currency as the PDMP samplers' gradient_evals (see grid_boomerang.py).
+    sample_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    gradient_evals = warmup_steps + sample_steps
 
     posterior = mcmc.get_samples()
     flat = []

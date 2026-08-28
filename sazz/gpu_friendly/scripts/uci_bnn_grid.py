@@ -410,17 +410,40 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
     mcmc = MCMC(kernel, num_warmup=NUTS_WARMUP, num_samples=NUTS_DRAWS,
                 num_chains=NUTS_CHAINS, progress_bar=True)
 
+    # Split into warmup()-then-run() (NumPyro's documented two-step pattern)
+    # instead of one mcmc.run() call, so warmup-phase leapfrog steps are
+    # visible via collect_warmup=True -- collect_warmup is a kwarg of
+    # MCMC.warmup(), NOT of MCMC.__init__()/run() (verified against the
+    # installed NumPyro 0.20.1's actual signatures). Passing
+    # mcmc.post_warmup_state.rng_key to run() (NOT a fresh/repeated
+    # PRNGKey(seed) call) is required for this to be a faithful
+    # decomposition of a single mcmc.run() call: run() always re-derives
+    # its sampling-phase key from whatever key it's given, so re-passing
+    # the ORIGINAL seed would silently reuse/collide the RNG stream and
+    # produce a genuinely different (not just re-labeled) trajectory --
+    # confirmed by direct comparison: re-passing PRNGKey(seed) here gives
+    # posterior samples that differ by up to ~0.6 in raw units from the
+    # single-run() baseline, while post_warmup_state.rng_key gives
+    # bit-identical samples. This is NumPyro's own documented pattern (see
+    # MCMC.post_warmup_state's docstring example: "mcmc.run(mcmc.post_warmup_state.rng_key)").
     t0 = time.perf_counter()
-    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y, init_params=init_params,
+    mcmc.warmup(jax.random.PRNGKey(seed), X=X, y=y, init_params=init_params,
+                extra_fields=("num_steps",), collect_warmup=True)
+    warmup_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    mcmc.run(mcmc.post_warmup_state.rng_key, X=X, y=y, init_params=init_params,
              extra_fields=("num_steps",))
     elapsed = time.perf_counter() - t0
 
-    # num_steps = leapfrog steps per post-warmup sample; NUTS/HMC evaluates
-    # the potential-energy gradient once per leapfrog step, so summing
-    # across all samples/chains gives total gradient evaluations -- the
-    # same currency as the PDMP samplers' gradient_evals, for a fair
-    # cost-per-gradient-eval comparison across sampler families.
-    gradient_evals = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    # num_steps = leapfrog steps per sample; NUTS/HMC evaluates the
+    # potential-energy gradient once per leapfrog step, so summing across
+    # all samples/chains (warmup AND post-warmup) gives total gradient
+    # evaluations -- the same currency as the PDMP samplers' gradient_evals,
+    # for a fair cost-per-gradient-eval comparison across sampler families.
+    # get_extra_fields() reflects whichever of warmup()/run() ran most
+    # recently, so warmup_steps was captured right after warmup() above,
+    # before run() overwrites it with the post-warmup fields.
+    sample_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    gradient_evals = warmup_steps + sample_steps
 
     posterior = mcmc.get_samples()
     flat = []
@@ -507,12 +530,22 @@ def run_nuts_horseshoe(data: dict[str, Any], cfg: BNNConfig, seed: int,
     mcmc = MCMC(kernel, num_warmup=NUTS_WARMUP, num_samples=NUTS_DRAWS,
                 num_chains=NUTS_CHAINS, progress_bar=True)
 
+    # See run_nuts's identical warmup()-then-run() split above for why --
+    # collect_warmup=True makes warmup-phase leapfrog steps visible via
+    # get_extra_fields(), which a single mcmc.run() call would silently omit.
+    # run() takes post_warmup_state.rng_key (NOT a fresh PRNGKey(seed) call)
+    # -- required for bit-identical posterior samples vs. a single run()
+    # call, verified directly; see run_nuts's comment for the full story.
     t0 = time.perf_counter()
-    mcmc.run(jax.random.PRNGKey(seed), X=X, y=y, init_params=init_params,
+    mcmc.warmup(jax.random.PRNGKey(seed), X=X, y=y, init_params=init_params,
+                extra_fields=("num_steps",), collect_warmup=True)
+    warmup_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    mcmc.run(mcmc.post_warmup_state.rng_key, X=X, y=y, init_params=init_params,
              extra_fields=("num_steps",))
     elapsed = time.perf_counter() - t0
 
-    gradient_evals = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    sample_steps = int(np.asarray(mcmc.get_extra_fields()["num_steps"]).sum())
+    gradient_evals = warmup_steps + sample_steps
 
     posterior = mcmc.get_samples()
     flat = []
