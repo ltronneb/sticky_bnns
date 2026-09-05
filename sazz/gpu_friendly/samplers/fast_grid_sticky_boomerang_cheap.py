@@ -437,7 +437,7 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
             sign = torch.sign(old_v)
             zero_sign = sign == 0
             if torch.any(zero_sign):
-                rand_sign = torch.randint(0, 2, (int(zero_sign.sum()),), device=self.device).to(self.dtype) * 2 - 1
+                rand_sign = torch.randint(0, 2, sign.shape, device=self.device).to(self.dtype) * 2 - 1
                 sign = torch.where(zero_sign, rand_sign, sign)
 
             new_v = sign * mag
