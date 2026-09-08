@@ -83,15 +83,18 @@ SIGMA_INV_SCALE_FALLBACK = 2.0
 
 SIGMA_INV_SCALE_TABLE: dict[str, dict[str, float]] = {
     "deep_narrow": {
-        "_default": 2.0,
-        "boston":   2.0,
+        "_default": 1.0,
+        "boston":   1.0,
         "energy":   20.0,
         "yacht":    50.0,
         "concrete": 10.0,
         "naval":    10.0,
     },
     "small": {
-        "_default": 1.0,   # TODO tune -- shallow, far smaller D
+        "_default": 0.1,
+        "boston":   0.1,
+        "energy":   0.1,
+        "naval":    0.1,
     },
     "deep_wide": {
         "_default": 10.0,  # TODO tune -- matches deep_wide_uci.py's SIGMA_INV_SCALE
