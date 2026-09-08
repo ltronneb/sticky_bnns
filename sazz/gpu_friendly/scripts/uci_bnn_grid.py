@@ -71,10 +71,13 @@ BASE_SEED   = 42
 # exact event-count-driven behavior in every runner below.
 GRAD_BUDGET: Optional[int] = None
 
-SIGMA_INV_SCALE = 0.1 #1.0, 10.0
-N_FISHER = 512
+SIGMA_INV_SCALE = 1.0 #1.0, 10.0  -- applies to the WEIGHT block of Sigma_inv only
 
-REFERENCE = "ggn"
+SIGMA_LOGSIGMA_PREC_SCALE = 1.0
+
+N_FISHER = 128
+
+REFERENCE = "empirical_fisher"
 REFRESH_RATE = 1.0
 GAMMA = 0.01
 
@@ -126,7 +129,7 @@ class BNNConfig:
     prior_std_weight: float = 1.0
     prior_std_bias: float = 1.0
     fan_in_scaling: bool = True
-    adam_steps: int = 20000
+    adam_steps: int = 20_000
     prior_inclusion_weight: float = 0.3  # sticky-only: spike-and-slab inclusion prob for kappa
 
 
@@ -304,6 +307,17 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: BNNConfig):
     return sampler
 
 
+def _scaled_sigma_inv(Sigma_inv: torch.Tensor, bm: BayesianModule) -> torch.Tensor:
+    """SIGMA_INV_SCALE on the weight block; SIGMA_LOGSIGMA_PREC_SCALE on the
+    trailing log_sigma coordinate (present only when bm.learns_noise). Keeps the
+    noise tether decoupled from the weight-reference scale -- see SIGMA_INV_SCALE
+    / SIGMA_LOGSIGMA_PREC_SCALE comments above."""
+    scale = torch.full_like(Sigma_inv, SIGMA_INV_SCALE)
+    if bm.learns_noise:
+        scale[-1] = SIGMA_LOGSIGMA_PREC_SCALE
+    return Sigma_inv * scale
+
+
 def build_boomerang_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: torch.Tensor):
     sampler = GridBoomerangSampler(
         grad_target=torch.func.grad(bm.energy),
@@ -317,7 +331,7 @@ def build_boomerang_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: 
         dtype=DTYPE,
         device=bm.device,
     )
-    sampler.preprocess(x_ref=x_ref, Sigma_inv=Sigma_inv * SIGMA_INV_SCALE)
+    sampler.preprocess(x_ref=x_ref, Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm))
     return sampler
 
 
@@ -351,7 +365,7 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
         dtype=DTYPE,
         device=bm.device,
     )
-    sampler.preprocess(x_ref=x_ref, Sigma_inv=Sigma_inv * SIGMA_INV_SCALE)
+    sampler.preprocess(x_ref=x_ref, Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm))
     return sampler
 
 
@@ -459,10 +473,8 @@ def run_nuts(data: dict[str, Any], cfg: BNNConfig, seed: int,
             init_params[f"b{i}"] = jnp.broadcast_to(b, (NUTS_CHAINS,) + b.shape)
             offset += n_out
         # x_ref's trailing coordinate is log_sigma (BayesianModule.build
-        # appends it when noise is learned); NumPyro samples sigma directly
-        # on the positive reals.
-        sigma0 = jnp.exp(jnp.array(x0[offset]))
-        init_params["sigma"] = jnp.broadcast_to(sigma0, (NUTS_CHAINS,))
+        log_sigma0 = jnp.array(x0[offset])
+        init_params["sigma"] = jnp.broadcast_to(log_sigma0, (NUTS_CHAINS,))
 
     kernel = NUTS(bnn, target_accept_prob=0.9, adapt_mass_matrix=True)
     mcmc = MCMC(kernel, num_warmup=NUTS_WARMUP, num_samples=NUTS_DRAWS,
@@ -1006,7 +1018,9 @@ def main():
           f"N_SKELETON={N_SKELETON} N_RESAMPLE={N_RESAMPLE} "
           f"prior_inclusion_weight={args.prior_inclusion_weight} "
           f"reference={REFERENCE} "
-          f"Sigma inverse scale={SIGMA_INV_SCALE}")
+          f"Sigma inverse scale={SIGMA_INV_SCALE} "
+          f"log_sigma prec scale={SIGMA_LOGSIGMA_PREC_SCALE} "
+          f"reference={REFERENCE}")
     for ds in datasets_to_run:
         X, y = raw[ds]
         cfg = cfgs[ds]
