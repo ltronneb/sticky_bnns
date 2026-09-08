@@ -34,7 +34,7 @@ from sazz.gpu_friendly.models.model import BayesianModule
 from sazz.gpu_friendly.models.priors import (
     build_fan_in_prior_precision, build_kappa_from_inclusion, build_can_freeze_mask,
 )
-from sazz.gpu_friendly.utils.warmup import find_reference_bnn
+from sazz.gpu_friendly.utils.warmup import find_reference_bnn, find_reference_bnn_ggn
 from sazz.gpu_friendly.utils.resample import (
     resample_zigzag_path_torch, resample_zigzag_path_sticky_torch,
     resample_boomerang_path_torch, resample_boomerang_path_sticky_torch,
@@ -54,7 +54,9 @@ DEVICE = (
     #else "mps" if torch.backends.mps.is_available()
     else "cpu"
 )
+print(DEVICE)
 DTYPE = torch.float32 if DEVICE == "cuda" else torch.float64
+print(DTYPE)
 torch.set_default_dtype(torch.float32)
 
 
@@ -70,6 +72,9 @@ BASE_SEED   = 42
 GRAD_BUDGET: Optional[int] = None
 
 SIGMA_INV_SCALE = 0.1 #1.0, 10.0
+N_FISHER = 512
+
+REFERENCE = "ggn"
 REFRESH_RATE = 1.0
 GAMMA = 0.01
 
@@ -223,7 +228,7 @@ def build_target(data: dict[str, Any], cfg: BNNConfig, dtype=DTYPE, device=DEVIC
     )
 
     # noise_std omitted -> learned (default), with a HalfNormal(prior_sigma_scale)
-    # prior on sigma; find_reference_bnn's log_sigma curvature patch (warmup.py)
+    # prior on sigma; the reference finder's log_sigma curvature patch (warmup.py)
     # picks this up automatically via bm.learns_noise/bm.prior_sigma_scale.
     bm = BayesianModule.build(
         module, likelihood="gaussian", X=X, y=y,
@@ -231,8 +236,12 @@ def build_target(data: dict[str, Any], cfg: BNNConfig, dtype=DTYPE, device=DEVIC
         dtype=dtype, device=device,
     )
 
-    x_ref, Sigma_inv = find_reference_bnn(
-        bm, n_steps=cfg.adam_steps, lr=1e-2, dtype=dtype, device=torch.device(device),
+    reference_finder = {
+        "empirical_fisher": find_reference_bnn,
+        "ggn": find_reference_bnn_ggn,
+    }[REFERENCE]
+    x_ref, Sigma_inv = reference_finder(
+        bm, n_steps=cfg.adam_steps, lr=1e-2, n_fisher_batch=N_FISHER, dtype=dtype, device=torch.device(device),
     )
 
     return bm, x_ref, Sigma_inv
@@ -913,7 +922,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 # ===========================================================================
 
 def main():
-    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET
+    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET, REFERENCE
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -951,6 +960,14 @@ def main():
                               "nuts.pt, ...) don't encode run mode, budget runs should "
                               "generally use a distinct --out directory rather than "
                               "overwrite/compare in place against event-count-driven runs.")
+    parser.add_argument("--reference", choices=["ggn", "empirical_fisher"], default=REFERENCE,
+                         help="Diagonal-Laplace reference for the Boomerang family (see warmup.py). "
+                              "'ggn' (default) uses find_reference_bnn_ggn: sum_n (df/dtheta)^2 / sigma^2, "
+                              "no residual weighting -- matches near-mode curvature well on the deep "
+                              "variants. 'empirical_fisher' uses find_reference_bnn: sum_n (d log p/dtheta)^2, "
+                              "residual^2-weighted, which underestimates inner-layer curvature on deep nets "
+                              "and needs SIGMA_INV_SCALE well above 1.0 to compensate. Ignored by "
+                              "grid_zigzag/grid_sticky_zigzag (no reference measure) and NUTS.")
     parser.add_argument("--prior-inclusion-weight", type=float, default=0.3,
                          help="Sticky-only spike-and-slab prior inclusion probability (BNNConfig."
                               "prior_inclusion_weight, fed to build_kappa_from_inclusion). Lower "
@@ -963,6 +980,7 @@ def main():
     N_SKELETON = args.n_skeleton
     N_RESAMPLE = args.n_resample
     GRAD_BUDGET = args.grad_budget
+    REFERENCE = args.reference
 
     hidden = HIDDEN_VARIANTS[args.hidden_variant]
     # "small" keeps writing to the original flat <out>/<dataset>/... layout
@@ -986,7 +1004,8 @@ def main():
     print(f"\nRunning {datasets_to_run} | samplers: {args.samplers} | splits: {args.splits} | "
           f"hidden_variant={args.hidden_variant} ({hidden}) | "
           f"N_SKELETON={N_SKELETON} N_RESAMPLE={N_RESAMPLE} "
-          f"prior_inclusion_weight={args.prior_inclusion_weight}"
+          f"prior_inclusion_weight={args.prior_inclusion_weight} "
+          f"reference={REFERENCE} "
           f"Sigma inverse scale={SIGMA_INV_SCALE}")
     for ds in datasets_to_run:
         X, y = raw[ds]
