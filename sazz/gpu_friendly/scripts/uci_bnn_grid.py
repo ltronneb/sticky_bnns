@@ -71,12 +71,42 @@ BASE_SEED   = 42
 # exact event-count-driven behavior in every runner below.
 GRAD_BUDGET: Optional[int] = None
 
-SIGMA_INV_SCALE_BOSTON = 2.0 #1.0, 10.0  -- applies to the WEIGHT block of Sigma_inv only
-SIGMA_INV_SCALE_ENERGY = 20.0
-SIGMA_INV_SCALE_YACHT = 50.0
-SIGMA_INV_SCALE_CONCRETE = 10.0
-SIGMA_INV_SCALE_NAVAL = 10.0
-SIGMA_INV_SCALE = 2.0
+# Per-(hidden-variant, dataset) weight-block scale on the Boomerang reference
+# precision Sigma_inv (see _scaled_sigma_inv). Tuned so the grid bound stays
+# valid (0 bound violations) and the chain's distance from x_ref is sane --
+# the right value depends BOTH on architecture (D, depth) and on the dataset
+# (N, curvature), so a single scalar can't serve all cells. A dataset missing
+# from a variant's dict falls back to that variant's "_default"; a whole
+# variant missing falls back to SIGMA_INV_SCALE_FALLBACK. Look up via
+# sigma_inv_scale_for(variant, dataset).
+SIGMA_INV_SCALE_FALLBACK = 2.0
+
+SIGMA_INV_SCALE_TABLE: dict[str, dict[str, float]] = {
+    "deep_narrow": {
+        "_default": 2.0,
+        "boston":   2.0,
+        "energy":   20.0,
+        "yacht":    50.0,
+        "concrete": 10.0,
+        "naval":    10.0,
+    },
+    "small": {
+        "_default": 1.0,   # TODO tune -- shallow, far smaller D
+    },
+    "deep_wide": {
+        "_default": 10.0,  # TODO tune -- matches deep_wide_uci.py's SIGMA_INV_SCALE
+    },
+}
+
+
+def sigma_inv_scale_for(hidden_variant: str, dataset: str) -> float:
+    """Resolve the weight-block Sigma_inv scale for (hidden_variant, dataset):
+    exact cell -> variant's '_default' -> SIGMA_INV_SCALE_FALLBACK."""
+    variant_tbl = SIGMA_INV_SCALE_TABLE.get(hidden_variant, {})
+    if dataset in variant_tbl:
+        return variant_tbl[dataset]
+    return variant_tbl.get("_default", SIGMA_INV_SCALE_FALLBACK)
+
 
 SIGMA_LOGSIGMA_PREC_SCALE = 1.0
 
@@ -136,9 +166,15 @@ class BNNConfig:
     fan_in_scaling: bool = True
     adam_steps: int = 20_000
     prior_inclusion_weight: float = 0.3  # sticky-only: spike-and-slab inclusion prob for kappa
+    # Weight-block scale on the Boomerang reference Sigma_inv, resolved from
+    # SIGMA_INV_SCALE_TABLE for this (hidden_variant, dataset) in configs_for.
+    # Consumed by _scaled_sigma_inv via bm.sigma_inv_scale (build_target
+    # copies it onto bm). Boomerang-family only; ZigZag/NUTS ignore it.
+    sigma_inv_scale: float = SIGMA_INV_SCALE_FALLBACK
 
 
 def configs_for(input_dims: dict[str, int], hidden: list[int],
+                 hidden_variant: str,
                  prior_inclusion_weight: float = 0.3) -> dict[str, BNNConfig]:
     cfgs: dict[str, BNNConfig] = {}
     for name in UCI_DATASETS:
@@ -147,6 +183,7 @@ def configs_for(input_dims: dict[str, int], hidden: list[int],
                 layer_sizes=[input_dims[name], *hidden, 1],
                 prior_sigma_scale=0.01 if name == "naval" else 0.3,
                 prior_inclusion_weight=prior_inclusion_weight,
+                sigma_inv_scale=sigma_inv_scale_for(hidden_variant, name),
             )
     return cfgs
 
@@ -312,18 +349,21 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: BNNConfig):
     return sampler
 
 
-def _scaled_sigma_inv(Sigma_inv: torch.Tensor, bm: BayesianModule) -> torch.Tensor:
-    """SIGMA_INV_SCALE on the weight block; SIGMA_LOGSIGMA_PREC_SCALE on the
-    trailing log_sigma coordinate (present only when bm.learns_noise). Keeps the
-    noise tether decoupled from the weight-reference scale -- see SIGMA_INV_SCALE
-    / SIGMA_LOGSIGMA_PREC_SCALE comments above."""
-    scale = torch.full_like(Sigma_inv, SIGMA_INV_SCALE)
+def _scaled_sigma_inv(Sigma_inv: torch.Tensor, bm: BayesianModule,
+                       weight_scale: float) -> torch.Tensor:
+    """weight_scale (the per-(hidden-variant, dataset) cfg.sigma_inv_scale) on
+    the weight block; SIGMA_LOGSIGMA_PREC_SCALE on the trailing log_sigma
+    coordinate (present only when bm.learns_noise). Keeps the noise tether
+    decoupled from the weight-reference scale -- see SIGMA_INV_SCALE_TABLE /
+    SIGMA_LOGSIGMA_PREC_SCALE comments above."""
+    scale = torch.full_like(Sigma_inv, weight_scale)
     if bm.learns_noise:
         scale[-1] = SIGMA_LOGSIGMA_PREC_SCALE
     return Sigma_inv * scale
 
 
-def build_boomerang_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: torch.Tensor):
+def build_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
+                             x_ref: torch.Tensor, Sigma_inv: torch.Tensor):
     sampler = GridBoomerangSampler(
         grad_target=torch.func.grad(bm.energy),
         D=bm.D,
@@ -336,7 +376,8 @@ def build_boomerang_sampler(bm: BayesianModule, x_ref: torch.Tensor, Sigma_inv: 
         dtype=DTYPE,
         device=bm.device,
     )
-    sampler.preprocess(x_ref=x_ref, Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm))
+    sampler.preprocess(x_ref=x_ref,
+                       Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm, cfg.sigma_inv_scale))
     return sampler
 
 
@@ -370,7 +411,8 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
         dtype=DTYPE,
         device=bm.device,
     )
-    sampler.preprocess(x_ref=x_ref, Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm))
+    sampler.preprocess(x_ref=x_ref,
+                       Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm, cfg.sigma_inv_scale))
     return sampler
 
 
@@ -790,7 +832,7 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
 
 def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
                         cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
-    sampler = build_boomerang_sampler(bm, x_ref, Sigma_inv)
+    sampler = build_boomerang_sampler(bm, cfg, x_ref, Sigma_inv)
 
     t0 = time.perf_counter()
     result = sampler.sample(N=N_SKELETON, diagnostics=True, grad_budget=GRAD_BUDGET)
@@ -1016,16 +1058,17 @@ def main():
     datasets_to_run = [d for d in args.datasets if d in raw]
 
     cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden,
+                        hidden_variant=args.hidden_variant,
                         prior_inclusion_weight=args.prior_inclusion_weight)
 
+    scale_str = ", ".join(f"{d}={cfgs[d].sigma_inv_scale:g}" for d in datasets_to_run)
     print(f"\nRunning {datasets_to_run} | samplers: {args.samplers} | splits: {args.splits} | "
           f"hidden_variant={args.hidden_variant} ({hidden}) | "
           f"N_SKELETON={N_SKELETON} N_RESAMPLE={N_RESAMPLE} "
           f"prior_inclusion_weight={args.prior_inclusion_weight} "
           f"reference={REFERENCE} "
-          f"Sigma inverse scale={SIGMA_INV_SCALE} "
-          f"log_sigma prec scale={SIGMA_LOGSIGMA_PREC_SCALE} "
-          f"reference={REFERENCE}")
+          f"sigma_inv_scale[{scale_str}] "
+          f"log_sigma_prec_scale={SIGMA_LOGSIGMA_PREC_SCALE}")
     for ds in datasets_to_run:
         X, y = raw[ds]
         cfg = cfgs[ds]
