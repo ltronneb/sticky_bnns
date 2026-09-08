@@ -71,7 +71,12 @@ BASE_SEED   = 42
 # exact event-count-driven behavior in every runner below.
 GRAD_BUDGET: Optional[int] = None
 
-SIGMA_INV_SCALE = 1.0 #1.0, 10.0  -- applies to the WEIGHT block of Sigma_inv only
+SIGMA_INV_SCALE_BOSTON = 2.0 #1.0, 10.0  -- applies to the WEIGHT block of Sigma_inv only
+SIGMA_INV_SCALE_ENERGY = 20.0
+SIGMA_INV_SCALE_YACHT = 50.0
+SIGMA_INV_SCALE_CONCRETE = 10.0
+SIGMA_INV_SCALE_NAVAL = 10.0
+SIGMA_INV_SCALE = 2.0
 
 SIGMA_LOGSIGMA_PREC_SCALE = 1.0
 
