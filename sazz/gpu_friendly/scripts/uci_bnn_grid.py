@@ -83,8 +83,8 @@ SIGMA_INV_SCALE_FALLBACK = 2.0
 
 SIGMA_INV_SCALE_TABLE: dict[str, dict[str, float]] = {
     "deep_narrow": {
-        "_default": 1.0,
-        "boston":   1.0,
+        "_default": 0.75,
+        "boston":   0.75,
         "energy":   20.0,
         "yacht":    50.0,
         "concrete": 10.0,
