@@ -135,7 +135,7 @@ GRID_STICKY_ZIGZAG_SPACING = GRID_SPACING_ZIGZAG
 
 GRID_STICKY_COLD_START_THRESHOLD = None
 
-NUTS_DRAWS  = 5_000
+NUTS_DRAWS  = 4_000
 NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
 N_SAVE      = NUTS_DRAWS * NUTS_CHAINS
@@ -182,9 +182,21 @@ def configs_for(input_dims: dict[str, int], hidden: list[int],
     cfgs: dict[str, BNNConfig] = {}
     for name in UCI_DATASETS:
         if name in input_dims:
+            if name == "boston":
+                prior_sigma_scale = 0.3
+            elif name == "naval":
+                prior_sigma_scale = 0.01
+            elif name == "energy":
+                prior_sigma_scale = 0.03
+            elif name == "yacht":
+                prior_sigma_scale = 0.01
+            elif name == "concrete":
+                prior_sigma_scale = 0.2
+            else:
+                prior_sigma_scale = 0.3
             cfgs[name] = BNNConfig(
                 layer_sizes=[input_dims[name], *hidden, 1],
-                prior_sigma_scale=0.01 if name == "naval" else 0.3,
+                prior_sigma_scale=prior_sigma_scale,
                 prior_inclusion_weight=prior_inclusion_weight,
                 sigma_inv_scale=sigma_inv_scale_for(hidden_variant, name),
             )
@@ -666,7 +678,7 @@ def run_nuts_horseshoe(data: dict[str, Any], cfg: BNNConfig, seed: int,
             b = jnp.array(x0[offset:offset + n_out])
             init_params[f"b{i}"] = jnp.broadcast_to(b, (NUTS_CHAINS,) + b.shape)
             offset += n_out
-        sigma0 = jnp.exp(jnp.array(x0[offset]))
+        sigma0 = jnp.array(x0[offset])
         init_params["sigma"] = jnp.broadcast_to(sigma0, (NUTS_CHAINS,))
 
     kernel = NUTS(bnn, target_accept_prob=0.95, adapt_mass_matrix=True)
