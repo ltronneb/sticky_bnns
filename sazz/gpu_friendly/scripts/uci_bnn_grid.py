@@ -135,7 +135,7 @@ GRID_STICKY_ZIGZAG_SPACING = GRID_SPACING_ZIGZAG
 
 GRID_STICKY_COLD_START_THRESHOLD = None
 
-NUTS_DRAWS  = 4_000
+NUTS_DRAWS  = 1_000
 NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
 N_SAVE      = NUTS_DRAWS * NUTS_CHAINS
@@ -185,7 +185,7 @@ def configs_for(input_dims: dict[str, int], hidden: list[int],
             if name == "boston":
                 prior_sigma_scale = 0.3
             elif name == "naval":
-                prior_sigma_scale = 0.01
+                prior_sigma_scale = 0.003
             elif name == "energy":
                 prior_sigma_scale = 0.03
             elif name == "yacht":
