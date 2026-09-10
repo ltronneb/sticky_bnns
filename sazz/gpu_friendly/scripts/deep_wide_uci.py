@@ -108,7 +108,9 @@ from sazz.gpu_friendly.scripts.uci_bnn_grid import (
 
 # Fast*-only knob (no Grid* equivalent); fast_cifar_resnet.py's value.
 GRID_ALPHA_VIOLATION = 1.1
-SIGMA_INV_SCALE = 0.1
+SIGMA_INV_SCALE = 10.0  # WEIGHT block of Sigma_inv only
+
+SIGMA_LOGSIGMA_PREC_SCALE = 1.0
 
 GAMMA = 1e-6
 GRID_T_MAX_INIT_ZIGZAG = 0.001
@@ -152,6 +154,16 @@ PDMP_SAMPLERS = ("grid_sticky_zigzag", "grid_sticky_boomerang")
 # variants -- deep_wide is a plain FFN). Factored out here because both the
 # zigzag and boomerang runners need the identical construction.
 # ===========================================================================
+
+def _scaled_sigma_inv(Sigma_inv: torch.Tensor, bm) -> torch.Tensor:
+    """SIGMA_INV_SCALE on the weight block; SIGMA_LOGSIGMA_PREC_SCALE on the
+    trailing log_sigma coordinate (present only when bm.learns_noise). Mirrors
+    uci_bnn_grid.py's _scaled_sigma_inv -- see the constants' comments there."""
+    scale = torch.full_like(Sigma_inv, SIGMA_INV_SCALE)
+    if bm.learns_noise:
+        scale[-1] = SIGMA_LOGSIGMA_PREC_SCALE
+    return Sigma_inv * scale
+
 
 def _build_sticky_kappa_can_freeze(bm, cfg: BNNConfig):
     kappa_net = build_kappa_from_inclusion(
@@ -213,8 +225,9 @@ def build_sticky_boomerang_sampler(bm, cfg: BNNConfig,
         device=bm.device,
         resample_grad_batch=None,
     )
-    # Same Sigma_inv rescale as uci_bnn_grid.py's build_boomerang_sampler.
-    sampler.preprocess(x_ref=x_ref, Sigma_inv=Sigma_inv * SIGMA_INV_SCALE)
+    # Same Sigma_inv rescale as uci_bnn_grid.py's build_boomerang_sampler
+    # (weight block: SIGMA_INV_SCALE; log_sigma: SIGMA_LOGSIGMA_PREC_SCALE).
+    sampler.preprocess(x_ref=x_ref, Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm))
     return sampler
 
 
@@ -513,8 +526,15 @@ def main():
         print(f"  (skipping {missing} -- data file(s) not found)")
     datasets_to_run = [d for d in args.datasets if d in raw]
 
+    # configs_for populates cfg.sigma_inv_scale from uci_bnn_grid's
+    # SIGMA_INV_SCALE_TABLE, but this script overrides it below with its own
+    # module-level SIGMA_INV_SCALE (deep_wide's Fast* grid constants and
+    # reference scale are tuned here, not in that table).
     cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden,
+                        hidden_variant=args.hidden_variant,
                         prior_inclusion_weight=args.prior_inclusion_weight)
+    for cfg in cfgs.values():
+        cfg.sigma_inv_scale = SIGMA_INV_SCALE
 
     n_stages_str = (
         str(math.ceil(N_SKELETON / STAGE_SIZE)) if STAGE_SIZE is not None else "n/a"
@@ -524,7 +544,8 @@ def main():
           f"N_SKELETON={N_SKELETON} N_RESAMPLE={N_RESAMPLE} "
           f"stage_size={STAGE_SIZE} n_stages={n_stages_str} stage_dir={STAGE_DIR} "
           f"prior_inclusion_weight={args.prior_inclusion_weight} "
-          f"Sigma inverse scale={SIGMA_INV_SCALE}")
+          f"Sigma inverse scale={SIGMA_INV_SCALE} "
+          f"log_sigma prec scale={SIGMA_LOGSIGMA_PREC_SCALE}")
 
     for ds in datasets_to_run:
         X, y = raw[ds]

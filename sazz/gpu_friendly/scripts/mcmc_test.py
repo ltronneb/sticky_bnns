@@ -2,12 +2,29 @@
 NUTS chain-behavior probe for the "small" UCI regression BNN -- for
 eyeballing how the MCMC chains move, NOT for a benchmark table.
 
-Unlike uci_bnn_grid.py's run_nuts (4 chains, all initialized from the same
-MAP estimate x_ref), this runs FIVE independent single-chain NUTS runs,
-each started from its OWN random draw from the prior -- no MAP reference
-anywhere. The five chains therefore explore from five genuinely different
-points, which is what makes cross-chain disagreement / multimodality /
-label-switching visible.
+Two init modes:
+
+  --init prior  (default): FIVE independent single-chain NUTS runs, each
+    started from its OWN random draw from the prior -- no MAP reference
+    anywhere. The chains explore from genuinely different points, which is
+    what makes cross-chain disagreement / multimodality / label-switching
+    visible. NOTE: a prior draw for a multi-hidden-layer net is far from
+    EVERY mode, and warmup's adaptation can funnel most chains into one
+    basin regardless of where they started -- so "chains agree" here is
+    weak evidence, not proof of unimodality.
+
+  --init flipped-map: a targeted probe of the tanh(-z) = -tanh(z) sign-flip
+    symmetry. Runs a MAP (via uci_bnn_grid.build_target) once, then starts
+    n_chains chains at sign-flipped copies of it: chain 0 at the raw MAP,
+    each other chain with a different random subset of hidden layers fully
+    sign-flipped (W[k] row-negated, b[k] negated, W[k+1] column-negated --
+    predictions exactly invariant). If a flipped chain STAYS in its flipped
+    configuration instead of migrating back to the raw-MAP signs, that mode
+    is a real, non-communicating basin -- the decisive test prior-init
+    can't reliably give. tanh activation only (relu has no such symmetry).
+
+Unlike uci_bnn_grid.py's run_nuts (4 chains, all from the same MAP x_ref),
+every mode here keeps chains SEPARATE and single-chain.
 
 Everything about the target (data loading, split construction, BNNConfig,
 the NumPyro `bnn` model with a learned-sigma HalfNormal prior) is taken
@@ -31,6 +48,7 @@ Usage:
     python -m sazz.gpu_friendly.scripts.mcmc_test
     python -m sazz.gpu_friendly.scripts.mcmc_test --datasets boston energy --splits 0
     python -m sazz.gpu_friendly.scripts.mcmc_test --n-draws 2000 --n-warmup 1000 --collect-warmup
+    python -m sazz.gpu_friendly.scripts.mcmc_test --init flipped-map --datasets boston --splits 0
 """
 
 from __future__ import annotations
@@ -47,7 +65,7 @@ from sazz.gpu_friendly.scripts.uci_bnn_grid import (
     DTYPE, BASE_SEED,
     UCI_DATASETS,
     BNNConfig, configs_for,
-    load_raw_datasets, make_split,
+    load_raw_datasets, make_split, build_target,
 )
 
 # "small" == Izmailov et al.'s 1x50 shape; this probe is deliberately fixed
@@ -88,11 +106,92 @@ def _prior_init_point(cfg: BNNConfig, rng: np.random.Generator) -> np.ndarray:
     return np.concatenate(parts).astype(np.float64)
 
 
+def _flat_slices(layer_sizes: list[int]) -> list[dict]:
+    """Byte-offset map of the flat [W0,b0,W1,b1,...,log_sigma] vector: one
+    dict per Linear layer with 'W'/'b' as (start, stop) index pairs and the
+    (n_out, n_in) shape. The trailing single log_sigma coord is not listed."""
+    slices = []
+    offset = 0
+    for n_in, n_out in zip(layer_sizes[:-1], layer_sizes[1:]):
+        w0, w1 = offset, offset + n_out * n_in
+        b0, b1 = w1, w1 + n_out
+        slices.append({"W": (w0, w1), "b": (b0, b1), "shape": (n_out, n_in)})
+        offset = b1
+    return slices
+
+
+def _sign_flip_map(x_map: np.ndarray, cfg: BNNConfig, flip_layers: list[int]) -> np.ndarray:
+    """Apply the tanh(-z) = -tanh(z) sign-flip symmetry to a flat MAP vector.
+
+    For each HIDDEN layer k in flip_layers (0-indexed among Linear layers;
+    the output layer -- the last one -- is never eligible, it has no tanh
+    after it): negate W[k]'s rows and b[k] (flips every unit of layer k's
+    pre-activation), and negate W[k+1]'s columns (undoes it downstream).
+    The network output is exactly unchanged; only the weight-space
+    coordinates move to the mirror mode. log_sigma is untouched.
+
+    Requires cfg.activation == 'tanh' (relu/elu have no such symmetry)."""
+    if cfg.activation != "tanh":
+        raise ValueError(
+            f"sign-flip symmetry needs tanh activation; cfg.activation={cfg.activation!r}"
+        )
+    n_linear = len(cfg.layer_sizes) - 1
+    out = x_map.copy()
+    slices = _flat_slices(cfg.layer_sizes)
+    for k in flip_layers:
+        if not (0 <= k < n_linear - 1):
+            raise ValueError(
+                f"flip layer {k} out of range -- hidden Linear layers are 0..{n_linear - 2} "
+                f"(layer {n_linear - 1} is the output layer, no tanh)"
+            )
+        wk0, wk1 = slices[k]["W"]
+        bk0, bk1 = slices[k]["b"]
+        out[wk0:wk1] = -out[wk0:wk1]     # W[k] all entries (rows) negated
+        out[bk0:bk1] = -out[bk0:bk1]     # b[k] negated
+        # W[k+1] columns: reshape, negate every column, write back.
+        w1_0, w1_1 = slices[k + 1]["W"]
+        n_out_next, n_in_next = slices[k + 1]["shape"]
+        Wnext = out[w1_0:w1_1].reshape(n_out_next, n_in_next).copy()
+        Wnext[:, :] = -Wnext           # n_in_next == this layer's n_out, so all cols
+        out[w1_0:w1_1] = Wnext.reshape(-1)
+    return out
+
+
+def _flipped_map_init_points(x_map: np.ndarray, cfg: BNNConfig, n_chains: int,
+                              rng: np.random.Generator) -> tuple[np.ndarray, list[list[int]]]:
+    """n_chains start points for --init flipped-map: chain 0 is the raw MAP,
+    each later chain flips a random non-empty subset of the hidden layers.
+    Returns (init_points [n_chains, D], per-chain flipped-layer lists)."""
+    n_hidden = len(cfg.layer_sizes) - 2  # Linear layers minus the output layer
+    if n_hidden < 1:
+        raise ValueError(
+            f"flipped-map needs >=1 hidden layer; layer_sizes={cfg.layer_sizes}"
+        )
+    hidden_idx = list(range(n_hidden))
+    points, flips = [x_map.copy()], [[]]
+    for _ in range(1, n_chains):
+        # random non-empty subset of hidden layers
+        mask = rng.integers(0, 2, size=n_hidden).astype(bool)
+        if not mask.any():
+            mask[rng.integers(0, n_hidden)] = True
+        chosen = [hidden_idx[i] for i in range(n_hidden) if mask[i]]
+        points.append(_sign_flip_map(x_map, cfg, chosen))
+        flips.append(chosen)
+    return np.stack(points), flips
+
+
 def _unflatten_init(x0: np.ndarray, cfg: BNNConfig) -> dict:
     """Flat [W0,b0,...,log_sigma] -> NumPyro init_params dict for ONE chain
     (no leading chain axis -- single-chain runs). Inverse of run_nuts's
-    flatten. sigma is stored as log_sigma in x0 (matches x_ref convention);
-    NumPyro samples sigma on the positive reals, so exp() it back."""
+    flatten.
+
+    NumPyro's model-based init_params are UNCONSTRAINED latent values
+    (verified against NumPyro 0.20.1: passing v as init_params["sigma"]
+    yields a first draw of exp(v)). sigma has a HalfNormal prior, so its
+    unconstrained coordinate is log_sigma -- which is exactly what x0[offset]
+    already stores (see _prior_init_point / x_ref convention). So pass it
+    through directly; exponentiating here (the old bug) started every chain
+    at sigma = exp(log_sigma_MAP) instead of sigma_MAP."""
     import jax.numpy as jnp
 
     layer_sizes = cfg.layer_sizes
@@ -104,7 +203,7 @@ def _unflatten_init(x0: np.ndarray, cfg: BNNConfig) -> dict:
         offset += w_size
         init[f"b{i}"] = jnp.array(x0[offset:offset + n_out])
         offset += n_out
-    init["sigma"] = jnp.exp(jnp.array(x0[offset]))
+    init["sigma"] = jnp.array(x0[offset])  # already log_sigma == the unconstrained coord
     return init
 
 
@@ -157,7 +256,12 @@ def _build_bnn_model(cfg: BNNConfig, X_np: np.ndarray, y_np: np.ndarray):
 
 def run_chains(data: dict[str, Any], cfg: BNNConfig, base_seed: int,
                n_chains: int, n_draws: int, n_warmup: int,
-               collect_warmup: bool) -> dict:
+               collect_warmup: bool, init_mode: str = "prior") -> dict:
+    """init_mode: 'prior' -- each chain from its own prior draw (default);
+    'flipped-map' -- chain 0 at a MAP, each other chain at that MAP with a
+    random subset of hidden layers sign-flipped (see module docstring /
+    _flipped_map_init_points). Returns, additionally, 'flip_layers' (list
+    per chain; empty for chain 0 / all prior-mode chains) and 'init_mode'."""
     import jax
     from numpyro.infer import MCMC, NUTS
 
@@ -169,12 +273,24 @@ def run_chains(data: dict[str, Any], cfg: BNNConfig, base_seed: int,
     # from the per-chain JAX PRNGKeys used for the sampler itself.
     init_rng = np.random.default_rng(base_seed)
 
+    if init_mode == "flipped-map":
+        # MAP once (build_target does Adam + Laplace; we only need x_ref).
+        _bm, x_map, _Sig = build_target(data, cfg)
+        x_map = x_map.detach().cpu().numpy().astype(np.float64)
+        init_points, flip_layers = _flipped_map_init_points(x_map, cfg, n_chains, init_rng)
+        print(f"      flipped-map: chain 0 = raw MAP; flips per chain = {flip_layers}")
+    elif init_mode == "prior":
+        init_points = np.stack([_prior_init_point(cfg, init_rng) for _ in range(n_chains)])
+        flip_layers = [[] for _ in range(n_chains)]
+    else:
+        raise ValueError(f"init_mode must be 'prior' or 'flipped-map'; got {init_mode!r}")
+
     all_samples, all_warmup, all_init = [], [], []
     all_diverging, all_num_steps, all_accept = [], [], []
 
     t0 = time.perf_counter()
     for c in range(n_chains):
-        x0 = _prior_init_point(cfg, init_rng)
+        x0 = init_points[c]
         all_init.append(x0)
         init_params = _unflatten_init(x0, cfg)
 
@@ -221,6 +337,8 @@ def run_chains(data: dict[str, Any], cfg: BNNConfig, base_seed: int,
         "num_steps": np.stack(all_num_steps),                   # [n_chains, n_draws]
         "accept_prob": np.stack(all_accept),                    # [n_chains, n_draws]
         "elapsed_sec": elapsed,
+        "init_mode": init_mode,
+        "flip_layers": flip_layers,                             # list[list[int]], per chain
     }
 
 
@@ -238,7 +356,9 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, cfg: BNNConfig,
         "base_seed": base_seed,
         "chain_seeds": [base_seed + 1 + c for c in range(n_chains)],
         "target_accept_prob": TARGET_ACCEPT,
-        "init_from_map": False,
+        "init_mode": result["init_mode"],                 # "prior" | "flipped-map"
+        "init_from_map": result["init_mode"] == "flipped-map",
+        "flip_layers": result["flip_layers"],            # list[list[int]], per chain
         "samples": torch.tensor(result["samples"]),
         "init_points": torch.tensor(result["init_points"]),
         "warmup_samples": (torch.tensor(result["warmup_samples"])
@@ -270,7 +390,13 @@ def main():
     parser.add_argument("--n-warmup", type=int, default=N_WARMUP)
     parser.add_argument("--collect-warmup", action="store_true",
                         help="Also keep the warmup draws (lets the notebook watch "
-                             "the chains move from their prior init through adaptation).")
+                             "the chains move from their init through adaptation).")
+    parser.add_argument("--init", choices=["prior", "flipped-map"], default="prior",
+                        help="'prior' (default): each chain from its own prior draw. "
+                             "'flipped-map': chain 0 at a MAP, each other chain at that "
+                             "MAP with a random subset of hidden layers sign-flipped "
+                             "(tanh symmetry) -- a targeted probe of whether the mirror "
+                             "modes are real non-communicating basins.")
     parser.add_argument("--out", type=Path, default=OUT_DIR)
     parser.add_argument("--resume", action="store_true",
                         help="Skip a (dataset, split) whose nuts_chains.pt already exists.")
@@ -286,9 +412,14 @@ def main():
         print(f"  (skipping {missing} -- data file(s) not found)")
     datasets_to_run = [d for d in args.datasets if d in raw]
 
-    cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden)
+    # sigma_inv_scale is irrelevant here (NUTS only, no Boomerang reference);
+    # pass HIDDEN_VARIANT just to satisfy configs_for's signature.
+    cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden,
+                        hidden_variant=HIDDEN_VARIANT)
 
-    print(f"\nMULTISTART NUTS (no MAP) | hidden_variant={HIDDEN_VARIANT} ({hidden}) | "
+    tag = "MULTISTART NUTS (prior init, no MAP)" if args.init == "prior" \
+        else "NUTS sign-flip probe (chain 0 = MAP, others = sign-flipped MAP)"
+    print(f"\n{tag} | hidden_variant={HIDDEN_VARIANT} ({hidden}) | "
           f"datasets={datasets_to_run} | splits={args.splits} | "
           f"{args.n_chains} chains x {args.n_draws} draws (+{args.n_warmup} warmup) | "
           f"target_accept={TARGET_ACCEPT}")
@@ -297,7 +428,8 @@ def main():
         X, y = raw[ds]
         cfg = cfgs[ds]
         for split_id in args.splits:
-            out_path = args.out / ds / f"split_{split_id:02d}" / "nuts_chains.pt"
+            fname = "nuts_chains.pt" if args.init == "prior" else "nuts_chains_flipped_map.pt"
+            out_path = args.out / ds / f"split_{split_id:02d}" / fname
             if args.resume and out_path.exists():
                 print(f"\n--- {ds.upper()} split {split_id:02d} -- skipping, exists at {out_path}")
                 continue
@@ -309,7 +441,7 @@ def main():
             result = run_chains(
                 data, cfg, base_seed=BASE_SEED + split_id,
                 n_chains=args.n_chains, n_draws=args.n_draws, n_warmup=args.n_warmup,
-                collect_warmup=args.collect_warmup,
+                collect_warmup=args.collect_warmup, init_mode=args.init,
             )
             save_run(
                 out_path, dataset=ds, split_id=split_id, cfg=cfg, y_std=data["y_std"],

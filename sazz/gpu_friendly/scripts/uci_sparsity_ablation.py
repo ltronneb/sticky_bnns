@@ -1,23 +1,30 @@
 """
-
-Script for running a sweep across different PIW values
-Uses the same configs as uci_bnn_grid.py and runs only the sticky variants.
+Sweep the spike-and-slab prior inclusion weight (PIW) for the two sticky
+samplers, reusing uci_bnn_grid.py's config/data/target machinery.
 
 Usage:
     python -m sazz.gpu_friendly.scripts.uci_sparsity_ablation \\
         --datasets boston --splits 0 --hidden-variant small \\
-        --prior-inclusion-weight 0.1 0.3 0.5 0.7
+        --prior-inclusion-weight 0.1 0.3 0.5 0.7 --resume
 
     # cheap smoke test
     python -m sazz.gpu_friendly.scripts.uci_sparsity_ablation \\
         --datasets boston --splits 0 --n-skeleton 500
+
+Sigma_inv scale: this script pins a SINGLE flat scalar (SIGMA_INV_SCALE)
+applied to the whole reference precision vector -- it deliberately does NOT
+use uci_bnn_grid's per-(hidden_variant, dataset) cfg.sigma_inv_scale /
+_scaled_sigma_inv weight-block mechanism, so every cell of the sweep is
+tethered identically. SIGMA_INV_SCALE = 0.1 is the value the committed
+results/grid/uci_sparsity_ablation/ runs were produced under (Aug 24
+onwards); do not change it without re-running the whole sweep. Overridable
+per-run with --sigma-inv-scale.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-import math
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,7 +45,7 @@ from sazz.gpu_friendly.utils.resample import (
 from sazz.gpu_friendly.scripts.uci_bnn_grid import (
     DEVICE, DTYPE, N_SKELETON, BURNIN_FRAC, BASE_SEED,
     HIDDEN_VARIANTS, DEFAULT_HIDDEN_VARIANT, UCI_DATASETS,
-    SIGMA_INV_SCALE, GAMMA, REFRESH_RATE,
+    GAMMA, REFRESH_RATE,
     GRID_N_SEGMENTS, GRID_T_MAX_INIT_ZIGZAG, GRID_T_MAX_INIT_BOOM,
     GRID_ALPHA_PLUS, GRID_ALPHA_MINUS,
     GRID_STICKY_ZIGZAG_SPACING, GRID_STICKY_BOOM_SPACING,
@@ -46,9 +53,9 @@ from sazz.gpu_friendly.scripts.uci_bnn_grid import (
     thin_to,
 )
 
-# GRID_T_MAX_INIT_BOOM = 0.002
-# GRID_STICKY_BOOM_SPACING = 0.0002 #math.pi / 8
-# REFRESH_RATE = 1.0
+# Flat scalar on the ENTIRE Sigma_inv vector (see module docstring). Not
+# cfg.sigma_inv_scale; not _scaled_sigma_inv. Settable via --sigma-inv-scale.
+SIGMA_INV_SCALE = 0.1
 
 N_RESAMPLE = 50_000
 N_SAVE = 5_000
@@ -56,7 +63,7 @@ N_SAVE = 5_000
 SAMPLER_NAMES = ("grid_sticky_zigzag", "grid_sticky_boomerang")
 
 OUT_MAPS_DIR = Path("results/maps/uci_sparsity_ablation")
-OUT_DIR = Path("results/grid/uci_sparsity_ablation")
+OUT_DIR = Path("results/paper/uci_sparsity_ablation")
 
 
 def build_bm_only(data: dict[str, Any], cfg: BNNConfig, dtype=DTYPE, device=DEVICE) -> BayesianModule:
@@ -301,6 +308,8 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any], cfg: BNNCo
 
 
 def main():
+    global SIGMA_INV_SCALE
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -312,6 +321,10 @@ def main():
     parser.add_argument("--prior-inclusion-weight", nargs="+", type=float, default=[0.1],
                          help="Sticky-only spike-and-slab prior inclusion probability w"
                               "kappa = (w/(1-w))/(sigma_w*sqrt(2pi)).")
+    parser.add_argument("--sigma-inv-scale", type=float, default=SIGMA_INV_SCALE,
+                         help="Flat scalar on the whole reference Sigma_inv vector "
+                              f"(Boomerang only). Default {SIGMA_INV_SCALE} matches the "
+                              "committed results/grid/uci_sparsity_ablation/ runs.")
     parser.add_argument("--resume", action="store_true",
                          help="Skip a sampler run if its output .pt already exists.")
     parser.add_argument("--refit-maps", action="store_true",
@@ -319,6 +332,8 @@ def main():
     parser.add_argument("--out-maps", type=Path, default=OUT_MAPS_DIR)
     parser.add_argument("--out", type=Path, default=OUT_DIR)
     args = parser.parse_args()
+
+    SIGMA_INV_SCALE = args.sigma_inv_scale
 
     hidden = HIDDEN_VARIANTS[args.hidden_variant]
     out_maps_dir = args.out_maps if args.hidden_variant == DEFAULT_HIDDEN_VARIANT else args.out_maps / args.hidden_variant
@@ -332,16 +347,20 @@ def main():
     if missing:
         print(f"  (skipping {missing} -- data file(s) not found)")
     datasets_to_run = [d for d in args.datasets if d in raw]
+    input_dims = {ds: raw[ds][0].shape[1] for ds in datasets_to_run}
 
     print(f"\nRunning {datasets_to_run} | splits: {args.splits} | "
           f"hidden_variant={args.hidden_variant} ({hidden}) | "
           f"prior_inclusion_weight sweep={args.prior_inclusion_weight} | "
-          f"N_SKELETON={args.n_skeleton}")
+          f"SIGMA_INV_SCALE={SIGMA_INV_SCALE:g} | N_SKELETON={args.n_skeleton}")
 
-    # The MAP checkpoint doesn't depend on prior_inclusion_weight
+    # The MAP checkpoint doesn't depend on prior_inclusion_weight.
+    # configs_for wants the hidden_variant NAME (a str) -- it feeds it to
+    # sigma_inv_scale_for(variant, dataset), which does a dict lookup -- so
+    # pass args.hidden_variant, NOT `hidden` (the sizes list).
     for piw in args.prior_inclusion_weight:
-        cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden,
-                            prior_inclusion_weight=piw)
+        cfgs = configs_for(input_dims, hidden, hidden_variant=args.hidden_variant,
+                           prior_inclusion_weight=piw)
         print(f"\n=== prior_inclusion_weight={piw:g} ===")
         for ds in datasets_to_run:
             X, y = raw[ds]
