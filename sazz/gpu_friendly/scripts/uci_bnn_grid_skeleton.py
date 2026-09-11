@@ -299,6 +299,7 @@ def main():
     datasets_to_run = [d for d in args.datasets if d in raw]
 
     cfgs = configs_for({n: X.shape[1] for n, (X, _) in raw.items()}, hidden,
+                        args.hidden_variant,
                         prior_inclusion_weight=args.prior_inclusion_weight)
     for cfg in cfgs.values():
         cfg.activation = args.activation

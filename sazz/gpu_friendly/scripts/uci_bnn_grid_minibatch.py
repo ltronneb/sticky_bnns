@@ -1,19 +1,12 @@
 """
-Grid-bound Boomerang (Andral & Kamatani 2024) on UCI regression BNN benchmarks 
-Activation is tanh by default, as this is smooth
-.
+Minibatch ablation of sazz/gpu_friendly/scripts/uci_bnn_grid.py.
 
-Six samplers: "grid_zigzag", "grid_sticky_zigzag", "grid_boomerang",
-"grid_sticky_boomerang", "nuts", "nuts_horseshoe"
 
 Usage:
-    python -m sazz.gpu_friendly.scripts.uci_bnn_grid
-    python -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston
-    python -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston --splits 0
-    python -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston --splits 0 --samplers grid_boomerang
-    python -m sazz.gpu_friendly.scripts.uci_bnn_grid --samplers nuts nuts_horseshoe
-    
-python3 -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston energy naval --samplers nuts nuts_horseshoe
+    python -m sazz.gpu_friendly.scripts.uci_bnn_grid_minibatch --grad-batch-size 64
+    python -m sazz.gpu_friendly.scripts.uci_bnn_grid_minibatch --datasets boston --grad-batch-size 32
+    python -m sazz.gpu_friendly.scripts.uci_bnn_grid_minibatch --grad-batch-size 64 --samplers grid_sticky_boomerang
+    python -m sazz.gpu_friendly.scripts.uci_bnn_grid_minibatch --samplers nuts nuts_horseshoe   # full-batch reference
 """
 
 from __future__ import annotations
@@ -28,21 +21,23 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import torch
+from torch.distributions import Normal
 
 from sazz.gpu_friendly.models.neural_networks import FFN
 from sazz.gpu_friendly.models.model import BayesianModule
 from sazz.gpu_friendly.models.priors import (
     build_fan_in_prior_precision, build_kappa_from_inclusion, build_can_freeze_mask,
+    make_gaussian_prior,
 )
 from sazz.gpu_friendly.utils.warmup import find_reference_bnn, find_reference_bnn_ggn
 from sazz.gpu_friendly.utils.resample import (
     resample_zigzag_path_torch, resample_zigzag_path_sticky_torch,
     resample_boomerang_path_torch, resample_boomerang_path_sticky_torch,
 )
-from sazz.gpu_friendly.samplers.grid_zigzag import GridZigZagSampler
-from sazz.gpu_friendly.samplers.grid_sticky_zigzag import GridStickyZigZagSampler
-from sazz.gpu_friendly.samplers.grid_boomerang import GridBoomerangSampler
-from sazz.gpu_friendly.samplers.grid_sticky_boomerang import GridStickyBoomerangSampler
+from sazz.gpu_friendly.samplers.mb_grid_zigzag import MbGridZigZagSampler
+from sazz.gpu_friendly.samplers.mb_grid_sticky_zigzag import MbGridStickyZigZagSampler
+from sazz.gpu_friendly.samplers.mb_grid_boomerang import MbGridBoomerangSampler
+from sazz.gpu_friendly.samplers.mb_grid_sticky_boomerang import MbGridStickyBoomerangSampler
 
 
 
@@ -70,6 +65,13 @@ BASE_SEED   = 42
 # skeleton events / NUTS_DRAWS samples. None (default) reproduces today's
 # exact event-count-driven behavior in every runner below.
 GRAD_BUDGET: Optional[int] = None
+
+# If set (via --grad-batch-size), every grid-bound episode of the four grid
+# PDMP samplers draws a fresh random minibatch of this size from the
+# training set instead of the full training set -- see
+# build_minibatch_grad_target for the learned-noise-aware rescale. None
+# (default) => exact full-batch, reproducing uci_bnn_grid.py.
+GRAD_BATCH_SIZE: Optional[int] = None
 
 # Per-(hidden-variant, dataset) weight-block scale on the Boomerang reference
 # precision Sigma_inv (see _scaled_sigma_inv). Tuned so the grid bound stays
@@ -153,7 +155,7 @@ HIDDEN_VARIANTS = {
 }
 DEFAULT_HIDDEN_VARIANT = "small"
 
-OUT_DIR = Path("results/grid/uci_bnn")
+OUT_DIR = Path("results/paper/minibatch")
 
 UCI_DATASETS  = ("boston", "naval", "energy", "yacht", "concrete")
 SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "nuts_horseshoe")
@@ -308,11 +310,96 @@ def build_target(data: dict[str, Any], cfg: BNNConfig, dtype=DTYPE, device=DEVIC
 
 
 # ===========================================================================
-# Samplers
+# Minibatch gradient -- learned-noise-aware (UCI always learns noise; see
+# this module's docstring for why fast_mnist_cnn.py's otherwise-identical
+# helper can't be reused as-is here).
+# ===========================================================================
+
+def build_minibatch_grad_target(bm: BayesianModule, batch_size: int):
+    """
+    Returns (grad_target, resample_fn).
+
+    grad_target(x) differentiates the energy against whatever minibatch is
+    CURRENTLY cached (never a fresh draw per call) -- it must stay a fixed
+    function of x for one full _grid_bound episode, since the grid upper
+    bound is only valid if every eager and vmapped rate evaluation within
+    that episode sees the same rate function. resample_fn() -- a plain,
+    non-vmapped call -- draws a new minibatch and overwrites the cache in
+    place; the Mb* samplers call it once per sample() loop iteration,
+    immediately before _grid_bound (one fresh minibatch per Poisson-
+    thinning proposal).
+
+    Data log-likelihood term rescaled by N_full/batch_size (matches the
+    toy/CNN scripts' convention, keeping the energy's overall scale
+    comparable to the full-batch target this script's GAMMA/grid spacing
+    were tuned against). When bm.learns_noise (always true for UCI here),
+    the HalfNormal(prior_sigma_scale) prior on sigma is recomputed and
+    added UNSCALED -- it is a single prior term over the noise scale, not a
+    per-datapoint term, so it must not be multiplied by N_full/batch_size
+    the way the data term is. This is why bm.log_likelihood.single can't be
+    called directly and rescaled wholesale here (unlike
+    fast_mnist_cnn.py's Bernoulli/Categorical case, which has no such term
+    to separate out) -- the Normal(preds, sigma).log_prob(y) data term is
+    recomputed from scratch instead, mirroring likelihoods.py::
+    make_gaussian_likelihood's log_prob_single but splitting out the scale.
+
+    This is a raw subsampled-gradient PDMP with no exactness correction --
+    traded for throughput, not exact.
+    """
+    assert bm.learns_noise, (
+        "build_minibatch_grad_target assumes learned noise (UCI's "
+        "build_target always learns noise) -- fixed-noise models should "
+        "use toy_bnn_grid_minibatch.py's fixed-noise variant instead"
+    )
+    N_full = bm.X.shape[0]
+    scale = N_full / batch_size
+    log_prior_fn = make_gaussian_prior(bm.prior_precision)
+    prior_sigma_scale_t = torch.as_tensor(
+        bm.prior_sigma_scale, dtype=bm.X.dtype, device=bm.device,
+    )
+
+    idx0 = torch.randint(0, N_full, (batch_size,), device=bm.device)
+    cache = {"X": bm.X[idx0], "y": bm.y[idx0]}
+
+    def energy_minibatch(beta: torch.Tensor) -> torch.Tensor:
+        weights, log_sigma = beta[:-1], beta[-1]
+        sigma = log_sigma.exp()
+        preds = torch.func.functional_call(
+            bm.module, bm.param_dict_fn(weights), (cache["X"],),
+        ).squeeze(-1)
+        log_lik_batch = Normal(preds, sigma, validate_args=False).log_prob(cache["y"]).sum() * scale
+        # HalfNormal(prior_sigma_scale) on sigma, with Jacobian to log_sigma
+        # -- same term as likelihoods.py's log_prob_single, added once,
+        # unscaled (see docstring above for why).
+        log_sigma_prior = -0.5 * (sigma / prior_sigma_scale_t) ** 2 + log_sigma
+        return -(log_prior_fn(beta) + log_lik_batch + log_sigma_prior)
+
+    grad_target = torch.func.grad(energy_minibatch)
+
+    def resample_fn() -> None:
+        idx = torch.randint(0, N_full, (batch_size,), device=bm.device)
+        cache["X"] = bm.X[idx]
+        cache["y"] = bm.y[idx]
+
+    return grad_target, resample_fn
+
+
+def _grad_target_and_resample(bm: BayesianModule):
+    """Full-batch (GRAD_BATCH_SIZE None) or minibatch, chosen by the global."""
+    if GRAD_BATCH_SIZE is not None:
+        return build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
+    return torch.func.grad(bm.energy), None
+
+
+# ===========================================================================
+# Samplers -- Mb* classes with the resample_grad_batch hook wired from
+# _grad_target_and_resample. Otherwise identical construction to
+# uci_bnn_grid.py.
 # ===========================================================================
 def build_zigzag_sampler(bm: BayesianModule):
-    sampler = GridZigZagSampler(
-        grad_target=torch.func.grad(bm.energy),
+    grad_target, resample_grad_batch = _grad_target_and_resample(bm)
+    sampler = MbGridZigZagSampler(
+        grad_target=grad_target,
         D=bm.D,
         gamma=GAMMA,
         grid_t_max_init=GRID_T_MAX_INIT_ZIGZAG,
@@ -322,6 +409,7 @@ def build_zigzag_sampler(bm: BayesianModule):
         alpha_minus=GRID_ALPHA_MINUS,
         dtype=DTYPE,
         device=bm.device,
+        resample_grad_batch=resample_grad_batch,
     )
     return sampler
 
@@ -346,8 +434,9 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: BNNConfig):
         kappa = kappa_net
         can_freeze = can_freeze_net
 
-    sampler = GridStickyZigZagSampler(
-        grad_target=torch.func.grad(bm.energy),
+    grad_target, resample_grad_batch = _grad_target_and_resample(bm)
+    sampler = MbGridStickyZigZagSampler(
+        grad_target=grad_target,
         D=bm.D,
         kappa=kappa,
         can_freeze=can_freeze,
@@ -360,6 +449,7 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: BNNConfig):
         alpha_minus=GRID_ALPHA_MINUS,
         dtype=DTYPE,
         device=bm.device,
+        resample_grad_batch=resample_grad_batch,
     )
     return sampler
 
@@ -379,8 +469,9 @@ def _scaled_sigma_inv(Sigma_inv: torch.Tensor, bm: BayesianModule,
 
 def build_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
                              x_ref: torch.Tensor, Sigma_inv: torch.Tensor):
-    sampler = GridBoomerangSampler(
-        grad_target=torch.func.grad(bm.energy),
+    grad_target, resample_grad_batch = _grad_target_and_resample(bm)
+    sampler = MbGridBoomerangSampler(
+        grad_target=grad_target,
         D=bm.D,
         refresh_rate=REFRESH_RATE,
         grid_t_max_init=GRID_T_MAX_INIT_BOOM,
@@ -390,6 +481,7 @@ def build_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
         alpha_minus=GRID_ALPHA_MINUS,
         dtype=DTYPE,
         device=bm.device,
+        resample_grad_batch=resample_grad_batch,
     )
     sampler.preprocess(x_ref=x_ref,
                        Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm, cfg.sigma_inv_scale))
@@ -411,8 +503,9 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
         kappa = kappa_net
         can_freeze = can_freeze_net
 
-    sampler = GridStickyBoomerangSampler(
-        grad_target=torch.func.grad(bm.energy),
+    grad_target, resample_grad_batch = _grad_target_and_resample(bm)
+    sampler = MbGridStickyBoomerangSampler(
+        grad_target=grad_target,
         D=bm.D,
         kappa=kappa,
         can_freeze=can_freeze,
@@ -425,6 +518,7 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
         alpha_minus=GRID_ALPHA_MINUS,
         dtype=DTYPE,
         device=bm.device,
+        resample_grad_batch=resample_grad_batch,
     )
     sampler.preprocess(x_ref=x_ref,
                        Sigma_inv=_scaled_sigma_inv(Sigma_inv, bm, cfg.sigma_inv_scale))
@@ -747,7 +841,7 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
              bound_violations: int, gradient_evals: Optional[int] = None,
              grid_t_max_log: Optional[list[float]] = None,
              grad_budget: Optional[int] = "unset",
-             grad_batch_size: Optional[int] = None) -> None:
+             grad_batch_size: Optional[int] = "unset") -> None:
     # "unset" sentinel (not None): lets a caller explicitly pass
     # grad_budget=None to record "definitely no budget," distinct from
     # "caller didn't say, fall back to the module-level GRAD_BUDGET global"
@@ -756,13 +850,11 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
     # same global (rather than requiring every one of the ~10 call sites
     # to pass it explicitly) keeps this provenance field accurate with a
     # single point of truth, not ten places that could drift out of sync.
+    # Same idea for grad_batch_size, extended from toy_bnn_grid_minibatch.py.
     if grad_budget == "unset":
         grad_budget = GRAD_BUDGET
-    # grad_batch_size has no module-level global on THIS script (this
-    # script itself is always full-batch) -- it's a plain default-None
-    # passthrough, present only so callers that DO minibatch (e.g.
-    # deep_wide_uci.py's --grad-batch-size) can record it on this payload
-    # without this script needing its own notion of the concept.
+    if grad_batch_size == "unset":
+        grad_batch_size = GRAD_BATCH_SIZE
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "dataset":           dataset,
@@ -927,6 +1019,7 @@ def run_nuts_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
         elapsed_sec=elapsed, n_events=samples.shape[0], bound_violations=0,
         gradient_evals=gradient_evals,
+        grad_batch_size=None,  # NUTS is always full-batch here
     )
     print(f"      saved {samples.shape[0]} samples -> {out_path}")
 
@@ -946,6 +1039,7 @@ def run_nuts_horseshoe_dataset(dataset_name: str, split_id: int, data: dict[str,
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
         elapsed_sec=elapsed, n_events=samples.shape[0], bound_violations=0,
         gradient_evals=gradient_evals,
+        grad_batch_size=None,  # NUTS-HS is always full-batch here
     )
     print(f"      saved {samples.shape[0]} samples -> {out_path}")
 
@@ -965,7 +1059,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
     print(f"\n--- {dataset_name.upper()} split {split_id:02d} | "
           f"layers={cfg.layer_sizes} | act={cfg.activation} | "
           f"noise=learned (HalfNormal scale={cfg.prior_sigma_scale:.4f}) | "
-          f"seed={BASE_SEED + split_id} ---")
+          f"seed={BASE_SEED + split_id} | grad_batch_size={GRAD_BATCH_SIZE} ---")
 
     sd = split_dir(out_dir, dataset_name, split_id)
 
@@ -1003,7 +1097,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 # ===========================================================================
 
 def main():
-    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET, REFERENCE
+    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET, GRAD_BATCH_SIZE, REFERENCE
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1056,11 +1150,25 @@ def main():
                               "frozen longer -- reduces the effective active-D the sticky samplers "
                               "spend skeleton events resolving. Only affects grid_sticky_zigzag/"
                               "grid_sticky_boomerang; plain grid_zigzag/grid_boomerang/NUTS ignore it.")
+    parser.add_argument("--grad-batch-size", type=int, default=None,
+                         help="If set, every grid-bound episode of the four grid PDMP samplers "
+                              "is served from a fresh random minibatch of this size (drawn from "
+                              "the training set) instead of the full training set -- a "
+                              "statistically uncorrected subsampled-gradient PDMP, matching what "
+                              "fast_mnist_cnn.py/fast_cifar_resnet.py and toy_bnn_grid_minibatch.py "
+                              "do (see build_minibatch_grad_target's docstring for the "
+                              "learned-noise-aware rescale this script needs that those don't). "
+                              "None (default) preserves exact full-batch behavior, reproducing "
+                              "uci_bnn_grid.py. For an apples-to-apples ablation, run "
+                              "uci_bnn_grid.py (or this script with --grad-batch-size unset) for "
+                              "the full-batch reference and this script with --grad-batch-size B "
+                              "for the minibatch arm, same --datasets/--splits/--hidden-variant.")
     args = parser.parse_args()
 
     N_SKELETON = args.n_skeleton
     N_RESAMPLE = args.n_resample
     GRAD_BUDGET = args.grad_budget
+    GRAD_BATCH_SIZE = args.grad_batch_size
     REFERENCE = args.reference
 
     hidden = HIDDEN_VARIANTS[args.hidden_variant]
@@ -1090,7 +1198,8 @@ def main():
           f"prior_inclusion_weight={args.prior_inclusion_weight} "
           f"reference={REFERENCE} "
           f"sigma_inv_scale[{scale_str}] "
-          f"log_sigma_prec_scale={SIGMA_LOGSIGMA_PREC_SCALE}")
+          f"log_sigma_prec_scale={SIGMA_LOGSIGMA_PREC_SCALE} "
+          f"grad_batch_size={GRAD_BATCH_SIZE}")
     for ds in datasets_to_run:
         X, y = raw[ds]
         cfg = cfgs[ds]
