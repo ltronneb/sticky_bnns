@@ -1,19 +1,25 @@
 """
 
-Two analyses, LeNet5 / MNIST:
+Two analyses, FFN / MNIST -- counterpart to analyze_lenet_mnist_paper.py.
+The FFN is a plain fully-connected net (`FFN`, `LAYER_SIZES = [784, 256,
+256, 10]`, relu, no BatchNorm, no conv/pool layers).
 
   A. PREDICTIVE QUALITY & CALIBRATION on clean MNIST, MAP vs posterior:
      accuracy / NLL / ECE / Brier / entropy + reliability diagram + entropy
      split (correct vs wrong).
 
   B. STRUCTURED-SPARSITY LEDGER: per-layer survival ("ever non-zero" vs
-     "non-zero in every draw"), conv-filter / (filter,in-channel) death
-     with posterior probability 1, accuracy vs sparsity vs the MAP, and
+     "non-zero in every draw"), accuracy vs sparsity vs the MAP, and
      per-layer posterior displacement from MAP in prior-std units on the
-     non-frozen coordinates.
+     non-frozen coordinates. In place of LeNet5's conv-filter death, the
+     FFN's structural analog is DEAD UNITS: hidden rows of `layers.0.
+     weight`/`layers.1.weight` (and output rows of `layers.2.weight`) that
+     are all-zero in every posterior draw -- a whole neuron switched off
+     with posterior probability 1 -- plus dead INPUT COLUMNS of
+     `layers.0.weight` (pixels the first layer ignores entirely).
 
-Plus the ROTATION / PIXEL-NOISE corruption sweep from lenet_pixel_noise.ipynb
-(shared with analyze_ffn_mnist_paper.py via notebooks/utils/image_nets.py):
+Plus the ROTATION / PIXEL-NOISE corruption sweep from ffn_pixel_noise.ipynb
+(shared with analyze_lenet_mnist_paper.py via notebooks/utils/image_nets.py):
 accuracy / P(true) / confidence / entropy under rotation and additive pixel
 noise, pooled over a handful of digit classes.
 
@@ -65,48 +71,48 @@ else:
 DTYPE = torch.float32
 print("device:", DEVICE)
 
-RUN_DIR = Path("results/paper/mnist_cnn/split_00")
+RUN_DIR = Path("results/paper/ffn_mnist")
 RUN_SPECS = [
     ("zigzag", "grid_sticky_zigzag.pt"),
     ("boomerang", "grid_sticky_boomerang.pt"),
 ]
 RUN_DISPLAY = {"zigzag": "Sticky Zig-Zag", "boomerang": "Sticky Boomerang"}
 
-# 88.8%-sparse pruned+refit MAP -- verified below to bit-match both runs.
-MAP_REF_PATH = Path("results/maps/lenet_reference_N60000_pruned_refit_N60k.pt")
+# pruned+refit MAP -- verified below to bit-match both runs.
+MAP_REF_PATH = Path("results/maps/ffn_mnist_reference_N60000_steps10000_pruned_refit_tol03_longrefit.pt")
 
-# Plain SGD baseline (lenet_sgd.py) -- genuinely unrelated to MAP_REF_PATH's
+# Plain SGD baseline (ffn_sgd.py) -- genuinely unrelated to MAP_REF_PATH's
 # pruned+refit x_ref: no prior term, no pruning, dense weights throughout.
 # This is the frequentist reference the noise sweep needs to play the role
 # Izmailov et al. (2021) Fig 15's "SGD" curve plays, since the MAP point is
 # a pruned/refit object and not a fair stand-in for it.
-SGD_REF_PATH = Path("results/maps/lenet_sgd_N60000_epochs40.pt")
+SGD_REF_PATH = Path("results/maps/ffn_sgd_N60000_epochs40.pt")
 
-# Prior hyper-params the run used (fast_mnist_cnn.py defaults).
+# Prior hyper-params the run used (ffn_mnist_reference.py defaults).
 PRIOR_STD_W = 2.0
 PRIOR_STD_B = 2.0
 FAN_IN_SCALING = True
 BASE_SEED = 42
-ACTIVATION = "relu"
-POOL = "max"        # overridden from the checkpoint below if it disagrees
+ACTIVATION = "relu"       # overridden from the checkpoint below if it disagrees
+LAYER_SIZES = [28 * 28, 256, 256, 10]
 
-N_PRED_DRAWS = 300  # LeNet forwards are cheap; 300 draws is fine
+N_PRED_DRAWS = 300  # FFN forwards are cheap; 300 draws is fine
 N_TEST = 1000
 ZERO_TOL = 1e-8
 
 MNIST_MEAN, MNIST_STD = 0.1307, 0.3081
 
-# --- rotation / noise sweep config (ported from lenet_pixel_noise.ipynb) ---
+# --- rotation / noise sweep config (ported from ffn_pixel_noise.ipynb) ---
 CLASSES = [0, 2, 4, 6, 8]
 N_PER_CLASS = 1_000
 N_DRAWS_POOL = 500
 POOL_SEED = 0
 NOISE_SEED = 12345
-ANGLES = [0, 15]#, 30, 45, 60, 90, 120, 150, 180]
-SIGMAS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0]
+ANGLES = [0, 15, 30, 45, 60, 90, 120, 150, 180]
+SIGMAS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0]#, 4.0, 5.0, 7.0, 10.0]
 SAMPLER_COLORS = {"zigzag": "#4C72B0", "boomerang": "#DD8452"}
 
-SAVE_DIR = Path("results/plots/MNIST_CNN/")
+SAVE_DIR = Path("results/plots/MNIST_FFN/")
 # SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 plt.rcParams.update({
@@ -121,9 +127,8 @@ plt.rcParams.update({
 # ==========================================================================
 runs = inet.load_runs(RUN_DIR, RUN_SPECS)
 
-# pick up pool/activation from the checkpoint (authoritative)
+# pick up activation from the checkpoint (authoritative)
 _ck0 = next(iter(runs.values()))
-POOL = _ck0["pool"]
 ACTIVATION = _ck0["activation"]
 
 map_ck = torch.load(MAP_REF_PATH, map_location="cpu", weights_only=False)
@@ -143,34 +148,32 @@ print(f"  train_acc={sgd_ck['train_acc']:.4f}  test_acc={sgd_ck['test_acc']:.4f}
 
 # %%
 # ==========================================================================
-# 2. Layer map + priors  (LeNet5 fixed architecture)
+# 2. Layer map + priors  (FFN fixed architecture)
 # ==========================================================================
-LENET5_SHAPES = [
-    ("conv1.weight", (6, 1, 5, 5)), ("conv1.bias", (6,)),
-    ("conv2.weight", (16, 6, 5, 5)), ("conv2.bias", (16,)),
-    ("fc1.weight", (120, 400)), ("fc1.bias", (120,)),
-    ("fc2.weight", (84, 120)), ("fc2.bias", (84,)),
-    ("fc3.weight", (10, 84)), ("fc3.bias", (10,)),
+FFN_SHAPES = [
+    ("layers.0.weight", (256, 784)), ("layers.0.bias", (256,)),
+    ("layers.1.weight", (256, 256)), ("layers.1.bias", (256,)),
+    ("layers.2.weight", (10, 256)), ("layers.2.bias", (10,)),
 ]
-assert sum(int(np.prod(s)) for _, s in LENET5_SHAPES) == D == 61706
+assert sum(int(np.prod(s)) for _, s in FFN_SHAPES) == D == 269322
 
 rows, idx = [], 0
 layer_slices = {}
-for name, shape in LENET5_SHAPES:
+for name, shape in FFN_SHAPES:
     n = int(np.prod(shape))
     layer_slices[name] = (idx, idx + n)
-    kind = "bias" if len(shape) == 1 else ("conv" if name.startswith("conv") else "fc")
+    kind = "bias" if len(shape) == 1 else "fc"
     rows.append({"layer": name, "kind": kind, "shape": shape, "start": idx, "stop": idx + n})
     idx += n
 layer_df = pd.DataFrame(rows)
 LAYERS = [r["layer"] for r in rows]
-CONV_LAYERS = [r["layer"] for r in rows if r["kind"] == "conv"]
+FC_WEIGHT_LAYERS = [r["layer"] for r in rows if r["kind"] == "fc"]
 
-# Fan-in prior precision, same builder the LeNet target used.
-from sazz.gpu_friendly.models.neural_networks import LeNet5
+# Fan-in prior precision, same builder the FFN target used.
+from sazz.gpu_friendly.models.neural_networks import FFN
 from sazz.gpu_friendly.models.priors import build_fan_in_prior_precision
 
-_ref_module = LeNet5(activation=ACTIVATION, pool=POOL)
+_ref_module = FFN(LAYER_SIZES, activation=ACTIVATION)
 assert sum(p.numel() for p in _ref_module.parameters()) == D
 prior_prec = build_fan_in_prior_precision(
     _ref_module, PRIOR_STD_W, PRIOR_STD_B, FAN_IN_SCALING,
@@ -179,7 +182,7 @@ prior_prec = build_fan_in_prior_precision(
 prior_std = prior_prec.clamp(min=1e-12).rsqrt().cpu().numpy()
 
 print(layer_df.to_string(index=False))
-print("conv layers:", CONV_LAYERS)
+print("fc layers:", FC_WEIGHT_LAYERS)
 
 
 # %%
@@ -203,14 +206,15 @@ print("X_test:", tuple(X_test.shape), " class balance:",
 from sazz.gpu_friendly.models.model import BayesianModule
 from sazz.gpu_friendly.models.priors import build_fan_in_prior_precision as _bpr
 
-_module = LeNet5(activation=ACTIVATION, pool=POOL).to(dtype=DTYPE, device=DEVICE)
+_module = FFN(LAYER_SIZES, activation=ACTIVATION).to(dtype=DTYPE, device=DEVICE)
 _module.eval()
 _prec_dev = _bpr(_module, PRIOR_STD_W, PRIOR_STD_B, FAN_IN_SCALING, dtype=DTYPE, device=DEVICE)
 _bm = BayesianModule.build(_module, likelihood="categorical",
-                           X=X_test[:2].to(DEVICE), y=y_test[:2].to(DEVICE),
+                           X=torch.flatten(X_test[:2], 1).to(DEVICE),
+                           y=y_test[:2].to(DEVICE),
                            prior_precision=_prec_dev, dtype=DTYPE, device=DEVICE)
 
-predict_probs = inet.make_predict_probs(_bm, DTYPE, DEVICE, flatten=False)
+predict_probs = inet.make_predict_probs(_bm, DTYPE, DEVICE, flatten=True)
 posterior_mean_probs = inet.make_posterior_mean_probs(predict_probs)
 
 
@@ -242,27 +246,9 @@ print(clean_df.to_string(float_format=lambda v: f"{v:.4f}"))
 # clean_df.to_csv(SAVE_DIR / "tableA_clean_metrics.csv")
 
 
-# %%
-# --- FIGURE A1: reliability diagram ---
-# fig, ax = plt.subplots(figsize=(5.2, 5))
-# ax.plot([0, 1], [0, 1], "k:", lw=1, label="perfect")
-# for name, d in clean_probs.items():
-#     disp = name if name == "MAP" else RUN_DISPLAY.get(name, name)
-#     m = inet.calibration_metrics(y_test, d["post_mean"])
-#     if not m["bin_stats"]:
-#         continue
-#     bc, ba, _ = zip(*m["bin_stats"])
-#     ax.plot(bc, ba, marker="o", ms=5, label=f"{disp} (ECE={m['ece']:.3f})")
-# ax.set(xlabel="confidence", ylabel="empirical accuracy",
-#        title="Reliability -- LeNet5 / MNIST", xlim=(0, 1), ylim=(0, 1))
-# ax.legend(fontsize=9)
-# fig.tight_layout()
-# plt.show()
-# fig.savefig(SAVE_DIR / "figA1_reliability.pdf", bbox_inches="tight")
-
 
 # %%
-# --- FIGURE A2: predictive entropy, correct vs wrong ---
+# --- FIGURE A: predictive entropy, correct vs wrong ---
 fig, axes = plt.subplots(1, len(runs), figsize=(5.2 * len(runs), 4), squeeze=False)
 for ax, (label, _) in zip(axes[0], runs.items()):
     mp = clean_probs[label]["post_mean"]
@@ -275,6 +261,7 @@ for ax, (label, _) in zip(axes[0], runs.items()):
     ax.legend()
 fig.tight_layout()
 plt.show()
+plt.close()
 # fig.savefig(SAVE_DIR / "figA2_entropy_split.pdf", bbox_inches="tight")
 
 
@@ -295,31 +282,40 @@ plt.show()
 # fig = inet.plot_layer_survival(c1_df, ledgers, RUN_DISPLAY, LAYERS,
 #                                "Per-layer weight survival under the sticky-PDMP posterior")
 # plt.show()
-# fig.savefig(SAVE_DIR / "figB1_layer_survival.pdf", bbox_inches="tight")
+# # fig.savefig(SAVE_DIR / "figB1_layer_survival.pdf", bbox_inches="tight")
 
 
 # %%
-# --- B2: conv-filter / (filter, in-channel) death with posterior prob 1 ---
+# --- B2: dead UNITS with posterior prob 1 (FFN's structural analog of
+#         LeNet5's dead conv filters). For each weight layer [out, in]:
+#   dead_output_units -- a hidden unit / output logit whose entire incoming
+#                         weight row is zero in EVERY draw: that unit's
+#                         pre-activation is input-independent (constant, set
+#                         by its bias alone) with posterior probability 1 --
+#                         a whole neuron switched off.
+#   dead_input_units  -- (layers.0.weight only) a column, i.e. an input
+#                         pixel, that is zero in every draw for every hidden
+#                         unit: the network provably never reads that pixel.
 # c2_rows = []
 # for label, ck in runs.items():
 #     s = ck["samples"]
-#     for lname in CONV_LAYERS:
+#     for lname in FC_WEIGHT_LAYERS:
 #         a, b = layer_slices[lname]
-#         shp = dict(_ref_module.named_parameters())[lname].shape   # [out,in,kh,kw]
+#         shp = dict(_ref_module.named_parameters())[lname].shape   # [out, in]
 #         w = s[:, a:b].reshape(s.shape[0], *shp)
 #         wz = (w.abs() < ZERO_TOL)
-#         filt_dead = wz.all(dim=(0, 2, 3, 4))
-#         slab_dead = wz.all(dim=(0, 3, 4))
+#         row_dead = wz.all(dim=(0, 2))      # [out] -- dead output units
+#         col_dead = wz.all(dim=(0, 1))      # [in]  -- dead input units
 #         c2_rows.append({
 #             "run": RUN_DISPLAY[label], "layer": lname,
-#             "out_ch": shp[0], "in_ch": shp[1],
-#             "dead_filters": int(filt_dead.sum()), "dead_filter_frac": filt_dead.float().mean().item(),
-#             "dead_slabs": int(slab_dead.sum()), "dead_slab_frac": slab_dead.float().mean().item(),
+#             "out": shp[0], "in": shp[1],
+#             "dead_output_units": int(row_dead.sum()), "dead_output_frac": row_dead.float().mean().item(),
+#             "dead_input_units": int(col_dead.sum()), "dead_input_frac": col_dead.float().mean().item(),
 #         })
 # c2_df = pd.DataFrame(c2_rows)
-# print("\n=== Analysis B2: structured death (posterior prob 1) ===")
+# print("\n=== Analysis B2: dead units (posterior prob 1) ===")
 # print(c2_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-# c2_df.to_csv(SAVE_DIR / "tableB2_structured_death.csv", index=False)
+# c2_df.to_csv(SAVE_DIR / "tableB2_dead_units.csv", index=False)
 
 
 # %%
@@ -327,11 +323,11 @@ plt.show()
 # c3_df = inet.accuracy_vs_sparsity_table(clean_df, X_REF, runs, RUN_DISPLAY, ZERO_TOL)
 # print("\n=== Analysis B3: accuracy vs sparsity ===")
 # print(c3_df.to_string(float_format=lambda v: f"{v:.4f}"))
-# # c3_df.to_csv(SAVE_DIR / "tableB3_acc_vs_sparsity.csv")
+# c3_df.to_csv(SAVE_DIR / "tableB3_acc_vs_sparsity.csv")
 
 
-# # %%
-# # --- B4: per-layer posterior displacement from MAP (non-frozen coords) ---
+# %%
+# --- B4: per-layer posterior displacement from MAP (non-frozen coords) ---
 # c4_df = inet.displacement_table(runs, ledgers, RUN_DISPLAY, LAYERS, layer_slices,
 #                                 X_REF, prior_std, D)
 # print("\n=== Analysis B4: posterior displacement from MAP (moving coords) ===")
@@ -347,8 +343,8 @@ plt.show()
 # %%
 # ==========================================================================
 # ANALYSIS C -- rotation / pixel-noise corruption sweep
-#   (ported from lenet_pixel_noise.ipynb; MAP flows through as a 1-draw
-#   point estimate so it renders on the same axes as the samplers)
+#   (ported from ffn_pixel_noise.ipynb; MAP flows through as a 1-draw point
+#   estimate so it renders on the same axes as the samplers)
 # ==========================================================================
 sweep_runs = dict(runs)
 sweep_runs["map"] = {"samples": X_REF.unsqueeze(0)}
@@ -374,16 +370,24 @@ noi_levels, noi_spans, noi_X, noi_agg = inet.run_shift_sweep(
 print(f"[rotation] {len(sweep_runs)} models x {len(CLASSES)} digits x {len(ANGLES)} levels")
 print(f"[noise]    {len(sweep_runs)} models x {len(CLASSES)} digits x {len(SIGMAS)} levels")
 
+noise_table = pd.DataFrame(
+    {SWEEP_DISPLAY.get(lbl, lbl): [noi_agg[lbl][("pool", lv)]["acc"] for lv in SIGMAS]
+     for lbl in sweep_runs},
+    index=[f"sigma={lv:g}" for lv in SIGMAS],
+)
+print("\n=== Pooled test accuracy vs Gaussian noise sigma (raw [0,1]-pixel units) ===")
+print(noise_table.to_string(float_format=lambda v: f"{v:.3f}"))
+
 
 # %%
 # fig = inet.shift_figure("noise", noi_levels, noi_agg, sweep_runs, SWEEP_DISPLAY, CLASSES,
-#                         xlabel=r"Pixel-noise $\sigma$", title="MNIST LeNet5 under pixel noise",
+#                         xlabel=r"Pixel-noise $\sigma$", title="MNIST FFN under pixel noise",
 #                         point_labels=("map", "sgd"))
 # plt.show()
 # # fig.savefig(SAVE_DIR / "MNIST_noise_paper.pdf", bbox_inches="tight")
 
 # fig = inet.shift_figure("rotation", rot_levels, rot_agg, sweep_runs, SWEEP_DISPLAY, CLASSES,
-#                         xlabel="Rotation (degrees)", title="MNIST LeNet5 under rotation",
+#                         xlabel="Rotation (degrees)", title="MNIST FFN under rotation",
 #                         point_labels=("map", "sgd"))
 # plt.show()
 # fig.savefig(SAVE_DIR / "MNIST_rotation_paper.pdf", bbox_inches="tight")
@@ -395,7 +399,7 @@ print(f"[noise]    {len(sweep_runs)} models x {len(CLASSES)} digits x {len(SIGMA
 #     on one axis, directly comparable in spirit to their SGD-vs-HMC plot.
 fig = inet.paper_style_figure(
     noi_levels, noi_agg, SWEEP_DISPLAY, SWEEP_COLORS,
-    xlabel=r"Noise Scale $\sigma$", #title="MNIST LeNet5: robustness to pixel noise",
+    xlabel=r" Noise Scale $\sigma$", #title="MNIST FFN: robustness to pixel noise",
     point_labels=("map", "sgd"), order=["sgd", "map", "zigzag", "boomerang"],
 )
 plt.show()
@@ -403,17 +407,17 @@ fig.savefig(SAVE_DIR / "MNIST_noise_paperstyle.pdf", bbox_inches="tight")
 
 
 # %%
-# fig = inet.bar_grid_appendix("noise", [0.0, 0.3, 0.5, 0.7, 1.0, 1.5], noi_agg,
+# fig = inet.bar_grid_appendix("noise", noi_levels, noi_agg,
 #                              sweep_runs, SWEEP_DISPLAY, CLASSES, SWEEP_COLORS,
 #                              point_labels=("map", "sgd"))
 # plt.show()
 # # fig.savefig(SAVE_DIR / "MNIST_noise_bars_appendix.pdf", bbox_inches="tight")
 
-# fig = inet.bar_grid_appendix("rotation", [0, 15, 30, 45, 90, 120, 180], rot_agg,
+# fig = inet.bar_grid_appendix("rotation", rot_levels, rot_agg,
 #                              sweep_runs, SWEEP_DISPLAY, CLASSES, SWEEP_COLORS,
 #                              point_labels=("map", "sgd"))
 # plt.show()
-# # fig.savefig(SAVE_DIR / "MNIST_rotation_bars_appendix.pdf", bbox_inches="tight")
+# fig.savefig(SAVE_DIR / "MNIST_rotation_bars_appendix.pdf", bbox_inches="tight")
 
 
 # %%
@@ -421,7 +425,7 @@ fig.savefig(SAVE_DIR / "MNIST_noise_paperstyle.pdf", bbox_inches="tight")
 # 5. One-screen summary for the paper's text
 # ==========================================================================
 # print("\n" + "=" * 70)
-# print("SUMMARY -- numbers to quote (LeNet5 / MNIST)")
+# print("SUMMARY -- numbers to quote (FFN / MNIST)")
 # print("=" * 70)
 # mrow = clean_df.loc["MAP (pruned x_ref)"]
 # print(f"\nMAP (pruned x_ref): acc={mrow['acc']:.3f}  NLL={mrow['nll']:.3f}  "
@@ -439,9 +443,9 @@ fig.savefig(SAVE_DIR / "MNIST_noise_paperstyle.pdf", bbox_inches="tight")
 #     print(f"  weight sparsity: per-draw {per_draw:.3f}  |  zero in EVERY draw "
 #           f"{L['always_zero'].mean():.3f} ({int(L['always_zero'].sum()):,}/{D:,})  |  "
 #           f"churning {churn:.3f}")
-#     dead_f = c2_df[c2_df['run'] == name]['dead_filters'].sum()
-#     tot_f = c2_df[c2_df['run'] == name]['out_ch'].sum()
-#     print(f"  conv filters dead w.p. 1: {dead_f} / {tot_f}")
+#     dead_u = c2_df[c2_df['run'] == name]['dead_output_units'].sum()
+#     tot_u = c2_df[c2_df['run'] == name]['out'].sum()
+#     print(f"  hidden/output units dead w.p. 1: {dead_u} / {tot_u}")
 #     sev3_noise = noi_agg[label][("pool", SIGMAS[-1])]
 #     print(f"  noise sigma={SIGMAS[-1]:g}: acc={sev3_noise['acc']:.3f}  "
 #           f"conf={sev3_noise['conf']:.3f}  entropy={sev3_noise['entropy']:.3f}")

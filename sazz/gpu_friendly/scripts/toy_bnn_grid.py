@@ -114,6 +114,14 @@ GRID_STICKY_COLD_START_THRESHOLD = None
 
 N_SAVE = 8_000  # matches the existing results/toy_bnns/*/split_00/*.pt files
 
+# If set (via --save-skeleton), every grid sampler also saves its raw
+# skeleton (positions/velocities/times, pre-resampling) alongside the
+# resampled draws, so a downstream notebook can reconstruct the actual
+# continuous PDMP trajectory instead of only seeing i.i.d.-looking
+# resampled draws. Off by default -- existing runs/output are unaffected.
+SAVE_SKELETON: bool = False
+SKELETON_OUT_DIR = Path("results/toy_bnns/skeletons/fullbatch")
+
 NUTS_DRAWS  = 2_000
 NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
@@ -566,6 +574,33 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
     }, out_path)
 
 
+def save_skeleton(dataset: str, split_id: int, sampler: str, result: dict,
+                   x_ref: Optional[torch.Tensor] = None) -> None:
+    """Raw pre-resampling skeleton (positions/velocities/times), for
+    reconstructing the actual continuous PDMP trajectory downstream --
+    same payload shape as uci_bnn_grid_skeleton.py's save_skeleton, minus
+    the UCI-only diagnostics/grid_t_max_log fields this script doesn't
+    track per-event. Only called when SAVE_SKELETON is set."""
+    out_path = split_dir(SKELETON_OUT_DIR, dataset, split_id) / f"{sampler}_skeleton.pt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "dataset": dataset,
+        "split_id": split_id,
+        "sampler": sampler,
+        "positions": result["positions"].cpu(),
+        "velocities": result["velocities"].cpu(),
+        "times": result["times"].cpu(),
+        "bound_violations": result["bound_violations"],
+        "gradient_evals": result.get("gradient_evals"),
+    }
+    if x_ref is not None:
+        payload["x_ref"] = x_ref.cpu()
+    if "frozen_mask_final" in result:
+        payload["frozen_mask_final"] = result["frozen_mask_final"].cpu()
+    torch.save(payload, out_path)
+    print(f"      saved skeleton ({result['positions'].shape[0]} events) -> {out_path}")
+
+
 # ===========================================================================
 # Per-dataset run -- each runner below does its own BayesianModule build
 # (MAP + Laplace), independently seeded; nuts only needs cfg/data/seed.
@@ -586,6 +621,9 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
     t0 = time.perf_counter()
     result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
+
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_zigzag", result, x_ref=x_ref)
 
     samples = resample_zigzag_path_torch(
         result["positions"], result["velocities"], result["times"],
@@ -627,6 +665,9 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
     result = sampler.sample(N=N_SKELETON, x0=x_ref, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_sticky_zigzag", result, x_ref=x_ref)
+
     samples = resample_zigzag_path_sticky_torch(
         result["positions"], result["velocities"], result["times"],
         N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
@@ -666,6 +707,9 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
     result = sampler.sample(N=N_SKELETON, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
 
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_boomerang", result, x_ref=x_ref)
+
     samples = resample_boomerang_path_torch(
         result["positions"], result["velocities"], result["times"], x_ref,
         N_resample=N_RESAMPLE, burnin_frac=BURNIN_FRAC,
@@ -701,6 +745,9 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     t0 = time.perf_counter()
     result = sampler.sample(N=N_SKELETON, diagnostics=True, grad_budget=GRAD_BUDGET)
     elapsed = time.perf_counter() - t0
+
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_sticky_boomerang", result, x_ref=x_ref)
 
     samples = resample_boomerang_path_sticky_torch(
         result["positions"], result["velocities"], result["times"], x_ref,
@@ -796,7 +843,7 @@ def run_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
 # ===========================================================================
 
 def main():
-    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET
+    global N_SKELETON, N_RESAMPLE, GRAD_BUDGET, SAVE_SKELETON
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -804,6 +851,12 @@ def main():
     )
     parser.add_argument("--datasets", nargs="+", default=list(TOY_DATASETS),
                          choices=list(TOY_DATASETS))
+    parser.add_argument("--save-skeleton", action="store_true",
+                         help="Also save each grid sampler's raw skeleton "
+                              "(positions/velocities/times, pre-resampling) to "
+                              f"{SKELETON_OUT_DIR}/<dataset>/split_XX/<sampler>_skeleton.pt "
+                              "-- lets a downstream notebook reconstruct the actual "
+                              "continuous PDMP trajectory. Off by default.")
     parser.add_argument("--samplers", nargs="+", default=list(SAMPLER_NAMES),
                          choices=list(SAMPLER_NAMES))
     parser.add_argument("--splits", nargs="+", type=int, default=[0])
@@ -831,6 +884,7 @@ def main():
     N_SKELETON = args.n_skeleton
     N_RESAMPLE = args.n_resample
     GRAD_BUDGET = args.grad_budget
+    SAVE_SKELETON = args.save_skeleton
 
     args.out.mkdir(parents=True, exist_ok=True)
 
