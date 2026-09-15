@@ -1,35 +1,26 @@
 """
-ZigZag sampler using ONLY the grid-based upper bound (Andral & Kamatani
-2024) for Poisson thinning. Not a subclass of
-sazz.samplers.AutomaticZigZagSampler -- independent copy, kept isolated
-from sazz/samplers/, mirroring grid_boomerang.py's isolation convention.
+ZigZag sampler using the grid-based upper bound (Andral & Kamatani 2024)
+for Poisson thinning. Independent copy, not a subclass of
+sazz.samplers.AutomaticZigZagSampler -- mirrors grid_boomerang.py's
+isolation convention.
 
-Differs fundamentally from grid_boomerang.py in how the bound is built:
-ZigZag's rate lambda_ZZ(t) = sum_j (grad_j U(x_t) * v_j)_+ + D*gamma is a SUM
-of D independently-kinked per-coordinate terms, not Boomerang's single
-smooth signed inner product (Andral & Kamatani Section 4.4.2). Naively
-bounding the aggregate signed sum fails (coordinates can cancel and hide
-curvature), so this sampler builds a per-coordinate Algorithm-2 bound for
-every coordinate (batched via one shared vmap(jvp(...)) call across all D
-coordinates and every grid time simultaneously -- see
-_make_rate_and_grad_fn), then sums the per-coordinate bounds via
-grid_bound.build_grid_bound_vectorized. The resulting scalar
-piecewise-constant bound feeds the SAME single shared Poisson thinning
-process (grid_bound.grid_thinning) that grid_boomerang.py already uses,
-via its bound_fn/rate_offset hooks -- only the bound CONSTRUCTION differs
-per PDMP; the thinning/Section-4.7/Algorithm-4 machinery is shared exactly.
+Differs from grid_boomerang.py only in how the bound is built: ZigZag's
+rate lambda_ZZ(t) = sum_j (grad_j U(x_t) * v_j)_+ + D*gamma is a sum of D
+independently-kinked per-coordinate terms, not one smooth signed inner
+product, so naively bounding the aggregate sum fails (coordinates can
+cancel and hide curvature). Instead, each coordinate gets its own
+Algorithm-2 tangent-line bound (batched via one shared vmap(jvp(...))
+call, see _make_rate_and_grad_fn), summed via
+grid_bound.build_grid_bound_vectorized. The resulting scalar bound feeds
+the same shared grid_bound.grid_thinning that grid_boomerang.py uses, via
+its bound_fn/rate_offset hooks.
 
-
-Critical correctness note carried over from grid_boomerang.py, but load-
-bearing here specifically because it fires on essentially every call:
-_grid_bound MUST capture stats["horizon"] (the horizon actually used to
-draw tau) BEFORE applying the Algorithm-4 adaptation to self._grid_t_max --
-the adaptation mutates self._grid_t_max in place, so sample() must never
-re-derive "the horizon this tau was drawn against" from self._grid_t_max
-after _grid_bound returns (that value has already moved). sample() branches
-on stats["accepted"] and reads stats["horizon"], never a fresh
-min(self._grid_t_max, ...) recomputation.
+Correctness note (shared with grid_boomerang.py): _grid_bound must
+capture stats["horizon"] before Algorithm 4 mutates self._grid_t_max in
+place -- sample() must read stats["horizon"], never recompute it from
+self._grid_t_max afterward.
 """
+
 
 import math
 import time as _time
@@ -42,63 +33,47 @@ import torch.nn as nn
 from torch import Tensor
 from tqdm import tqdm
 
-# from ..utils.grid_bound import grid_thinning, build_grid_bound_vectorized
 from ..utils.fast_grid_bound import grid_thinning, build_grid_bound_vectorized
 
 
 class GridZigZagSampler(nn.Module):
     """
-    ZigZag sampler with the grid-based (Andral & Kamatani 2024) upper bound
-    as its only thinning strategy, using the per-coordinate vectorized
-    bound construction their Section 4.4.2 describes for a ZigZag-shaped
-    rate (see grid_bound.build_grid_bound_vectorized).
+    ZigZag sampler using the grid-based (Andral & Kamatani 2024) upper
+    bound as its only thinning strategy, via the per-coordinate
+    vectorized bound construction from their Section 4.4.2 (see
+    grid_bound.build_grid_bound_vectorized).
+    
+    ZigZag has no reference measure, but allows for initialization at 
+    the same x_ref as the boomerang.
 
-    grad_target: PLAIN FUNCTION gradient of the (negative) log-target,
-    built via torch.func.grad(energy) -- must not detach its input, so
-    grid times can be differentiated through it via jvp (same contract as
-    grid_boomerang.py's grad_target).
-    gamma: refreshment floor added per-coordinate before summing (matches
-    sazz.samplers.AutomaticZigZagSampler's default of 0.01). D*gamma
-    supplies genuine irreducibility slack to the bound -- see grid_spacing
-    below for a caveat about scale.
-    grid_t_max_init: initial adaptive horizon; ZigZag's rate has no
-    periodic structure to anchor a default to (unlike Boomerang's ~pi
-    period), so this defaults to 0.1, matching the CPU ZigZag sampler's own
-    t_max default -- Algorithm 4 will move it from there regardless.
-    grid_spacing: target grid-node spacing (NOT segment count, same
-    convention as grid_boomerang.py). Unlike Boomerang's pi/16 (anchored to
-    the known pi/4 first-harmonic curvature scale), ZigZag has no principled
-    anchor for this value -- it depends on the target's Hessian curvature
-    along v, which varies per-target and per-region of parameter space.
-    Default 0.01 is a STARTING point only (roughly grid_t_max_init/10,
-    independent of n_segments); tune per-target by watching
+    grad_target: plain-function gradient of the (negative) log-target
+    (torch.func.grad(energy)); must not detach its input so grid times
+    can be jvp'd through it (same contract as grid_boomerang.py).
+    gamma: per-coordinate refreshment floor before summing (default 0.01,
+    matching AutomaticZigZagSampler).
+    grid_t_max_init: initial adaptive horizon. Default 0.1 (no periodic
+    structure to anchor to, unlike Boomerang's ~pi period); Algorithm 4
+    adapts it regardless.
+    grid_spacing: target grid-node spacing (not segment count). No
+    principled default (depends on the target's Hessian curvature along
+    v); 0.01 is a starting point only -- tune per-target using
     bound_violations/max_ratio/curvature_ratio/effective_spacing in the
-    diagnostics output, do not trust the default blindly.
-    n_segments: CAP on the per-call segment count derived from grid_spacing
-    (same "spacing is the tunable, n_segments is the ceiling" convention as
-    grid_boomerang.py). Note self._grid_t_max's Algorithm-4 equilibrium is
-    itself D-dependent here (roughly 1/(D*gamma + curvature-driven rate)),
-    unlike Boomerang's D-independent pi/4-anchored horizon -- at large D
-    this can pin n_segments at its floor of 2, making grid_spacing
-    effectively inert; effective_spacing is logged per-iteration so this is
-    visible rather than a silent drift.
-    strategy: "vectorized_signed" (default) bounds each coordinate's SMOOTH
-    signed rate separately (no kink, robust, matches the paper's own
-    recommendation -- fewest bound violations in their Figure 6), clamping
-    each coordinate's bound to >=0 individually before summing.
-    "vectorized_not_signed" bounds each coordinate's already-CLAMPED
-    (kinked) rate directly -- tighter, but can silently under-bound if a
-    coordinate's signed rate crosses zero strictly inside a segment (the
-    missed mass is undetectable by the accept/reject ratio check, since no
-    proposal is ever generated there). Use vectorized_not_signed only for
-    reproducing Andral & Kamatani's Figure 6 comparison, not as an
-    unattended production default.
-    chunk_size: passed to the vmap composition in _make_rate_and_grad_fn.
-    [K, D] with K = n_segments+1 concurrent forward+backward graphs through
-    the target can OOM on larger BNN/CNN targets; default None keeps the
-    current unchunked behavior.
-    alpha_plus/alpha_minus/alpha_violation: Algorithm 4 horizon growth/
-    shrink constants, identical role and defaults to grid_boomerang.py.
+    diagnostics.
+    n_segments: cap on the per-call segment count derived from
+    grid_spacing. At large D, self._grid_t_max's equilibrium shrinks
+    (roughly 1/(D*gamma + curvature)), which can pin n_segments at its
+    floor of 2 and make grid_spacing inert -- watch effective_spacing.
+    strategy: "vectorized_signed" (default) clamps each coordinate's
+    smooth signed bound to >=0 before summing -- matches the paper's own
+    recommendation (fewest violations in their Figure 6).
+    "vectorized_not_signed" bounds the already-clamped rate directly:
+    tighter, but can silently under-bound where a coordinate's rate
+    crosses zero inside a segment. Use only to reproduce their Figure 6,
+    not as a production default.
+    chunk_size: passed to the vmap in _make_rate_and_grad_fn; default None
+    is unchunked ([K, D] graphs can OOM on larger targets).
+    alpha_plus/alpha_minus/alpha_violation: Algorithm 4's horizon
+    growth/shrink constants (same role/defaults as grid_boomerang.py).
     grid_kwargs: forwarded to grid_thinning (max_iter, min_window,
     max_violations).
     """
@@ -139,17 +114,12 @@ class GridZigZagSampler(nn.Module):
         self.dtype = dtype
         self.device = torch.device(device)
 
-        # Adaptive horizon -- persists across _grid_bound calls (sampler
-        # state; grid_bound.py itself stays stateless). No x_ref/Sigma_inv/
-        # preprocess() -- ZigZag has no reference measure.
+        # Adaptive horizon -- persists across _grid_bound calls 
         self._grid_t_max = float(grid_t_max_init)
 
     # ------------------------------------------------------------------
     # Dynamics -- ON the computational graph. `t` must be a differentiable
-    # tensor op, not a Python float, so torch.func.jvp can trace a tangent
-    # through it -- same discipline as grid_boomerang.py's trajectory, even
-    # though `+`/`*` don't themselves require it (keeps the convention
-    # consistent so a future edit can't accidentally detach t).
+    # tensor op, not a Python float, so torch.func.jvp can trace a tangent through it
     # ------------------------------------------------------------------
     def trajectory(self, t: Tensor, x: Tensor, v: Tensor):
         x_t = x + t * v
@@ -159,9 +129,7 @@ class GridZigZagSampler(nn.Module):
     def flip_velocity(self, v: Tensor, i: int) -> Tensor:
         """
         Flip the i-th coordinate of the velocity. Off-graph only -- called
-        post-accept in sample(), never inside the vmapped/jvp'd rate
-        closures (same as grid_boomerang.py's reflect_velocity), so no
-        functional/no-in-place-mutation requirement applies here.
+        post-accept in sample(), never inside the vmapped/jvp rate
         """
         v_new = v.clone()
         v_new[i] = -v_new[i]
@@ -173,9 +141,7 @@ class GridZigZagSampler(nn.Module):
     def _rate_scalar(self, t: float, x: Tensor, v: Tensor, want_per_coord: bool = False):
         """
         Off-graph, true rate lambda_ZZ(t) = sum_j clamp(v_j*grad_j U(x_t), 0)
-        + D*gamma -- for the accept/reject check inside grid_thinning. Same
-        regardless of `strategy` (only the BOUND construction differs; the
-        true rate used to accept/reject is always this one function).
+        + D*gamma -- for the accept/reject check inside grid_thinning.
 
         want_per_coord: if True, also returns the per-coordinate clamped
         rate vector (before summing) so a post-accept flip draw can reuse
@@ -193,9 +159,7 @@ class GridZigZagSampler(nn.Module):
 
     def _per_coord_rates(self, t: float, x: Tensor, v: Tensor) -> Tensor:
         """
-        Per-coordinate rates at time t. Fallback path when a stashed vector
-        from _rate_scalar isn't available (e.g. called independently of an
-        accept-check) -- feeds the post-accept categorical flip draw.
+        Per-coordinate rates at time t -- feeds the post-accept categorical flip draw.
         """
         with torch.no_grad():
             t_t = torch.as_tensor(t, dtype=self.dtype, device=self.device)
@@ -206,23 +170,18 @@ class GridZigZagSampler(nn.Module):
     def _make_rate_and_grad_fn(self, x: Tensor, v: Tensor):
         """
         Batched (value, derivative) closure for the per-coordinate signed
-        rate g_j(t) = grad_j U(x_t) * v_j, anchored at (x, v). x, v are
-        detached; only t is differentiable, per grid_bound.py's contract.
+        rate g_j(t) = grad_j U(x_t) * v_j, anchored at (x, v) (detached;
+        only t is differentiable, per grid_bound.py's contract).
 
-        ONE torch.func.jvp of the FULL gradient vector x -> grad_target(x_t)
-        (composed with x_t = x + t*v via the chain rule inside jvp) gives
-        every coordinate's (value, derivative) pair simultaneously -- v is
-        constant in t for ZigZag's linear trajectory, so the product rule
-        collapses to d/dt[grad_j U(x_t) * v_j] = v_j * d/dt[grad_j U(x_t)],
-        and d/dt[grad U(x_t)] (the full vector) is exactly the tangent jvp
-        computes. This means rate_evals for one call is n_segments+1
-        (shared across all D coordinates), NOT D*(n_segments+1) -- do not
-        restructure this as D independent per-coordinate closures each
-        redoing a full-D gradient call, which would be D-times wasteful.
+        One torch.func.jvp of the full gradient vector x -> grad_target(x_t)
+        gives every coordinate's (value, derivative) pair at once: v is
+        constant in t, so d/dt[grad_j U(x_t) * v_j] = v_j * d/dt[grad_j
+        U(x_t)], and the tangent jvp computes exactly d/dt[grad U(x_t)].
+        So rate_evals per call is n_segments+1, not D*(n_segments+1) -- do
+        not split this into D per-coordinate closures.
 
         Returns rate_and_grad_fn(t_batch: Tensor[K]) -> (y_full, d_full),
-        both [D, K] -- exactly the shape build_grid_bound_vectorized
-        expects.
+        both [D, K], as build_grid_bound_vectorized expects.
         """
         x = x.detach()
         v = v.detach()
@@ -266,7 +225,6 @@ class GridZigZagSampler(nn.Module):
         # n_segments computed ONCE from the incoming horizon and held fixed
         # for the lifetime of this grid_thinning call -- including across
         # any internal Section 4.7 shrink/rebuild on a bound violation
-        # (same convention as grid_boomerang.py's _grid_bound).
         n_segments = int(min(max(math.ceil(horizon / self.grid_spacing), 2), self.n_segments))
         effective_spacing = horizon / n_segments
 
@@ -290,9 +248,7 @@ class GridZigZagSampler(nn.Module):
         # Capture the horizon THIS call actually used to draw tau BEFORE
         # applying the Algorithm-4 adaptation below -- the adaptation
         # mutates self._grid_t_max in place, so sample() must read
-        # stats["horizon"], never re-derive it from self._grid_t_max after
-        # this method returns (that value has already moved). See module
-        # docstring's "critical correctness note."
+        # stats["horizon"], never re-derive it from self._grid_t_max 
         stats["horizon"] = horizon
 
         # --- t_max adaptation (Algorithm 4), same logic as grid_boomerang.py ---
@@ -309,7 +265,6 @@ class GridZigZagSampler(nn.Module):
 
     # ------------------------------------------------------------------
     # Initial velocity -- Rademacher +-1 per coordinate, NOT a Gaussian
-    # refresh draw (ZigZag has no reference measure to refresh toward).
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _initial_velocity(self) -> Tensor:
@@ -322,29 +277,19 @@ class GridZigZagSampler(nn.Module):
     def sample(self, N: int, x0: Optional[Tensor] = None, diagnostics: bool = True,
                grad_budget: Optional[int] = None) -> dict:
         """
-        x0=None defaults to N(0, I) (matching the CPU AutomaticZigZagSampler's
-        default -- ZigZag has no reference measure, so Boomerang's
-        x_ref + refresh convention doesn't apply here). Pass x0=x_ref
-        explicitly to warm-start from the same point used for a Boomerang
-        comparison run on the same target -- ZigZag's trajectory has no
-        structural dependency on a reference point, so x_ref can be used
-        purely as an ordinary initial position, with no preprocess() call
-        needed.
+        x0=None defaults to N(0, I) (matching AutomaticZigZagSampler --
+        ZigZag has no reference measure, so Boomerang's x_ref+refresh
+        convention doesn't apply). x0=x_ref can be passed to warm-start
+        from a Boomerang comparison run's starting point; no preprocess()
+        needed, since x_ref is used only as an ordinary initial position.
 
-        grad_budget: if given, sampling stops as soon as this many real
-        gradient evaluations (grad_evals) have been spent, rather than
-        after N skeleton events -- N still acts as a pre-allocation size
-        AND a hard safety cap on skeleton events (whichever bound is hit
-        first stops the loop). N=grad_budget is always a safe, generous
-        upper bound on the number of events the budget could actually
-        produce (minimum cost per accepted event is n_segments+1 >= 3, so
-        far fewer than grad_budget events will ever be needed). The
-        returned positions/velocities/times are truncated to the actual
-        number of events produced when stopped early via budget (not
-        padded with trailing zeros) -- gradient_evals may slightly exceed
-        grad_budget (the check happens after each iteration's cost is
-        already added, since a given iteration's true cost isn't known
-        until it completes), but never falls far short of it.
+        grad_budget: if given, sampling stops once this many gradient
+        evaluations have been spent, rather than after N skeleton events.
+        N still acts as pre-allocation size and a hard cap on events;
+        N=grad_budget is a safe upper bound since each event costs at
+        least n_segments+1 (>=3) evaluations. Returned arrays are
+        truncated to the events actually produced (not zero-padded);
+        grad_evals may slightly exceed grad_budget but never falls short.
         """
         positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
         velocities = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
@@ -405,10 +350,7 @@ class GridZigZagSampler(nn.Module):
             # Branch on stats["accepted"] (equivalently tau < math.inf, what
             # grid_thinning's own _make_stats already sets), NEVER on a
             # re-derived min(self._grid_t_max, ...) -- self._grid_t_max has
-            # already been mutated by _grid_bound's Algorithm-4 step by the
-            # time we get here, so a fresh recomputation would silently
-            # discard a genuinely accepted event whenever the adaptation
-            # shrank the horizon below tau (see module docstring).
+            # already been mutated by _grid_bound's Algorithm-4 
             event_accepted = bool(stats["accepted"])
 
             if event_accepted:
@@ -459,10 +401,7 @@ class GridZigZagSampler(nn.Module):
             )
             diag_log.append(row)
 
-            # Checked unconditionally (not just inside the accepted branch)
-            # since grad_evals accumulates on rejections too -- a run could
-            # otherwise spend its whole budget on no_event iterations and
-            # never break.
+            # Checked unconditionally
             if grad_budget is not None and grad_evals >= grad_budget:
                 break
 
