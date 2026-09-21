@@ -123,7 +123,7 @@ from sazz.gpu_friendly.scripts.uci_bnn_grid import (
 
 # Fast*-only knob (no Grid* equivalent); fast_cifar_resnet.py's value.
 GRID_ALPHA_VIOLATION = 1.1
-SIGMA_INV_SCALE = 10.0  # WEIGHT block of Sigma_inv only
+SIGMA_INV_SCALE = 1.0  # WEIGHT block of Sigma_inv only
 
 SIGMA_LOGSIGMA_PREC_SCALE = 1.0
 
