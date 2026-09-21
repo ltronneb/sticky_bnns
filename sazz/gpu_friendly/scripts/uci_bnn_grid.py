@@ -85,8 +85,8 @@ SIGMA_INV_SCALE_TABLE: dict[str, dict[str, float]] = {
     "deep_narrow": {
         "_default": 0.75,
         "boston":   0.75,
-        "energy":   20.0,
-        "yacht":    50.0,
+        "energy":   0.50,
+        "yacht":    0.50,
         "concrete": 10.0,
         "naval":    10.0,
     },

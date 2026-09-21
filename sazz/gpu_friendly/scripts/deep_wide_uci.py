@@ -13,13 +13,16 @@ STAGED versions built on the _Cheap sticky samplers
 (FastGridStickyZigZagSampler_Cheap / FastGridStickyBoomerangSampler_Cheap).
 The skeleton is generated in STAGE_SIZE-sized stages chained via the
 samplers' resume_state contract; immediately after each stage:
-  1. that stage's chunk_*.pt files are resampled into N_RESAMPLE/n_stages
-     draws (equal draws per stage, NOT time-proportional across stages),
+  1. that stage's chunk_*.pt files are resampled into a POOL of draws,
+     and the stage's post-burnin simulated-time span is read off its
+     manifest (cheap: floats only, no [rows, D] tensors),
   2. the entire stage_XXXX/ dir (chunk_*.pt + diag_*.pt + manifest.pt) is
      deleted,
   3. the sampler's resume_state is threaded into the next stage.
-All stages' draws are concatenated into the same "samples" field a
-non-staged run would produce. Peak disk is ONE stage
+After the last stage the final N_RESAMPLE draws are taken across the
+per-stage pools with multinomial probability T_s / sum(T_s) -- see
+_run_staged_sticky's docstring -- giving draws UNIFORM IN SIMULATED TIME
+over the whole trajectory, not uniform per stage. Peak disk is ONE stage
 (O(stage_size * D)), not the whole skeleton -- this is the same
 resample-and-discard loop fast_cheap_cifar_resnet.py uses at ResNet scale,
 back-ported here so a full --n-skeleton 1_000_000 run at D~45,000 doesn't
@@ -42,14 +45,10 @@ WHAT IS AND IS NOT COMPARABLE TO uci_bnn_grid.py:
     gradient chain -- NOT the same posterior as NUTS/full-batch PDMP
     anymore, same caveat as uci_bnn_grid_minibatch.py's ablation.
   * Staging changes WHERE skeleton rows live (one stage on disk at a time)
-    and makes the resample per-stage-uniform rather than globally uniform
-    over simulation time (equal draws per stage; a stage covering more
-    sim-time is under-weighted relative to a global draw). This is the
-    same tradeoff fast_cheap_cifar_resnet.py accepts. Confirm it doesn't
-    move the deep_wide sticky numbers before putting them in the same
-    table as the small / deep_narrow sticky numbers (which ARE globally
-    uniform). Set --stage-size >= --n-skeleton to force a single stage
-    (recovers exact global-uniform resampling, at full disk cost).
+    but NOT the draws' distribution: per-stage pools are combined by time
+    share, matching a global uniform-in-time resample, so these numbers are
+    comparable to uci_bnn_grid.py's. --equal-draws-per-stage restores the old
+    per-stage-uniform behavior (what the fast_cheap_* drivers still do).
   * ONLY the two sticky PDMP families are available here. Plain
     grid_zigzag / grid_boomerang have no _Cheap/chunked equivalent, so
     they are simply not offered -- deep_wide gets grid_sticky_zigzag,
@@ -102,6 +101,7 @@ from sazz.gpu_friendly.models.priors import (
 )
 from sazz.gpu_friendly.utils.resample import (
     resample_zigzag_path_sticky_chunked_torch, resample_boomerang_path_sticky_chunked_torch,
+    stage_time_span, pool_stage_draws_time_weighted,
 )
 from torch.distributions import Normal
 from sazz.gpu_friendly.samplers.fast_grid_sticky_zigzag_cheap import FastGridStickyZigZagSampler_Cheap
@@ -152,6 +152,15 @@ GRID_VMAP_CHUNK_SIZE = 4
 # resample, full disk cost). ---
 STAGE_SIZE: Optional[int] = None
 STAGE_DIR: Optional[Path] = None
+
+# Resample weighting across stages. Stages hold equal EVENT counts but unequal
+# simulated TIME, so equal draws per stage is not a time-average. True (default)
+# weights each stage's pool by its time span; False is the old behavior.
+TIME_WEIGHTED_RESAMPLE: bool = True
+
+# Draws per stage pooled before the time-weighted combine. GPU cost is one
+# pool at a time, [pool, D] (~0.34 GiB per 1000 draws at D~45,000 float64).
+POOL_PER_STAGE: int = 2_000
 
 # If set (via --grad-batch-size), every grid-bound episode of the sticky
 # PDMP samplers draws a fresh random minibatch of this size from the
@@ -331,6 +340,11 @@ def _stage_dir_base_for(dataset_name: str, split_id: int, sampler: str) -> Path:
     return STAGE_DIR / dataset_name / f"split_{split_id:02d}" / sampler
 
 
+def _pool_per_stage() -> int:
+    """Pool size per stage, capped at N_RESAMPLE."""
+    return min(POOL_PER_STAGE, N_RESAMPLE)
+
+
 def _run_staged_sticky(
     sampler,
     *,
@@ -348,14 +362,23 @@ def _run_staged_sticky(
     resample_stage_fn(chunk_files, manifest_path, n_draws, burnin_frac) ->
     Tensor[n_draws, D] is the one piece that differs between ZigZag and
     Boomerang (the latter also needs x_ref); the caller binds it.
+
+    Stages hold equal EVENT counts but unequal simulated TIME, so equal draws
+    per stage over-weights event-dense regions. TIME_WEIGHTED_RESAMPLE pools
+    per-stage draws and combines them by time share instead, which matches a
+    single global uniform-in-time resample. Peak disk is unchanged.
     """
     assert STAGE_SIZE is not None, "deep_wide_uci.py sticky runs require --stage-size."
 
     stage_base = _stage_dir_base_for(dataset_name, split_id, sampler_name)
     n_stages = math.ceil(N_SKELETON / STAGE_SIZE)
-    draws_per_stage = max(N_RESAMPLE // n_stages, 1)
+    if TIME_WEIGHTED_RESAMPLE:
+        draws_per_stage = _pool_per_stage()
+    else:
+        draws_per_stage = max(N_RESAMPLE // n_stages, 1)
 
     all_draws: list[torch.Tensor] = []
+    stage_spans: list[float] = []
     total_grad_evals = 0
     total_bound_violations = 0
     all_tmax_log: list[float] = []
@@ -384,13 +407,25 @@ def _run_staged_sticky(
 
         # burn-in only on stage 0 (its first BURNIN_FRAC of events); later
         # stages are already past burn-in, so keep all of their events.
+        stage_burnin = BURNIN_FRAC if stage == 0 else 0.0
         stage_draws = resample_stage_fn(
             result["chunk_files"], result["manifest_path"],
-            draws_per_stage, BURNIN_FRAC if stage == 0 else 0.0,
+            draws_per_stage, stage_burnin,
         )
         # .cpu() each stage -- avoids holding n_stages worth of draws on the
         # GPU plus the final torch.cat's transient full-size allocation.
         all_draws.append(stage_draws.cpu())
+
+        if TIME_WEIGHTED_RESAMPLE:
+            # Read before the rmtree below deletes the manifest. Same
+            # burnin_frac as the resample, so the span matches those draws.
+            span = stage_time_span(
+                result["chunk_files"], burnin_frac=stage_burnin,
+                manifest_path=result["manifest_path"],
+            )
+            stage_spans.append(span)
+            print(f"      [stage {stage + 1}/{n_stages}] sim-time span {span:.6g} "
+                  f"({draws_per_stage} pooled draws)")
 
         total_grad_evals += result["gradient_evals"]
         total_bound_violations += result["bound_violations"]
@@ -406,7 +441,20 @@ def _run_staged_sticky(
         print(f"      [stage {stage + 1}/{n_stages}] freed {stage_dir}")
 
     elapsed = time.perf_counter() - t0
-    samples = torch.cat(all_draws, dim=0)
+    if TIME_WEIGHTED_RESAMPLE:
+        samples = pool_stage_draws_time_weighted(all_draws, stage_spans, N_RESAMPLE)
+        total_span = sum(stage_spans)
+        shares = [s / total_span for s in stage_spans]
+        print(f"      time-weighted pooling: total sim-time {total_span:.6g} across "
+              f"{n_stages} stages; stage time-shares min={min(shares):.3%} "
+              f"max={max(shares):.3%} (equal-weight would be {1 / n_stages:.3%})")
+    else:
+        samples = torch.cat(all_draws, dim=0)
+
+    # Pooled rows are grouped by stage; shuffle so save_run's thin_to (and any
+    # downstream prefix slice) stays correctly time-weighted.
+    if TIME_WEIGHTED_RESAMPLE:
+        samples = samples[torch.randperm(samples.shape[0])]
 
     final_sparsity = float(frozen_mask_final.float().mean())
     print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s across {n_stages} stages "
@@ -423,6 +471,15 @@ def _run_staged_sticky(
         grad_budget=None,  # _Cheap sample() has no grad_budget; PDMP here is event-count driven
         grad_batch_size=GRAD_BATCH_SIZE,
     )
+    # Staging provenance. save_run lives in uci_bnn_grid.py (imported verbatim,
+    # not edited), so these fields are patched in after the fact.
+    payload = torch.load(out_path, weights_only=False)
+    payload["resample_time_weighted"] = TIME_WEIGHTED_RESAMPLE
+    payload["stage_size"] = STAGE_SIZE
+    payload["n_stages"] = n_stages
+    payload["pool_per_stage"] = draws_per_stage
+    payload["stage_time_spans"] = stage_spans if TIME_WEIGHTED_RESAMPLE else None
+    torch.save(payload, out_path)
     print(f"      saved {samples.shape[0]} samples (thinned to {N_SAVE}) -> {out_path}")
 
 
@@ -498,6 +555,16 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
         n_stages = math.ceil(N_SKELETON / STAGE_SIZE)
         print(f"  staged skeleton: {STAGE_SIZE} events/stage x {n_stages} stages "
               f"(~{approx_gib:.2f} GiB/buffer x3 buffers, peak disk ~1 stage) -> {STAGE_DIR}")
+        if TIME_WEIGHTED_RESAMPLE:
+            pps = _pool_per_stage()
+            pool_gib = n_stages * pps * bm.D * (4 if DTYPE == torch.float32 else 8) / 1024**3
+            print(f"  resample: TIME-WEIGHTED (uniform in simulated time) | "
+                  f"{pps} draws/stage pooled, ~{pool_gib:.2f} GiB CPU RAM held for pools, "
+                  f"final {N_RESAMPLE} drawn by stage time-share")
+        else:
+            print(f"  resample: EQUAL-PER-STAGE ({max(N_RESAMPLE // n_stages, 1)} draws/stage) "
+                  f"-- NOT uniform in simulated time; stages with more sim-time are "
+                  f"under-weighted")
     else:
         print("  STAGE_SIZE unset -- sticky PDMP runners will assert. Pass --stage-size.")
 
@@ -514,6 +581,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 
 def main():
     global N_SKELETON, N_RESAMPLE, STAGE_SIZE, STAGE_DIR, GRAD_BATCH_SIZE
+    global TIME_WEIGHTED_RESAMPLE, POOL_PER_STAGE
 
     # uci_bnn_grid.py's NUTS runners read GRAD_BUDGET as a module global on
     # that module -- set it there, not here, so --grad-budget reaches them.
@@ -565,6 +633,25 @@ def main():
                               "Only one stage exists at a time, so this needs O(stage-size * D * 3) "
                               "free, not the full skeleton -- but pointing it at node scratch "
                               "keeps even that off your quota. --skeleton-chunk-dir is an alias.")
+    parser.add_argument("--equal-draws-per-stage", action="store_true",
+                         help="Revert to the ORIGINAL per-stage-uniform resampling: each stage "
+                              "contributes N_RESAMPLE // n_stages draws, weighting every stage "
+                              "equally regardless of how much simulated time it covers. Since "
+                              "stages hold equal EVENT counts but unequal TIME, that is not a "
+                              "time-average of the trajectory and over-represents event-dense "
+                              "regions. Default (flag absent) is time-weighted pooling, which is "
+                              "distributionally equivalent to a global uniform-in-time resample "
+                              "at identical peak disk. Use this only to reproduce numbers "
+                              "generated before time-weighting existed.")
+    parser.add_argument("--pool-per-stage", type=int, default=POOL_PER_STAGE,
+                         help="Draws each stage is resampled into before the time-weighted "
+                              "combine (ignored with --equal-draws-per-stage). Larger reduces "
+                              "with-replacement duplication for stages whose time share exceeds "
+                              "their event share. GPU cost is ONE pool at a time, [pool, D] "
+                              "(~0.34 GiB per 1000 draws at D~45,000 float64), transient and "
+                              "alongside the sampler's own 3 x [stage-size, D] buffers -- budget "
+                              "it against the device the same way --stage-size is budgeted. "
+                              f"Default: {POOL_PER_STAGE}.")
     parser.add_argument("--grad-budget", type=int, default=None,
                          help="Applies to NUTS / NUTS-HS ONLY (delegated to uci_bnn_grid.py's "
                               "budget-truncation logic). The Fast* sticky PDMP samplers ignore "
@@ -597,6 +684,13 @@ def main():
                      "deleted, bounding peak disk to O(stage-size * D).")
     if args.stage_size is not None and args.stage_size <= 0:
         parser.error("--stage-size must be a positive integer.")
+    if args.pool_per_stage <= 0:
+        parser.error("--pool-per-stage must be a positive integer.")
+    if args.equal_draws_per_stage and (
+        args.pool_per_stage != POOL_PER_STAGE
+    ):
+        print("NOTE: --pool-per-stage is ignored under "
+              "--equal-draws-per-stage (no pooling happens in that mode).")
     if args.grad_budget is not None and any(s in PDMP_SAMPLERS for s in args.samplers):
         print(f"NOTE: --grad-budget {args.grad_budget} is ignored by the sticky PDMP samplers "
               f"(_Cheap sample() has no grad_budget); it applies to nuts/nuts_horseshoe only. "
@@ -610,6 +704,8 @@ def main():
         else args.out / "chunks"
     )
     GRAD_BATCH_SIZE = args.grad_batch_size
+    TIME_WEIGHTED_RESAMPLE = not args.equal_draws_per_stage
+    POOL_PER_STAGE = args.pool_per_stage
 
     # Propagate to the imported NUTS runners' module.
     uci_grid.N_SKELETON = N_SKELETON

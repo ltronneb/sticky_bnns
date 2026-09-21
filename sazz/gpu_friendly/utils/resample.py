@@ -378,6 +378,93 @@ def _resample_chunked_core(
     return output
 
 
+def stage_time_span(
+    chunk_files: list[Path] | list[str], burnin_frac: float = 0.0,
+    manifest_path: Optional[Path | str] = None,
+) -> float:
+    """
+    Post-burnin simulated-time span (T_end - T_start) of a chunked stage --
+    exactly the interval _resample_chunked_core would draw sample_times from
+    for the same arguments.
+
+    Staged runners (deep_wide_uci.py) delete each stage's chunk dir before the
+    next stage runs, so they need this while the stage is still on disk in
+    order to weight its draws by time. Reads manifest.pt only (floats, no
+    [rows, D] tensors) unless burnin_frac > 0, which opens the one chunk
+    holding row n_burn.
+    """
+    chunk_entries = _load_manifest(chunk_files, manifest_path)
+    if not chunk_entries:
+        raise ValueError("No chunks found -- chunk_files/manifest_path is empty.")
+
+    T_end = chunk_entries[-1]["t_end"]
+    if burnin_frac <= 0.0:
+        T_start = chunk_entries[0]["t_start"]
+    else:
+        N = sum(e["row_count"] for e in chunk_entries)
+        T_start = _find_burnin_t_start(chunk_entries, int(burnin_frac * N))
+    return float(T_end - T_start)
+
+
+def pool_stage_draws_time_weighted(
+    stage_pools: list[Tensor], stage_spans: list[float], N_resample: int,
+    generator: Optional[torch.Generator] = None,
+) -> Tensor:
+    """
+    Combines per-stage pools into N_resample draws uniform in simulated time
+    over the whole staged trajectory, rather than uniform per stage.
+
+    Each pool is already uniform in time WITHIN its stage. Concatenating equal
+    blocks weights stage s by 1/n_stages, but a time-average needs
+    T_s / sum(T_s) -- stages are equal in EVENT count, not elapsed time, and
+    for a sticky PDMP those diverge sharply with freeze/thaw churn.
+
+    Global uniform-in-time sampling factorizes over a partition: the count
+    landing in stage s is Multinomial with probability T_s / sum(T_s), and
+    conditional on it those draws are uniform within stage s. So drawing stage
+    labels by time share and then rows from that stage's pool is equivalent to
+    one global pass -- which a staged run can't do, since later stages' spans
+    are unknown while earlier chunk dirs still exist.
+
+    Pool draws are WITH REPLACEMENT, so a stage whose time share exceeds its
+    pool share duplicates rows; keep pools well above N_resample / n_stages.
+    """
+    if len(stage_pools) != len(stage_spans):
+        raise ValueError(
+            f"stage_pools ({len(stage_pools)}) and stage_spans "
+            f"({len(stage_spans)}) must be the same length."
+        )
+    if not stage_pools:
+        raise ValueError("stage_pools is empty -- nothing to pool.")
+
+    device = stage_pools[0].device
+    dtype = stage_pools[0].dtype
+
+    spans = torch.tensor(stage_spans, dtype=torch.float64, device=device)
+    if torch.any(spans < 0):
+        raise ValueError(f"Negative stage time span(s): {stage_spans}")
+    total = float(spans.sum())
+    if not total > 0.0:
+        raise ValueError(f"Stage time spans sum to {total} -- no simulated time to weight by.")
+
+    # multinomial over stage labels rather than deterministic rounding, so
+    # counts sum to exactly N_resample without dropping short stages to zero.
+    labels = torch.multinomial(
+        spans / total, N_resample, replacement=True, generator=generator,
+    )
+    counts = torch.bincount(labels, minlength=len(stage_pools))
+
+    out: list[Tensor] = []
+    for pool, n_take in zip(stage_pools, counts.tolist()):
+        if n_take == 0:
+            continue
+        idx = torch.randint(
+            0, pool.shape[0], (n_take,), device=pool.device, generator=generator,
+        )
+        out.append(pool[idx].to(dtype=dtype, device=device))
+    return torch.cat(out, dim=0)
+
+
 def resample_zigzag_path_chunked_torch(
     chunk_files: list[Path] | list[str], N_resample: int, burnin_frac: float = 0.1,
     manifest_path: Optional[Path | str] = None,
