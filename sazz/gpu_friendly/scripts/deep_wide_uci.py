@@ -22,7 +22,10 @@ samplers' resume_state contract; immediately after each stage:
 After the last stage the final N_RESAMPLE draws are taken across the
 per-stage pools with multinomial probability T_s / sum(T_s) -- see
 _run_staged_sticky's docstring -- giving draws UNIFORM IN SIMULATED TIME
-over the whole trajectory, not uniform per stage. Peak disk is ONE stage
+over the whole trajectory, not uniform per stage. Burn-in is a whole-stage
+cut: the first BURNIN_FRAC * n_stages stages are given zero weight, so
+BURNIN_FRAC means the same global fraction it does in a non-staged run.
+Peak disk is ONE stage
 (O(stage_size * D)), not the whole skeleton -- this is the same
 resample-and-discard loop fast_cheap_cifar_resnet.py uses at ResNet scale,
 back-ported here so a full --n-skeleton 1_000_000 run at D~45,000 doesn't
@@ -405,9 +408,15 @@ def _run_staged_sticky(
             chunk_dir=stage_dir,
         )
 
-        # burn-in only on stage 0 (its first BURNIN_FRAC of events); later
-        # stages are already past burn-in, so keep all of their events.
-        stage_burnin = BURNIN_FRAC if stage == 0 else 0.0
+        # Within-stage burn-in applies ONLY in the equal-draws path, where
+        # cutting stage 0's first BURNIN_FRAC of events is the only burn-in
+        # there is. Under time-weighting, burn-in is instead a whole-stage
+        # cut applied at the pooling step below (the first n_burn_stages get
+        # zero weight), so a partial cut here would double-count it -- and
+        # stage 0's pool is discarded entirely anyway.
+        stage_burnin = (
+            0.0 if TIME_WEIGHTED_RESAMPLE else (BURNIN_FRAC if stage == 0 else 0.0)
+        )
         stage_draws = resample_stage_fn(
             result["chunk_files"], result["manifest_path"],
             draws_per_stage, stage_burnin,
@@ -442,12 +451,24 @@ def _run_staged_sticky(
 
     elapsed = time.perf_counter() - t0
     if TIME_WEIGHTED_RESAMPLE:
-        samples = pool_stage_draws_time_weighted(all_draws, stage_spans, N_RESAMPLE)
+        # Burn-in as a WHOLE-STAGE cut. Applying BURNIN_FRAC inside stage 0
+        # only (the fast_cheap_* convention) discards BURNIN_FRAC of ONE
+        # stage, i.e. BURNIN_FRAC/n_stages of the run -- 0.5% at 0.2 and 40
+        # stages, not the 20% a non-staged run drops. Zeroing the first
+        # n_burn_stages spans gives those stages multinomial probability 0,
+        # so they contribute no draws: burn-in then means the same global
+        # fraction it does without staging.
+        n_burn_stages = int(BURNIN_FRAC * n_stages)
+        eff_spans = [0.0] * n_burn_stages + stage_spans[n_burn_stages:]
+        samples = pool_stage_draws_time_weighted(all_draws, eff_spans, N_RESAMPLE)
         total_span = sum(stage_spans)
         shares = [s / total_span for s in stage_spans]
+        dropped = sum(stage_spans[:n_burn_stages]) / total_span if n_burn_stages else 0.0
         print(f"      time-weighted pooling: total sim-time {total_span:.6g} across "
               f"{n_stages} stages; stage time-shares min={min(shares):.3%} "
               f"max={max(shares):.3%} (equal-weight would be {1 / n_stages:.3%})")
+        print(f"      burn-in: dropped first {n_burn_stages}/{n_stages} stages "
+              f"= {dropped:.2%} of simulated time (BURNIN_FRAC={BURNIN_FRAC})")
     else:
         samples = torch.cat(all_draws, dim=0)
 
@@ -479,6 +500,8 @@ def _run_staged_sticky(
     payload["n_stages"] = n_stages
     payload["pool_per_stage"] = draws_per_stage
     payload["stage_time_spans"] = stage_spans if TIME_WEIGHTED_RESAMPLE else None
+    payload["burnin_frac"] = BURNIN_FRAC
+    payload["n_burn_stages"] = int(BURNIN_FRAC * n_stages) if TIME_WEIGHTED_RESAMPLE else None
     torch.save(payload, out_path)
     print(f"      saved {samples.shape[0]} samples (thinned to {N_SAVE}) -> {out_path}")
 
