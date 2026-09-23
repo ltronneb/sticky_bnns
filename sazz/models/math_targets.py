@@ -52,7 +52,7 @@ def make_gaussian(D=5, cov="diagonal", seed=42, dtype=torch.float64):
     )
 
 
-def make_banana(D=2, a=1.0, scale=1.0, dtype=torch.float64):
+def make_banana(D=2, a=1.0, scale=1.0, sigma_inv_scale=1.0, dtype=torch.float64):
     """
     Banana E(b0,b1) = 0.5*(b0/scale)^2 + 0.5*(b1 - a*(b0/scale)^2)^2.
     """
@@ -93,7 +93,7 @@ def make_banana(D=2, a=1.0, scale=1.0, dtype=torch.float64):
         D=D,
         grad_target=grad_target,
         x_ref=torch.tensor([0.0, a], dtype=dtype),
-        Sigma_inv=torch.diag(torch.tensor([1.0, 1.0 / 3.0], dtype=dtype)),
+        Sigma_inv=(sigma_inv_scale) * torch.diag(torch.tensor([1.0, 1.0 / 3.0], dtype=dtype)),
         marginal_grids=marginal_grids,
     )
 

@@ -5,8 +5,11 @@ architecture, datasets, and per-dataset hyperparameters. Six samplers
 available: "grid_zigzag" (GridZigZagSampler), "grid_sticky_zigzag"
 (GridStickyZigZagSampler, sparsity via freeze/thaw), "grid_boomerang"
 (GridBoomerangSampler), "grid_sticky_boomerang" (GridStickyBoomerangSampler),
-"nuts" (NumPyro NUTS), and "svi" (NumPyro mean-field SVI with
-TraceMeanField_ELBO, on the same model as "nuts").
+"nuts" (NumPyro NUTS), "svi" (NumPyro mean-field SVI with
+TraceMeanField_ELBO, on the same model as "nuts"), and "lbbnn" (Hubin &
+Storvik spike-and-slab variational BNN -- see sazz/gpu_friendly/lbbnn/; the
+variational counterpart to the sticky samplers' joint model/parameter
+inference, so it is the baseline for the sparsity claims as well as accuracy).
 
 Isolated from sazz/scripts/bnns/toy_bnn.py's model/sampler/warmup imports;
 only reads pure utilities from the existing tree (generate_toys.GENERATORS,
@@ -49,6 +52,7 @@ from sazz.gpu_friendly.samplers.grid_zigzag import GridZigZagSampler
 from sazz.gpu_friendly.samplers.grid_sticky_zigzag import GridStickyZigZagSampler
 from sazz.gpu_friendly.samplers.grid_boomerang import GridBoomerangSampler
 from sazz.gpu_friendly.samplers.grid_sticky_boomerang import GridStickyBoomerangSampler
+from sazz.gpu_friendly.lbbnn import LBBNNConfig, run_lbbnn
 
 
 
@@ -131,7 +135,29 @@ OUT_DIR = Path("results/grid/toy_bnns")
 TOY_DIR = Path("datasets/toy_1d")
 
 TOY_DATASETS = ("hernandez", "gap", "sharp", "multiscale")
-SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "svi")
+SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "svi", "lbbnn")
+
+# LBBNN (Hubin & Storvik spike-and-slab VI) -- the variational counterpart to
+# the sticky samplers' model-space inference, so it is the natural baseline
+# for the sparsity claims, not just the accuracy ones. See
+# sazz/gpu_friendly/lbbnn/. These override LBBNNConfig's defaults for the toy
+# setting; LBBNN_TEMPER is the knob to re-check first if `mean_alpha` in the
+# training log never moves off its ~0.61 init.
+# 20000, not the reference's 250: the toy datasets are ~20 points, so an
+# "epoch" here is a single full-batch step and the reference's epoch count
+# would give 250 updates total. Measured on hernandez (split 0), where the
+# sticky samplers get RMSE 0.111 / 58% zeros: 5000 epochs underfits badly
+# (RMSE 0.467), 20000 lands at RMSE 0.119 with 64% zeros -- i.e. matched
+# accuracy at comparable sparsity. Costs ~35s per dataset on CPU.
+LBBNN_EPOCHS = 20_000
+LBBNN_LR = 1e-2
+# Larger than any toy dataset (~20 points), so these runs are full-batch --
+# matching the PDMP samplers here, which are also full-batch. train_lbbnn
+# clamps this to n_train, so it is full-batch by construction, not by luck.
+LBBNN_BATCH_SIZE = 10_000
+LBBNN_TEMPER = 0.5
+LBBNN_MC_SAMPLES = 1
+LBBNN_DRAWS = NUTS_DRAWS * NUTS_CHAINS  # match NUTS/SVI's total draw count
 
 DATASET_CONFIGS = {
     "hernandez": dict(
@@ -812,6 +838,66 @@ def run_svi_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
     print(f"      saved {samples.shape[0]} samples -> {out_path}")
 
 
+def run_lbbnn_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
+                       cfg: BNNConfig, sd: Path) -> None:
+    seed = BASE_SEED + split_id
+
+    # Mirror the BNNConfig the samplers use, so LBBNN targets the same model:
+    # same architecture, activation, fixed toy noise_std, and the same
+    # fan-in-scaled Gaussian slab prior (weight_prior="gaussian", the
+    # LBBNNConfig default -- NOT the reference's learnable Normal-Gamma,
+    # which would confound the comparison; see lbbnn/distributions.py).
+    lb_cfg = LBBNNConfig(
+        layer_sizes=cfg.layer_sizes,
+        activation=cfg.activation,
+        likelihood="gaussian",
+        noise_std=cfg.noise_std,
+        prior_std_weight=cfg.prior_std_weight,
+        prior_std_bias=cfg.prior_std_bias,
+        fan_in_scaling=cfg.fan_in_scaling,
+        temper=LBBNN_TEMPER,
+        temper_prior=LBBNN_TEMPER,
+        epochs=LBBNN_EPOCHS,
+        batch_size=LBBNN_BATCH_SIZE,
+        lr=LBBNN_LR,
+        mc_samples=LBBNN_MC_SAMPLES,
+    )
+
+    samples_np, elapsed, gradient_evals, info = run_lbbnn(
+        data, lb_cfg, seed, n_draws=LBBNN_DRAWS, device=DEVICE, dtype=DTYPE,
+    )
+    samples = torch.tensor(samples_np)
+
+    print(f"      sampled {samples.shape[0]} LBBNN draws in {elapsed:.1f}s "
+          f"({gradient_evals} full-batch-equivalent gradient evals, "
+          f"{info['raw_steps']} steps); mean inclusion alpha="
+          f"{info['mean_alpha']:.4f}")
+
+    out_path = sd / "lbbnn.pt"
+    save_run(
+        out_path, dataset=dataset_name, split_id=split_id, sampler="lbbnn",
+        samples=samples, x_ref=None, cfg=cfg, y_std=data["y_std"],
+        elapsed_sec=elapsed, n_events=samples.shape[0], bound_violations=0,
+        gradient_evals=gradient_evals,
+    )
+
+    # The inclusion probabilities are LBBNN's headline output and have no slot
+    # in save_run's schema (which is built around sampler skeletons), so they
+    # go alongside it -- this is what a sparsity comparison against the sticky
+    # samplers' freeze fractions reads.
+    alpha_path = sd / "lbbnn_inclusion.pt"
+    torch.save({
+        "dataset": dataset_name,
+        "split_id": split_id,
+        "layer_sizes": cfg.layer_sizes,
+        "inclusion_probabilities": info["inclusion_probabilities"],
+        "mean_alpha": info["mean_alpha"],
+        "history": info["history"],
+    }, alpha_path)
+    print(f"      saved {samples.shape[0]} samples -> {out_path}")
+    print(f"      saved inclusion probabilities -> {alpha_path}")
+
+
 SAMPLER_RUNNERS = {
     "grid_zigzag": run_grid_zigzag,
     "grid_sticky_zigzag": run_grid_sticky_zigzag,
@@ -819,6 +905,7 @@ SAMPLER_RUNNERS = {
     "grid_sticky_boomerang": run_grid_sticky_boomerang,
     "nuts": run_nuts_dataset,
     "svi": run_svi_dataset,
+    "lbbnn": run_lbbnn_dataset,
 }
 
 

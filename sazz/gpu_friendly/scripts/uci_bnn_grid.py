@@ -3,8 +3,14 @@ Grid-bound Boomerang (Andral & Kamatani 2024) on UCI regression BNN benchmarks
 Activation is tanh by default, as this is smooth
 .
 
-Six samplers: "grid_zigzag", "grid_sticky_zigzag", "grid_boomerang",
-"grid_sticky_boomerang", "nuts", "nuts_horseshoe"
+Seven samplers: "grid_zigzag", "grid_sticky_zigzag", "grid_boomerang",
+"grid_sticky_boomerang", "nuts", "nuts_horseshoe", "lbbnn"
+
+"lbbnn" is the Hubin & Storvik spike-and-slab variational BNN (see
+sazz/gpu_friendly/lbbnn/) -- the variational counterpart to the sticky
+samplers' joint model/parameter inference, and the baseline for the sparsity
+claims as well as accuracy. It needs no MAP/Laplace reference, so a
+--samplers lbbnn run skips that build entirely.
 
 Usage:
     python -m sazz.gpu_friendly.scripts.uci_bnn_grid
@@ -43,6 +49,7 @@ from sazz.gpu_friendly.samplers.grid_zigzag import GridZigZagSampler
 from sazz.gpu_friendly.samplers.grid_sticky_zigzag import GridStickyZigZagSampler
 from sazz.gpu_friendly.samplers.grid_boomerang import GridBoomerangSampler
 from sazz.gpu_friendly.samplers.grid_sticky_boomerang import GridStickyBoomerangSampler
+from sazz.gpu_friendly.lbbnn import LBBNNConfig, run_lbbnn
 
 
 
@@ -156,7 +163,35 @@ DEFAULT_HIDDEN_VARIANT = "small"
 OUT_DIR = Path("results/grid/uci_bnn")
 
 UCI_DATASETS  = ("boston", "naval", "energy", "yacht", "concrete")
-SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "nuts_horseshoe")
+SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_sticky_boomerang", "nuts", "nuts_horseshoe", "lbbnn")
+
+# Samplers that need neither x_ref nor Sigma_inv, so run_split can skip the
+# MAP+Laplace build entirely when none of the pending samplers want it. That
+# build is cfg.adam_steps (20k) of Adam plus a curvature pass -- pure waste
+# for a `--samplers lbbnn` run, which fits its own variational posterior from
+# a random init.
+NO_REFERENCE_SAMPLERS = frozenset({"lbbnn"})
+
+# LBBNN (Hubin & Storvik spike-and-slab VI) -- see sazz/gpu_friendly/lbbnn/.
+# The variational counterpart to the sticky samplers' joint model/parameter
+# inference, so it is the baseline for the sparsity claims, not just accuracy.
+LBBNN_EPOCHS = 15_000
+LBBNN_LR = 1e-2
+
+# Larger than any UCI training split we run full-batch (concrete, the biggest,
+# is 927 after a 0.9 split), so train_lbbnn's min(batch_size, n_train) clamp
+# makes these runs full-batch by construction -- matching the PDMP samplers on
+# the shallow/deep_narrow configs. Override with --lbbnn-batch-size for
+# deep_wide, which is run minibatched at 128.
+LBBNN_BATCH_SIZE = 10_000
+LBBNN_TEMPER = 0.2
+
+LBBNN_LEARN_MODEL_PRIOR = False
+LBBNN_PRIOR_PA = 1.0
+LBBNN_PRIOR_PB = 1.0
+
+LBBNN_MC_SAMPLES = 1
+LBBNN_DRAWS = N_SAVE  # match the other samplers' saved draw count
 
 
 @dataclass
@@ -950,6 +985,74 @@ def run_nuts_horseshoe_dataset(dataset_name: str, split_id: int, data: dict[str,
     print(f"      saved {samples.shape[0]} samples -> {out_path}")
 
 
+def run_lbbnn_dataset(dataset_name: str, split_id: int, data: dict[str, Any],
+                       cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
+    """LBBNN baseline. Ignores bm/x_ref/Sigma_inv (it fits its own variational
+    posterior from a random init) -- they are in the signature only because
+    SAMPLER_RUNNERS dispatches every runner uniformly."""
+    seed = BASE_SEED + split_id
+
+    # Mirror the BNNConfig build_target uses, so LBBNN targets the same model
+    # as the samplers: same architecture/activation, the same fan-in-scaled
+    # Gaussian prior, and -- unlike the toys -- LEARNED noise under the same
+    # HalfNormal(prior_sigma_scale) prior BayesianModule.build puts on it
+    # (noise_std=None). The flat samples therefore carry the trailing
+    # log_sigma coordinate, matching this script's D = D_network + 1.
+    lb_cfg = LBBNNConfig(
+        layer_sizes=cfg.layer_sizes,
+        activation=cfg.activation,
+        likelihood="gaussian",
+        noise_std=None,
+        prior_sigma_scale=cfg.prior_sigma_scale,
+        prior_std_weight=cfg.prior_std_weight,
+        prior_std_bias=cfg.prior_std_bias,
+        fan_in_scaling=cfg.fan_in_scaling,
+        temper=LBBNN_TEMPER,
+        temper_prior=LBBNN_TEMPER,
+        epochs=LBBNN_EPOCHS,
+        batch_size=LBBNN_BATCH_SIZE,
+        lr=LBBNN_LR,
+        mc_samples=LBBNN_MC_SAMPLES,
+        learn_model_prior=LBBNN_LEARN_MODEL_PRIOR,
+        prior_pa_init=(LBBNN_PRIOR_PA, LBBNN_PRIOR_PA),
+        prior_pb_init=(LBBNN_PRIOR_PB, LBBNN_PRIOR_PB),
+    )
+
+    samples_np, elapsed, gradient_evals, info = run_lbbnn(
+        data, lb_cfg, seed, n_draws=LBBNN_DRAWS, device=DEVICE, dtype=DTYPE,
+    )
+    samples = torch.tensor(samples_np)
+
+    print(f"      sampled {samples.shape[0]} LBBNN draws in {elapsed:.1f}s "
+          f"({gradient_evals} full-batch-equivalent gradient evals, "
+          f"{info['raw_steps']} steps); mean inclusion alpha="
+          f"{info['mean_alpha']:.4f}")
+
+    out_path = sd / "lbbnn.pt"
+    save_run(
+        out_path, dataset=dataset_name, split_id=split_id, sampler="lbbnn",
+        samples=samples, x_ref=None, cfg=cfg, y_std=data["y_std"],
+        elapsed_sec=elapsed, n_events=samples.shape[0], bound_violations=0,
+        gradient_evals=gradient_evals,
+    )
+
+    # Inclusion probabilities are LBBNN's headline output and have no slot in
+    # save_run's schema (built around sampler skeletons), so they go beside
+    # it -- this is what a sparsity comparison against the sticky samplers'
+    # freeze fractions reads.
+    alpha_path = sd / "lbbnn_inclusion.pt"
+    torch.save({
+        "dataset": dataset_name,
+        "split_id": split_id,
+        "layer_sizes": cfg.layer_sizes,
+        "inclusion_probabilities": info["inclusion_probabilities"],
+        "mean_alpha": info["mean_alpha"],
+        "history": info["history"],
+    }, alpha_path)
+    print(f"      saved {samples.shape[0]} samples -> {out_path}")
+    print(f"      saved inclusion probabilities -> {alpha_path}")
+
+
 SAMPLER_RUNNERS = {
     "grid_zigzag": run_grid_zigzag,
     "grid_sticky_zigzag": run_grid_sticky_zigzag,
@@ -957,6 +1060,7 @@ SAMPLER_RUNNERS = {
     "grid_sticky_boomerang": run_grid_sticky_boomerang,
     "nuts": run_nuts_dataset,
     "nuts_horseshoe": run_nuts_horseshoe_dataset,
+    "lbbnn": run_lbbnn_dataset,
 }
 
 
@@ -988,8 +1092,15 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    bm, x_ref, Sigma_inv = build_target(data, cfg)
-    print(f"  D = {bm.D}")
+    # Skip the MAP/Laplace build when nothing pending needs a reference --
+    # it costs cfg.adam_steps (20k) of Adam plus a curvature pass, which is
+    # pure overhead for e.g. a `--samplers lbbnn` run.
+    if all(s in NO_REFERENCE_SAMPLERS for s in pending):
+        bm = x_ref = Sigma_inv = None
+        print(f"  (no reference build needed for {pending})")
+    else:
+        bm, x_ref, Sigma_inv = build_target(data, cfg)
+        print(f"  D = {bm.D}")
 
     for sampler_name in pending:
         print(f"  [{sampler_name}]")
@@ -1004,6 +1115,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 
 def main():
     global N_SKELETON, N_RESAMPLE, GRAD_BUDGET, REFERENCE
+    global LBBNN_BATCH_SIZE, LBBNN_EPOCHS
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1049,6 +1161,17 @@ def main():
                               "residual^2-weighted, which underestimates inner-layer curvature on deep nets "
                               "and needs SIGMA_INV_SCALE well above 1.0 to compensate. Ignored by "
                               "grid_zigzag/grid_sticky_zigzag (no reference measure) and NUTS.")
+    parser.add_argument("--lbbnn-batch-size", type=int, default=LBBNN_BATCH_SIZE,
+                         help="Minibatch size for the lbbnn sampler. The default is larger "
+                              "than any training split run here, so lbbnn is full-batch by "
+                              "default (train_lbbnn clamps it to n_train), matching the "
+                              "PDMP samplers on the shallow/deep_narrow configs. Set it "
+                              "explicitly (e.g. 128) for deep_wide. Ignored by every other "
+                              "sampler.")
+    parser.add_argument("--lbbnn-steps", type=int, default=LBBNN_EPOCHS,
+                         help="Optimizer steps for the lbbnn sampler when it runs full-batch "
+                              "(equivalently, passes over the training set when it does not). "
+                              "Ignored by every other sampler.")
     parser.add_argument("--prior-inclusion-weight", type=float, default=0.3,
                          help="Sticky-only spike-and-slab prior inclusion probability (BNNConfig."
                               "prior_inclusion_weight, fed to build_kappa_from_inclusion). Lower "
@@ -1062,6 +1185,8 @@ def main():
     N_RESAMPLE = args.n_resample
     GRAD_BUDGET = args.grad_budget
     REFERENCE = args.reference
+    LBBNN_BATCH_SIZE = args.lbbnn_batch_size
+    LBBNN_EPOCHS = args.lbbnn_steps
 
     hidden = HIDDEN_VARIANTS[args.hidden_variant]
     # "small" keeps writing to the original flat <out>/<dataset>/... layout
