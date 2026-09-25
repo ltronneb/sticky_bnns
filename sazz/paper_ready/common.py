@@ -1,5 +1,6 @@
 """Device, sampler construction and result files shared by the scripts."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -41,8 +42,11 @@ def make_pdmp(name: str, bm, x_ref, Sigma_inv, *, t_max_init: float, gamma: floa
 
 
 def save(path: Path, **payload):
+    """Atomic, so parallel jobs never read a half-written file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({k: v.cpu() if torch.is_tensor(v) else v for k, v in payload.items()}, path)
+    tmp = path.with_suffix(f".tmp{os.getpid()}")
+    torch.save({k: v.cpu() if torch.is_tensor(v) else v for k, v in payload.items()}, tmp)
+    os.replace(tmp, path)
     print(f"  saved -> {path}")
 
 

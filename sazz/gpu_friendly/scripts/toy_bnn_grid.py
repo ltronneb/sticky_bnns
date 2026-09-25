@@ -149,7 +149,7 @@ N_SAVE = 8_000  # matches the existing results/toy_bnns/*/split_00/*.pt files
 SAVE_SKELETON: bool = False
 SKELETON_OUT_DIR = Path("results/toy_bnns/skeletons/fullbatch")
 
-NUTS_DRAWS  = 2_000
+NUTS_DRAWS  = 1_000
 NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
 PRIOR_INCLUSION_WEIGHT = 0.1
@@ -172,7 +172,7 @@ SAMPLER_NAMES = ("grid_zigzag", "grid_sticky_zigzag", "grid_boomerang", "grid_st
 # sticky samplers get RMSE 0.111 / 58% zeros: 5000 epochs underfits badly
 # (RMSE 0.467), 20000 lands at RMSE 0.119 with 64% zeros -- i.e. matched
 # accuracy at comparable sparsity. Costs ~35s per dataset on CPU.
-LBBNN_EPOCHS = 20_000
+LBBNN_EPOCHS = 15_000
 LBBNN_LR = 1e-2
 # Larger than any toy dataset (~20 points), so these runs are full-batch --
 # matching the PDMP samplers here, which are also full-batch. train_lbbnn

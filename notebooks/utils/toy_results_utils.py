@@ -26,7 +26,7 @@ SAMPLER_STYLE = {
 GRID_SAMPLERS = ["grid_boomerang", "grid_sticky_boomerang", "grid_zigzag", "grid_sticky_zigzag"]
 
 RUN_TREES = {
-    "fullbatch": Path("results/paper/toy_bnns"),
+    "fullbatch": Path("results/paper_v2/toy_bnns"),
     "minibatch": Path("results/paper/toy_bnns_minibatch"),
     "negmap":    Path("results/paper/toy_bnns_negative_map"),
 }
