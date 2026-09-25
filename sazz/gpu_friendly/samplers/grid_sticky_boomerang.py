@@ -77,6 +77,8 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         grid_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
+        bound_mode: str = "grid",
+        adapt_rule: str = "alg4",
     ):
         super().__init__(
             grad_target=grad_target,
@@ -92,6 +94,8 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
             grid_kwargs=grid_kwargs,
             dtype=dtype,
             device=device,
+            bound_mode=bound_mode,
+            adapt_rule=adapt_rule,
         )
 
         if isinstance(kappa, (int, float)):
@@ -396,6 +400,15 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         binding = min(candidates, key=candidates.get)
         horizon = candidates[binding]
 
+        if self.bound_mode == "single_segment":
+            tau, stats = self._single_segment_bound(
+                self._make_rate_and_grad_fn_sticky(pos, vel),
+                lambda t: self._rate_scalar_sticky(t, pos.detach(), vel.detach()),
+                horizon, t_max_binding=(binding == "grid_t_max"),
+            )
+            stats["binding"] = binding
+            return tau, stats
+
         # n_segments computed ONCE from the incoming horizon and held fixed
         # for the lifetime of this grid_thinning call -- including across
         # any internal Section 4.7 shrink/rebuild on a bound violation.
@@ -452,9 +465,13 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         truncated to the actual event count if stopped early via budget)."""
         assert self.x_ref is not None, "Call preprocess() first."
 
-        positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
-        velocities = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
-        times = torch.zeros(N, dtype=self.dtype, device=self.device)
+        # torch.empty, not zeros: memory is only committed as rows are written,
+        # so a generous N costs nothing until used. Unwritten rows are never
+        # read (every write fills a whole row, and the arrays are truncated
+        # to the events actually produced)
+        positions = torch.empty(N, self.D, dtype=self.dtype, device=self.device)
+        velocities = torch.empty(N, self.D, dtype=self.dtype, device=self.device)
+        times = torch.empty(N, dtype=self.dtype, device=self.device)
 
         self._reset_sticky_state()
 
@@ -474,6 +491,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
         total_bound_violations = 0
         diag_log = []
         grid_t_max_log = []
+        self._node_cache = None
 
         pbar = tqdm(total=N, desc="GridStickyBoomerang", unit="skel")
         pbar.update(1)
@@ -524,6 +542,8 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                 "wall_seconds": None,
                 "bound_violations": stats.get("bound_violations", 0),
                 "max_ratio": stats.get("max_ratio", 0.0),
+                "proposals": stats.get("proposals"),
+                "rejections": stats.get("rejections"),
             }
 
             # Branch on stats["accepted"], NEVER on a re-derived
@@ -555,6 +575,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                             x_prev, v_prev,
                         )
                     self._freeze(i_hit, vel_now, current_time + advance)
+                    self._node_cache = None
                     pos_now = pos_now.clone()
                     vel_now = vel_now.clone()
                     pos_now[i_hit] = 0.0
@@ -582,6 +603,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                     vel_now = vel_now.clone()
                     vel_now[i_thaw] = self.frozen_velocity[i_thaw]
                     self._thaw(i_thaw)
+                    self._node_cache = None
 
                     time_passed += advance
                     current_time += advance
@@ -610,6 +632,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                 )
                 grad_at_prop = self.grad_U_excess(pos_prop)
                 vel_reflected = self.reflect_velocity_sticky(vel_prop, grad_at_prop)
+                self._node_cache = None
 
                 positions[n] = pos_prop.detach()
                 velocities[n] = vel_reflected.detach()
@@ -624,6 +647,7 @@ class GridStickyBoomerangSampler(GridBoomerangSampler):
                 pbar.update(1)
 
             if dt_refresh <= 1e-14:
+                self._node_cache = None
                 row["wall_seconds"] = _time.perf_counter() - _t0
                 diag_log.append(row)
 

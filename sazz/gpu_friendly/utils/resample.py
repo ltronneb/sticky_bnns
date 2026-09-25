@@ -38,6 +38,7 @@ anchors correctly to chunk k's own last row, already present in chunk k.
 """
 
 import bisect
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -284,8 +285,8 @@ def _find_burnin_t_start(chunk_entries: list[dict], n_burn: int) -> float:
 def _resample_chunked_core(
     chunk_files: list[Path] | list[str], N_resample: int, burnin_frac: float,
     dtype: torch.dtype, device: torch.device | str, manifest_path: Optional[Path | str],
-    interpolate_fn,
-) -> Tensor:
+    interpolate_fn, return_times: bool = False,
+):
     """
     Shared core for all four *_chunked_torch functions below -- mirrors
     the four in-memory resamplers' shared searchsorted-and-gather skeleton
@@ -295,6 +296,9 @@ def _resample_chunked_core(
     Boomerang and sticky/non-sticky -- identical in spirit to the shared
     dt/k_pos/k_vel gather these four functions already do, just factored
     out so this core doesn't need to know which dynamics it's serving.
+
+    return_times=True returns (samples, sample_times) instead of samples,
+    for callers that need each draw's trajectory time (UniformTimeReservoir).
     """
     chunk_entries = _load_manifest(chunk_files, manifest_path)
     if not chunk_entries:
@@ -375,6 +379,8 @@ def _resample_chunked_core(
 
         i = j
 
+    if return_times:
+        return output, sample_times
     return output
 
 
@@ -469,7 +475,8 @@ def resample_zigzag_path_chunked_torch(
     chunk_files: list[Path] | list[str], N_resample: int, burnin_frac: float = 0.1,
     manifest_path: Optional[Path | str] = None,
     dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
-) -> Tensor:
+    return_times: bool = False,
+):
     """
     Chunk-aware equivalent of resample_zigzag_path_torch -- reads directly
     from chunk_files (as written by a chunked sample() call) instead of a
@@ -483,6 +490,7 @@ def resample_zigzag_path_chunked_torch(
 
     return _resample_chunked_core(
         chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+        return_times=return_times,
     )
 
 
@@ -490,7 +498,8 @@ def resample_zigzag_path_sticky_chunked_torch(
     chunk_files: list[Path] | list[str], N_resample: int, burnin_frac: float = 0.1,
     zero_tol: float = 1e-12, manifest_path: Optional[Path | str] = None,
     dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
-) -> Tensor:
+    return_times: bool = False,
+):
     """
     Sticky, chunk-aware equivalent of resample_zigzag_path_sticky_torch --
     same left-endpoint frozen-detection convention (see that function's
@@ -504,6 +513,7 @@ def resample_zigzag_path_sticky_chunked_torch(
 
     return _resample_chunked_core(
         chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+        return_times=return_times,
     )
 
 
@@ -511,7 +521,8 @@ def resample_boomerang_path_chunked_torch(
     chunk_files: list[Path] | list[str], x_ref: Tensor, N_resample: int, burnin_frac: float = 0.1,
     manifest_path: Optional[Path | str] = None,
     dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
-) -> Tensor:
+    return_times: bool = False,
+):
     """
     Chunk-aware equivalent of resample_boomerang_path_torch.
     """
@@ -522,6 +533,7 @@ def resample_boomerang_path_chunked_torch(
 
     return _resample_chunked_core(
         chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+        return_times=return_times,
     )
 
 
@@ -529,7 +541,8 @@ def resample_boomerang_path_sticky_chunked_torch(
     chunk_files: list[Path] | list[str], x_ref: Tensor, N_resample: int, burnin_frac: float = 0.1,
     zero_tol: float = 1e-12, manifest_path: Optional[Path | str] = None,
     dtype: torch.dtype = torch.float64, device: torch.device | str = "cpu",
-) -> Tensor:
+    return_times: bool = False,
+):
     """
     Sticky, chunk-aware equivalent of resample_boomerang_path_sticky_torch.
     """
@@ -542,4 +555,129 @@ def resample_boomerang_path_sticky_chunked_torch(
 
     return _resample_chunked_core(
         chunk_files, N_resample, burnin_frac, dtype, device, manifest_path, interpolate_fn,
+        return_times=return_times,
     )
+
+
+# ===========================================================================
+# Uniform-in-time resampling over a staged trajectory -- new addition.
+# ===========================================================================
+
+def stage_time_range(
+    chunk_files: list[Path] | list[str], manifest_path: Optional[Path | str] = None,
+) -> tuple[float, float]:
+    """(t_start, t_end) of a chunked stage, from its manifest (floats only)."""
+    chunk_entries = _load_manifest(chunk_files, manifest_path)
+    if not chunk_entries:
+        raise ValueError("No chunks found -- chunk_files/manifest_path is empty.")
+    return float(chunk_entries[0]["t_start"]), float(chunk_entries[-1]["t_end"])
+
+
+class UniformTimeReservoir:
+    """
+    Exact "S draws uniform in time over the whole trajectory, after a burn-in
+    of the first burnin_frac of its time" for a trajectory produced and
+    discarded in consecutive stages whose total length is unknown until the
+    last stage is done.
+
+    Keeps n_slots independent slots, each holding one (time, draw) pair that
+    is uniform over the trajectory seen so far. When a stage covering
+    [a, b] arrives and the trajectory so far spans [t0, b], every slot
+    independently switches to a fresh uniform point in [a, b] with
+    probability (b - a) / (b - t0) (probability 1 for the first stage). By
+    induction each slot is uniform over [t0, b] after every stage,
+    independently of the other slots, so the stages never need to be
+    revisited.
+
+    finalize() drops slots with time < t0 + burnin_frac * (T - t0) (the rest
+    are iid uniform over the post-burn-in trajectory) and keeps n_out of the
+    survivors at random. n_slots = ceil(slack * n_out / (1 - burnin_frac)),
+    so survivors fall short of n_out only with negligible probability (with
+    slack 1.2 and n_out 4000 the shortfall is over 25 standard deviations
+    away). Draws are held on CPU, [n_slots, D].
+
+    Replaces pool_stage_draws_time_weighted for staged runs: no with-
+    replacement duplicates, and burn-in is cut by time like the in-memory
+    resamplers instead of by whole stages (events).
+    """
+
+    def __init__(self, n_out: int, burnin_frac: float, slack: float = 1.2,
+                 generator: Optional[torch.Generator] = None):
+        if not 0.0 <= burnin_frac < 1.0:
+            raise ValueError(f"burnin_frac must be in [0, 1), got {burnin_frac}")
+        self.n_out = n_out
+        self.burnin_frac = burnin_frac
+        self.n_slots = math.ceil(slack * n_out / (1.0 - burnin_frac))
+        self.generator = generator
+        self.times = torch.full((self.n_slots,), float("nan"), dtype=torch.float64)
+        self.draws: Optional[Tensor] = None
+        self.t0: Optional[float] = None
+        self.t_end: Optional[float] = None
+        self.n_evaluated = 0
+
+    def add_stage(self, t_start: float, t_end: float, draw_fn) -> int:
+        """
+        draw_fn(n) -> (draws [n, D], times [n]) with the n times drawn iid
+        uniform on [t_start, t_end] (e.g. a chunked resampler with
+        burnin_frac=0.0 and return_times=True). Returns how many slots
+        switched to this stage.
+        """
+        if self.t0 is None:
+            self.t0 = t_start
+            p_switch = 1.0
+        else:
+            if abs(t_start - self.t_end) > 1e-9 * max(1.0, abs(self.t_end)):
+                raise ValueError(
+                    f"stages must be contiguous: previous stage ended at {self.t_end}, "
+                    f"this one starts at {t_start}"
+                )
+            p_switch = (t_end - t_start) / (t_end - self.t0)
+        self.t_end = t_end
+
+        u = torch.rand(self.n_slots, dtype=torch.float64, generator=self.generator)
+        idx = torch.nonzero(u < p_switch).squeeze(-1)
+        n = int(idx.numel())
+        if n == 0:
+            return 0
+
+        draws, times = draw_fn(n)
+        # Draws come back sorted by time; shuffle so which slot gets which
+        # draw is unrelated to its time
+        perm = torch.randperm(n, generator=self.generator)
+        draws = draws[perm.to(draws.device)].detach().cpu()
+        times = times[perm.to(times.device)].detach().cpu().to(torch.float64)
+
+        if self.draws is None:
+            self.draws = torch.zeros(self.n_slots, draws.shape[1], dtype=draws.dtype)
+        self.draws[idx] = draws.to(self.draws.dtype)
+        self.times[idx] = times
+        self.n_evaluated += n
+        return n
+
+    def finalize(self) -> tuple[Tensor, Tensor, dict]:
+        """(draws [n_out, D], times [n_out], info). Draws are in random order."""
+        if self.draws is None:
+            raise ValueError("finalize() called before any stage was added.")
+        t_cut = self.t0 + self.burnin_frac * (self.t_end - self.t0)
+        keep = torch.nonzero(self.times >= t_cut).squeeze(-1)
+        n_survivors = int(keep.numel())
+        if n_survivors < self.n_out:
+            import warnings
+            warnings.warn(
+                f"UniformTimeReservoir: only {n_survivors} post-burn-in slots for "
+                f"n_out={self.n_out}; returning all of them.",
+                RuntimeWarning,
+            )
+            chosen = keep
+        else:
+            perm = torch.randperm(n_survivors, generator=self.generator)[: self.n_out]
+            chosen = keep[perm]
+        info = {
+            "t0": self.t0,
+            "t_end": self.t_end,
+            "burnin_t_cut": t_cut,
+            "n_slots": self.n_slots,
+            "n_survivors": n_survivors,
+            "n_evaluated": self.n_evaluated,
+        }
+        return self.draws[chosen], self.times[chosen], info

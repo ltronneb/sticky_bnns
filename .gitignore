@@ -24,6 +24,7 @@
 *.xlsx
 *.pt
 *.json
+*.pdf
 
 # Logs and databases #
 ######################
@@ -53,5 +54,7 @@ personal/
 datasets/
 results/
 goan/
+goan_scripts/
+tbnn/
 goan_esbps/
 goan_tpdmp/

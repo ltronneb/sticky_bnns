@@ -391,6 +391,9 @@ def cmd_sample(args) -> None:
     dw.TIME_WEIGHTED_RESAMPLE = not args.equal_draws_per_stage
     dw.POOL_PER_STAGE = args.pool_per_stage
     dw.STAGE_DIR = args.stage_dir if args.stage_dir is not None else (args.out / "chunks")
+    dw.BOUND_MODE = args.bound_mode
+    dw.ADAPT_RULE = args.adapt_rule
+    dw.SINGLE_SEGMENT_T_MAX_INIT = args.single_segment_t_max_init
 
     if args.stage_size is None:
         raise SystemExit(
@@ -558,10 +561,18 @@ def main():
                     dest="stage_dir",
                     help="Transient stage dirs. Default <out>/chunks. A chain_N/ level "
                          "is appended automatically so concurrent chains never collide.")
-    ps.add_argument("--pool-per-stage", type=int, default=dw.POOL_PER_STAGE)
+    ps.add_argument("--pool-per-stage", type=int, default=dw.POOL_PER_STAGE,
+                    help="Most draws per resampler call (device memory only, see "
+                         "deep_wide_uci.py).")
     ps.add_argument("--equal-draws-per-stage", action="store_true",
-                    help="Revert to per-stage-uniform resampling instead of "
-                         "time-weighted pooling (see deep_wide_uci.py).")
+                    help="Revert to per-stage-uniform resampling instead of the "
+                         "uniform-in-time reservoir (see deep_wide_uci.py).")
+    ps.add_argument("--bound-mode", choices=["grid", "single_segment"], default=dw.BOUND_MODE,
+                    help="Same as deep_wide_uci.py's --bound-mode.")
+    ps.add_argument("--adapt-rule", choices=["alg4", "balanced"], default=dw.ADAPT_RULE,
+                    help="Same as deep_wide_uci.py's --adapt-rule.")
+    ps.add_argument("--single-segment-t-max-init", type=float, default=None,
+                    help="Same as deep_wide_uci.py's --single-segment-t-max-init.")
     ps.add_argument("--grad-batch-size", type=int, default=None,
                     help="Opt into minibatched gradients. Default None = full batch, "
                          "matching deep_wide_uci.py and keeping the chains comparable "

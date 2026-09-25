@@ -1,27 +1,3 @@
-"""
-
-Two analyses, LeNet5 / MNIST:
-
-  A. PREDICTIVE QUALITY & CALIBRATION on clean MNIST, MAP vs posterior:
-     accuracy / NLL / ECE / Brier / entropy + reliability diagram + entropy
-     split (correct vs wrong).
-
-  B. STRUCTURED-SPARSITY LEDGER: per-layer survival ("ever non-zero" vs
-     "non-zero in every draw"), conv-filter / (filter,in-channel) death
-     with posterior probability 1, accuracy vs sparsity vs the MAP, and
-     per-layer posterior displacement from MAP in prior-std units on the
-     non-frozen coordinates.
-
-Plus the ROTATION / PIXEL-NOISE corruption sweep from lenet_pixel_noise.ipynb
-(shared with analyze_ffn_mnist_paper.py via notebooks/utils/image_nets.py):
-accuracy / P(true) / confidence / entropy under rotation and additive pixel
-noise, pooled over a handful of digit classes.
-
-The saliency / localised border-vs-digit noise analysis that used to live
-here has been dropped as redundant with the rotation/noise sweep below.
-
-"""
-
 from __future__ import annotations
 
 # %%
@@ -75,11 +51,7 @@ RUN_DISPLAY = {"zigzag": "Sticky Zig-Zag", "boomerang": "Sticky Boomerang"}
 # 88.8%-sparse pruned+refit MAP -- verified below to bit-match both runs.
 MAP_REF_PATH = Path("results/maps/lenet_reference_N60000_pruned_refit_N60k.pt")
 
-# Plain SGD baseline (lenet_sgd.py) -- genuinely unrelated to MAP_REF_PATH's
-# pruned+refit x_ref: no prior term, no pruning, dense weights throughout.
-# This is the frequentist reference the noise sweep needs to play the role
-# Izmailov et al. (2021) Fig 15's "SGD" curve plays, since the MAP point is
-# a pruned/refit object and not a fair stand-in for it.
+# Plain SGD baseline (lenet_sgd.py) -- genuinely unrelated to the samplers
 SGD_REF_PATH = Path("results/maps/lenet_sgd_N60000_epochs40.pt")
 
 # Prior hyper-params the run used (fast_mnist_cnn.py defaults).
@@ -91,7 +63,7 @@ ACTIVATION = "relu"
 POOL = "max"        # overridden from the checkpoint below if it disagrees
 
 N_PRED_DRAWS = 300  # LeNet forwards are cheap; 300 draws is fine
-N_TEST = 1000
+N_TEST = 10_000  # full MNIST test pool
 ZERO_TOL = 1e-8
 
 MNIST_MEAN, MNIST_STD = 0.1307, 0.3081
@@ -242,36 +214,36 @@ print(clean_df.to_string(float_format=lambda v: f"{v:.4f}"))
 # clean_df.to_csv(SAVE_DIR / "tableA_clean_metrics.csv")
 
 
-# %%
-# --- FIGURE A1: reliability diagram ---
-# fig, ax = plt.subplots(figsize=(5.2, 5))
-# ax.plot([0, 1], [0, 1], "k:", lw=1, label="perfect")
-# for name, d in clean_probs.items():
-#     disp = name if name == "MAP" else RUN_DISPLAY.get(name, name)
-#     m = inet.calibration_metrics(y_test, d["post_mean"])
-#     if not m["bin_stats"]:
-#         continue
-#     bc, ba, _ = zip(*m["bin_stats"])
-#     ax.plot(bc, ba, marker="o", ms=5, label=f"{disp} (ECE={m['ece']:.3f})")
-# ax.set(xlabel="confidence", ylabel="empirical accuracy",
-#        title="Reliability -- LeNet5 / MNIST", xlim=(0, 1), ylim=(0, 1))
-# ax.legend(fontsize=9)
-# fig.tight_layout()
-# plt.show()
-# fig.savefig(SAVE_DIR / "figA1_reliability.pdf", bbox_inches="tight")
-
 
 # %%
 # --- FIGURE A2: predictive entropy, correct vs wrong ---
+_p_sgd = predict_probs(X_SGD, X_test)
+_ent_sgd = inet.entropy(_p_sgd)
+_ok_sgd = _p_sgd.argmax(-1) == y_test
+
+import numpy as np
+from scipy.stats import gaussian_kde
+
 fig, axes = plt.subplots(1, len(runs), figsize=(5.2 * len(runs), 4), squeeze=False)
+
 for ax, (label, _) in zip(axes[0], runs.items()):
     mp = clean_probs[label]["post_mean"]
-    ent = inet.entropy(mp)
-    ok = mp.argmax(-1) == y_test
-    ax.hist(ent[ok].numpy(), bins=40, histtype="step", lw=1.5, label="correct")
-    ax.hist(ent[~ok].numpy(), bins=40, histtype="step", lw=1.5, ls="--", label="wrong")
-    ax.set(xlabel="predictive entropy", ylabel="count", yscale="log",
-           title=f"{RUN_DISPLAY[label]}: entropy by outcome")
+    ent = inet.entropy(mp).numpy()
+    ok = (mp.argmax(-1) == y_test).numpy()
+    ent_sgd = _ent_sgd.numpy()
+    ok_sgd = _ok_sgd.numpy()
+    for x, color, ls, lbl in [
+        (ent[ok], "tab:green", "-", "correct"),
+        (ent[~ok], "tab:red", "-", "wrong"),
+        (ent_sgd[ok_sgd], "tab:green", "--", "SGD correct"),
+        (ent_sgd[~ok_sgd], "tab:red", "--", "SGD wrong"),
+    ]:
+        kde = gaussian_kde(x)
+        xx = np.linspace(0, max(ent.max(), ent_sgd.max()), 500)
+        ax.plot(xx, kde(xx), color=color, ls=ls, lw=1.8, label=lbl)
+    ax.set(
+        xlabel="predictive entropy", ylabel="density", yscale="log", title=f"{RUN_DISPLAY[label]}: entropy by outcome",
+    )
     ax.legend()
 fig.tight_layout()
 plt.show()
@@ -280,75 +252,25 @@ plt.show()
 
 # %%
 # ==========================================================================
-# ANALYSIS B -- structured-sparsity ledger
+# ANALYSIS B -- headline predictive-metrics table: SGD, MAP, both samplers
 # ==========================================================================
-# ledgers = {label: inet.sparsity_ledger(ck["samples"], ZERO_TOL) for label, ck in runs.items()}
+#_p_sgd = predict_probs(X_SGD, X_test)
+_m_sgd = inet.calibration_metrics(y_test, _p_sgd)
 
-# # --- B1: per-layer survival ---
-# c1_df = inet.layer_survival_table(ledgers, RUN_DISPLAY, LAYERS, layer_slices)
-# print("\n=== Analysis B1: per-layer weight survival ===")
-# print(c1_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-# # c1_df.to_csv(SAVE_DIR / "tableB1_layer_survival.csv", index=False)
+summary_rows = [{"model": "SGD", **{k: _m_sgd[k] for k in ("acc", "ece", "nll", "brier")}}]
+for row in clean_rows:
+    summary_rows.append({"model": row["model"],
+                         **{k: row[k] for k in ("acc", "ece", "nll", "brier")}})
 
-# inet.print_static_vs_dynamic_sparsity(runs, ledgers, RUN_DISPLAY, ZERO_TOL)
-
-# fig = inet.plot_layer_survival(c1_df, ledgers, RUN_DISPLAY, LAYERS,
-#                                "Per-layer weight survival under the sticky-PDMP posterior")
-# plt.show()
-# fig.savefig(SAVE_DIR / "figB1_layer_survival.pdf", bbox_inches="tight")
-
-
-# %%
-# --- B2: conv-filter / (filter, in-channel) death with posterior prob 1 ---
-# c2_rows = []
-# for label, ck in runs.items():
-#     s = ck["samples"]
-#     for lname in CONV_LAYERS:
-#         a, b = layer_slices[lname]
-#         shp = dict(_ref_module.named_parameters())[lname].shape   # [out,in,kh,kw]
-#         w = s[:, a:b].reshape(s.shape[0], *shp)
-#         wz = (w.abs() < ZERO_TOL)
-#         filt_dead = wz.all(dim=(0, 2, 3, 4))
-#         slab_dead = wz.all(dim=(0, 3, 4))
-#         c2_rows.append({
-#             "run": RUN_DISPLAY[label], "layer": lname,
-#             "out_ch": shp[0], "in_ch": shp[1],
-#             "dead_filters": int(filt_dead.sum()), "dead_filter_frac": filt_dead.float().mean().item(),
-#             "dead_slabs": int(slab_dead.sum()), "dead_slab_frac": slab_dead.float().mean().item(),
-#         })
-# c2_df = pd.DataFrame(c2_rows)
-# print("\n=== Analysis B2: structured death (posterior prob 1) ===")
-# print(c2_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-# c2_df.to_csv(SAVE_DIR / "tableB2_structured_death.csv", index=False)
-
-
-# %%
-# --- B3: accuracy vs sparsity, posterior vs MAP ---
-# c3_df = inet.accuracy_vs_sparsity_table(clean_df, X_REF, runs, RUN_DISPLAY, ZERO_TOL)
-# print("\n=== Analysis B3: accuracy vs sparsity ===")
-# print(c3_df.to_string(float_format=lambda v: f"{v:.4f}"))
-# # c3_df.to_csv(SAVE_DIR / "tableB3_acc_vs_sparsity.csv")
-
-
-# # %%
-# # --- B4: per-layer posterior displacement from MAP (non-frozen coords) ---
-# c4_df = inet.displacement_table(runs, ledgers, RUN_DISPLAY, LAYERS, layer_slices,
-#                                 X_REF, prior_std, D)
-# print("\n=== Analysis B4: posterior displacement from MAP (moving coords) ===")
-# print(c4_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
-# # c4_df.to_csv(SAVE_DIR / "tableB4_displacement.csv", index=False)
-
-# fig = inet.plot_displacement(c4_df, runs, RUN_DISPLAY, LAYERS,
-#                              "Posterior exploration around the MAP, per layer (moving coords only)")
-# plt.show()
-# fig.savefig(SAVE_DIR / "figB4_displacement.pdf", bbox_inches="tight")
+summary_df = pd.DataFrame(summary_rows).set_index("model")
+print(f"\n=== Analysis B: predictive metrics on full MNIST test set (N={N_TEST}) ===")
+print(summary_df.to_string(float_format=lambda v: f"{v:.4f}"))
+# summary_df.to_csv(SAVE_DIR / "tableB_headline_metrics.csv")
 
 
 # %%
 # ==========================================================================
-# ANALYSIS C -- rotation / pixel-noise corruption sweep
-#   (ported from lenet_pixel_noise.ipynb; MAP flows through as a 1-draw
-#   point estimate so it renders on the same axes as the samplers)
+# ANALYSIS C -- rotation / pixel-noise corruption
 # ==========================================================================
 sweep_runs = dict(runs)
 sweep_runs["map"] = {"samples": X_REF.unsqueeze(0)}
@@ -365,22 +287,15 @@ def _noise(X, lv, seed=0):
     return inet.noise_batch(X, lv, MNIST_MEAN, MNIST_STD, seed=seed)
 
 
-rot_levels, rot_spans, rot_X, rot_agg = inet.run_shift_sweep(
-    ANGLES, _rotate, CLASSES, y_test, X_test, sweep_runs, predict_probs,
-    N_PER_CLASS, N_DRAWS_POOL, POOL_SEED, NOISE_SEED)
+# rot_levels, rot_spans, rot_X, rot_agg = inet.run_shift_sweep(
+#     ANGLES, _rotate, CLASSES, y_test, X_test, sweep_runs, predict_probs,
+#     N_PER_CLASS, N_DRAWS_POOL, POOL_SEED, NOISE_SEED)
 noi_levels, noi_spans, noi_X, noi_agg = inet.run_shift_sweep(
     SIGMAS, _noise, CLASSES, y_test, X_test, sweep_runs, predict_probs,
     N_PER_CLASS, N_DRAWS_POOL, POOL_SEED, NOISE_SEED)
-print(f"[rotation] {len(sweep_runs)} models x {len(CLASSES)} digits x {len(ANGLES)} levels")
+# print(f"[rotation] {len(sweep_runs)} models x {len(CLASSES)} digits x {len(ANGLES)} levels")
 print(f"[noise]    {len(sweep_runs)} models x {len(CLASSES)} digits x {len(SIGMAS)} levels")
 
-
-# %%
-# fig = inet.shift_figure("noise", noi_levels, noi_agg, sweep_runs, SWEEP_DISPLAY, CLASSES,
-#                         xlabel=r"Pixel-noise $\sigma$", title="MNIST LeNet5 under pixel noise",
-#                         point_labels=("map", "sgd"))
-# plt.show()
-# # fig.savefig(SAVE_DIR / "MNIST_noise_paper.pdf", bbox_inches="tight")
 
 # fig = inet.shift_figure("rotation", rot_levels, rot_agg, sweep_runs, SWEEP_DISPLAY, CLASSES,
 #                         xlabel="Rotation (degrees)", title="MNIST LeNet5 under rotation",
@@ -401,50 +316,3 @@ fig = inet.paper_style_figure(
 plt.show()
 fig.savefig(SAVE_DIR / "MNIST_noise_paperstyle.pdf", bbox_inches="tight")
 
-
-# %%
-# fig = inet.bar_grid_appendix("noise", [0.0, 0.3, 0.5, 0.7, 1.0, 1.5], noi_agg,
-#                              sweep_runs, SWEEP_DISPLAY, CLASSES, SWEEP_COLORS,
-#                              point_labels=("map", "sgd"))
-# plt.show()
-# # fig.savefig(SAVE_DIR / "MNIST_noise_bars_appendix.pdf", bbox_inches="tight")
-
-# fig = inet.bar_grid_appendix("rotation", [0, 15, 30, 45, 90, 120, 180], rot_agg,
-#                              sweep_runs, SWEEP_DISPLAY, CLASSES, SWEEP_COLORS,
-#                              point_labels=("map", "sgd"))
-# plt.show()
-# # fig.savefig(SAVE_DIR / "MNIST_rotation_bars_appendix.pdf", bbox_inches="tight")
-
-
-# %%
-# ==========================================================================
-# 5. One-screen summary for the paper's text
-# ==========================================================================
-# print("\n" + "=" * 70)
-# print("SUMMARY -- numbers to quote (LeNet5 / MNIST)")
-# print("=" * 70)
-# mrow = clean_df.loc["MAP (pruned x_ref)"]
-# print(f"\nMAP (pruned x_ref): acc={mrow['acc']:.3f}  NLL={mrow['nll']:.3f}  "
-#       f"ECE={mrow['ece']:.3f}  Brier={mrow['brier']:.3f}  H={mrow['mean_entropy']:.3f}  "
-#       f"sparsity={c3_df.loc['MAP (pruned x_ref)', 'weight_sparsity']:.3f}")
-# for label, ck in runs.items():
-#     name = RUN_DISPLAY[label]
-#     L = ledgers[label]
-#     row = clean_df.loc[name]
-#     print(f"\n[{name}]")
-#     print(f"  clean:  acc={row['acc']:.3f}  NLL={row['nll']:.3f}  ECE={row['ece']:.3f}  "
-#           f"Brier={row['brier']:.3f}  H={row['mean_entropy']:.3f}")
-#     per_draw = (np.abs(ck["samples"].numpy()) < ZERO_TOL).mean(1).mean()
-#     churn = 1 - L["always_zero"].mean() - L["always_nonzero"].mean()
-#     print(f"  weight sparsity: per-draw {per_draw:.3f}  |  zero in EVERY draw "
-#           f"{L['always_zero'].mean():.3f} ({int(L['always_zero'].sum()):,}/{D:,})  |  "
-#           f"churning {churn:.3f}")
-#     dead_f = c2_df[c2_df['run'] == name]['dead_filters'].sum()
-#     tot_f = c2_df[c2_df['run'] == name]['out_ch'].sum()
-#     print(f"  conv filters dead w.p. 1: {dead_f} / {tot_f}")
-#     sev3_noise = noi_agg[label][("pool", SIGMAS[-1])]
-#     print(f"  noise sigma={SIGMAS[-1]:g}: acc={sev3_noise['acc']:.3f}  "
-#           f"conf={sev3_noise['conf']:.3f}  entropy={sev3_noise['entropy']:.3f}")
-#     rot180 = rot_agg[label][("pool", 180)]
-#     print(f"  rotation 180deg:      acc={rot180['acc']:.3f}  "
-#           f"conf={rot180['conf']:.3f}  entropy={rot180['entropy']:.3f}")

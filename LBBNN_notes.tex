@@ -1,0 +1,64 @@
+\subsection{Tuning the LBBNN baseline}
+\label{sec:lbbnn-tuning}
+
+Since LBBNN underperforms the sampling-based methods on the UCI
+benchmarks, we verified that this reflects the method rather than a poor
+choice of hyperparameters. We tuned the two knobs governing its
+spike-and-slab posterior on \textsc{boston}, over the same five splits
+used throughout, holding all else fixed.
+
+\paragraph{Concrete temperature.}
+The relaxation temperature $\tau$ of the Bernoulli inclusion variables was
+varied over $\tau \in \{0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8\}$, against our
+default $\tau = 0.2$. Within the range where the variational posterior
+remains non-degenerate ($\tau \leq 0.2$), test RMSE spans $3.36$--$3.52$,
+a band narrower than its own standard error ($\approx 0.23$) and not
+monotone in $\tau$. The best setting, $\tau = 0.05$, gives
+$3.36 \pm 0.24$ against $3.52 \pm 0.23$ at the default; the paired
+difference over splits is $-0.16$ ($t = -1.6$, $4/5$ splits improved),
+which we do not regard as significant.
+
+Larger temperatures appear to improve accuracy markedly: $\tau = 0.5$
+attains RMSE $3.11$ and the lowest NLL of any configuration tested. These
+runs are, however, degenerate. The mean variational standard deviation
+collapses from $2.8 \times 10^{-1}$ to $1.5 \times 10^{-6}$ and the mean
+inclusion probability rises to $0.97$, i.e.\ the posterior contracts to a
+point mass over an essentially dense network. Both RMSE and NLL improve
+monotonically as this collapse proceeds, so neither predictive metric
+identifies the failure; only the posterior scale and the inclusion
+probabilities do. We therefore exclude $\tau \geq 0.3$, and note more
+generally that predictive accuracy alone is not a safe criterion for
+selecting this hyperparameter.
+
+\paragraph{Model-space prior.}
+The Beta--Binomial prior on the inclusion indicators, with shape
+parameters $(p_a, p_b)$, was varied over seven settings spanning prior
+mean inclusion $0.048$ to $0.667$. All runs remained non-degenerate. The
+fitted mean inclusion $\alpha$ responds strongly and monotonically,
+falling from $0.248$ at our default $p_a = p_b = 1$ to $0.032$ at
+$(1, 20)$, i.e.\ sparsity rises from ${\approx}75\%$ to ${\approx}97\%$.
+Over that same range test RMSE varies only between $3.43$ and $3.64$,
+again within noise. The response is governed by $p_b$ rather than by the
+prior mean: $(0.5, 5)$ and $(1, 5)$ share $p_b$ and yield identical
+$\alpha = 0.077$, whereas $(0.5, 5)$ and $(1, 10)$ share a prior mean of
+$0.091$ and do not; and $(2, 1)$, which raises the prior mean to $0.667$
+but leaves $p_b = 1$, reproduces the default $\alpha = 0.248$ exactly.
+
+\paragraph{Consequences.}
+Neither knob closes the gap to the sampling-based methods, and we retain
+the defaults ($\tau = 0.2$, $p_a = p_b = 1$) throughout. The LBBNN
+results reported here should therefore be read as reflecting the
+limitations of the variational approximation itself rather than
+insufficient tuning.
+
+The sparsity comparison warrants a further caveat. LBBNN's inclusion
+level is largely set by the prior and is nearly insensitive to the data:
+across \textsc{boston}, \textsc{yacht}, \textsc{energy} and
+\textsc{concrete} the fitted $\alpha$ lies in $[0.235, 0.250]$, a spread
+of roughly $0.01$, and on a single dataset it can be moved across a
+$22$-point range in sparsity at no measurable cost in predictive
+accuracy. The sticky samplers, by contrast, recover sparsity levels
+between $37\%$ and $62\%$ on the same four datasets, ordered by dataset.
+The relevant distinction is thus not which method reports the larger
+sparsity figure, but that LBBNN's is specified in advance whereas the
+sticky samplers' is inferred.

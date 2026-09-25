@@ -15,7 +15,7 @@ where the raw horizon would silently advance past unexamined trajectory time.
 import math
 import time as _time
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import numpy as np
 import torch
@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 # from ..utils.grid_bound import grid_thinning
 from ..utils.fast_grid_bound import grid_thinning
+from ..utils.single_segment_bound import single_segment_thinning, adapt_t_max
 
 
 class GridBoomerangSampler(nn.Module):
@@ -55,6 +56,13 @@ class GridBoomerangSampler(nn.Module):
     [K, D] with K = n_segments+1 concurrent forward+backward graphs through
     the target can OOM on larger BNN/CNN targets; default None keeps the
     current unchunked behavior.
+    bound_mode: "grid" (default, grid_thinning over n segments) or
+    "single_segment" (single_segment_bound.py: the whole t_max window is
+    one segment, its right node is reused as the next window's left node,
+    and grid_spacing/n_segments are unused). Not safe with a per-call
+    minibatch hook (mb_grid_*): a new minibatch makes the cached node stale.
+    adapt_rule: t_max adaptation in "single_segment" mode, "alg4" (default,
+    same rule as "grid" mode) or "balanced" (see adapt_t_max).
     """
 
     def __init__(
@@ -72,6 +80,8 @@ class GridBoomerangSampler(nn.Module):
         grid_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
+        bound_mode: Literal["grid", "single_segment"] = "grid",
+        adapt_rule: Literal["alg4", "balanced"] = "alg4",
     ):
         super().__init__()
         self.D = D
@@ -94,6 +104,15 @@ class GridBoomerangSampler(nn.Module):
         # Adaptive horizon -- persists across _grid_bound calls (sampler
         # state; grid_bound.py itself stays stateless).
         self._grid_t_max = float(grid_t_max_init)
+
+        if bound_mode not in ("grid", "single_segment"):
+            raise ValueError(f"unknown bound_mode {bound_mode!r}")
+        self.bound_mode = bound_mode
+        self.adapt_rule = adapt_rule
+        # single_segment mode only: (y, d) at the current window start, valid
+        # only while the trajectory continues unchanged -- cleared by sample()
+        # on every state change
+        self._node_cache = None
 
         # Reference-measure quantities (set by preprocess)
         self.x_ref: Optional[Tensor] = None
@@ -212,6 +231,13 @@ class GridBoomerangSampler(nn.Module):
         grid_was_binding = self._grid_t_max <= dt_refresh
         horizon = min(self._grid_t_max, dt_refresh)
 
+        if self.bound_mode == "single_segment":
+            return self._single_segment_bound(
+                self._make_rate_and_grad_fn(pos, vel),
+                partial(self._rate_scalar, x=pos.detach(), v=vel.detach()),
+                horizon, t_max_binding=grid_was_binding,
+            )
+
         # n_segments computed ONCE from the incoming horizon and held fixed
         # for the lifetime of this grid_thinning call -- including across
         # any internal Section 4.7 shrink/rebuild on a bound violation.
@@ -256,6 +282,33 @@ class GridBoomerangSampler(nn.Module):
 
         return tau, stats
 
+    def _single_segment_bound(
+        self, rate_and_grad_fn, rate_scalar_fn, horizon: float, t_max_binding: bool,
+    ) -> tuple[float, dict]:
+        """
+        bound_mode="single_segment": one tangent-line segment over the whole
+        window, left node from self._node_cache. The right node is cached
+        only when t_max was the binding horizon candidate (a refresh, hit or
+        thaw at the window end changes the trajectory). Shared with the
+        sticky subclass, which passes its own closures and binding.
+        """
+        tau, stats = single_segment_thinning(
+            rate_and_grad_fn, rate_scalar_fn, horizon,
+            left_node=self._node_cache, device=self.device, dtype=self.dtype,
+            diagnostics=True, **self.grid_kwargs,
+        )
+        right_node = stats.pop("right_node")
+        self._node_cache = right_node if t_max_binding else None
+
+        stats["n_segments"] = 1
+        stats["horizon"] = horizon
+
+        self._grid_t_max = adapt_t_max(
+            self._grid_t_max, stats, tau, horizon, t_max_binding, self.adapt_rule,
+            self.alpha_plus, self.alpha_minus, self.alpha_violation,
+        )
+        return tau, stats
+
     # ------------------------------------------------------------------
     # Velocity refresh
     # ------------------------------------------------------------------
@@ -275,9 +328,13 @@ class GridBoomerangSampler(nn.Module):
         truncated to the actual event count if stopped early via budget)."""
         assert self.x_ref is not None, "Call preprocess() first."
 
-        positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
-        velocities = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
-        times = torch.zeros(N, dtype=self.dtype, device=self.device)
+        # torch.empty, not zeros: memory is only committed as rows are written,
+        # so a generous N costs nothing until used. Unwritten rows are never
+        # read (every write fills a whole row, and the arrays are truncated
+        # to the events actually produced)
+        positions = torch.empty(N, self.D, dtype=self.dtype, device=self.device)
+        velocities = torch.empty(N, self.D, dtype=self.dtype, device=self.device)
+        times = torch.empty(N, dtype=self.dtype, device=self.device)
 
         if x0 is None:
             positions[0] = self.x_ref + self._refresh_velocity()
@@ -293,6 +350,7 @@ class GridBoomerangSampler(nn.Module):
         total_bound_violations = 0
         diag_log = []
         grid_t_max_log = []
+        self._node_cache = None
 
         pbar = tqdm(total=N, desc="GridBoomerang", unit="skel")
         pbar.update(1)
@@ -327,6 +385,8 @@ class GridBoomerangSampler(nn.Module):
                 "wall_seconds": None,
                 "bound_violations": stats.get("bound_violations", 0),
                 "max_ratio": stats.get("max_ratio", 0.0),
+                "proposals": stats.get("proposals"),
+                "rejections": stats.get("rejections"),
             }
 
             # Branch on stats["accepted"] (equivalently tau < math.inf, what
@@ -360,6 +420,7 @@ class GridBoomerangSampler(nn.Module):
                 )
                 grad_at_prop = self.grad_U_excess(pos_prop)
                 vel_reflected = self.reflect_velocity(vel_prop, grad_at_prop)
+                self._node_cache = None
 
                 positions[n] = pos_prop.detach()
                 velocities[n] = vel_reflected.detach()
@@ -374,6 +435,7 @@ class GridBoomerangSampler(nn.Module):
                 pbar.update(1)
 
             if dt_refresh <= 1e-14:
+                self._node_cache = None
                 row["wall_seconds"] = _time.perf_counter() - _t0
                 diag_log.append(row)
 

@@ -93,6 +93,8 @@ class GridStickyZigZagSampler(GridZigZagSampler):
         grid_kwargs: Optional[dict] = None,
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
+        bound_mode: str = "grid",
+        adapt_rule: str = "alg4",
     ):
         super().__init__(
             grad_target=grad_target,
@@ -109,6 +111,8 @@ class GridStickyZigZagSampler(GridZigZagSampler):
             grid_kwargs=grid_kwargs,
             dtype=dtype,
             device=device,
+            bound_mode=bound_mode,
+            adapt_rule=adapt_rule,
         )
 
         if isinstance(kappa, (int, float)):
@@ -403,6 +407,18 @@ class GridStickyZigZagSampler(GridZigZagSampler):
 
         rate_and_grad_fn = self._make_rate_and_grad_fn_sticky(pos, vel)
         rate_scalar_fn = partial(self._rate_scalar_sticky, x=pos.detach(), v=vel.detach())
+
+        if self.bound_mode == "single_segment":
+            # offset is folded into the bound at build time, not stored in
+            # the cached node, and a freeze/thaw (the only thing that changes
+            # n_active) clears the cache in sample()
+            tau, stats = self._single_segment_bound(
+                rate_and_grad_fn, rate_scalar_fn, horizon, offset=offset,
+                t_max_binding=(binding == "grid_t_max"),
+            )
+            stats["binding"] = binding
+            return tau, stats
+
         bound_fn = partial(
             build_grid_bound_vectorized,
             signed=(self.strategy == "vectorized_signed"),
@@ -446,9 +462,13 @@ class GridStickyZigZagSampler(GridZigZagSampler):
         semantics -- identical contract here (N stays a required
         pre-allocation size / hard safety cap; positions/velocities/times
         truncated to the actual event count if stopped early via budget)."""
-        positions = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
-        velocities = torch.zeros(N, self.D, dtype=self.dtype, device=self.device)
-        times = torch.zeros(N, dtype=self.dtype, device=self.device)
+        # torch.empty, not zeros: memory is only committed as rows are written,
+        # so a generous N costs nothing until used. Unwritten rows are never
+        # read (every write fills a whole row, and the arrays are truncated
+        # to the events actually produced)
+        positions = torch.empty(N, self.D, dtype=self.dtype, device=self.device)
+        velocities = torch.empty(N, self.D, dtype=self.dtype, device=self.device)
+        times = torch.empty(N, dtype=self.dtype, device=self.device)
 
         self._reset_sticky_state()
 
@@ -467,6 +487,7 @@ class GridStickyZigZagSampler(GridZigZagSampler):
         total_bound_violations = 0
         diag_log = []
         grid_t_max_log = []
+        self._node_cache = None
 
         pbar = tqdm(total=N, desc="GridStickyZigZag", unit="skel")
         pbar.update(1)
@@ -510,6 +531,8 @@ class GridStickyZigZagSampler(GridZigZagSampler):
                 "bound_violations": stats.get("bound_violations", 0),
                 "max_ratio": stats.get("max_ratio", 0.0),
                 "curvature_ratio": stats.get("curvature_ratio", 0.0),
+                "proposals": stats.get("proposals"),
+                "rejections": stats.get("rejections"),
                 "n_segments": stats.get("n_segments"),
                 "effective_spacing": stats.get("effective_spacing"),
             }
@@ -547,6 +570,7 @@ class GridStickyZigZagSampler(GridZigZagSampler):
                     # deadline _freeze draws here must be anchored at that
                     # true (post-advance) time, not the stale current_time.
                     self._freeze(i_hit, vel_now, current_time + advance)
+                    self._node_cache = None
                     pos_now = pos_now.clone()
                     vel_now = vel_now.clone()
                     # Hand-zero the newly-frozen coordinate: frozen_mask[i_hit]
@@ -582,6 +606,7 @@ class GridStickyZigZagSampler(GridZigZagSampler):
                     vel_now = vel_now.clone()
                     vel_now[i_thaw] = self.frozen_velocity[i_thaw]
                     self._thaw(i_thaw)
+                    self._node_cache = None
 
                     time_passed += advance
                     current_time += advance
@@ -616,6 +641,7 @@ class GridStickyZigZagSampler(GridZigZagSampler):
                 i_flip = int(torch.multinomial(probs, 1).item())
 
                 vel_flipped = self.flip_velocity(vel_prop, i_flip)
+                self._node_cache = None
                 grad_evals += 1
                 row["rate_evals"] += 1
                 row["flipped_coord"] = i_flip

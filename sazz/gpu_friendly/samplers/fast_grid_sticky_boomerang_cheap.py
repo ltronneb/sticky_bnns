@@ -138,6 +138,8 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
         resample_grad_batch: Optional[Callable[[], None]] = None,
+        bound_mode: str = "grid",
+        adapt_rule: str = "alg4",
     ):
         super().__init__(
             grad_target=grad_target,
@@ -153,6 +155,8 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
             grid_kwargs=grid_kwargs,
             dtype=dtype,
             device=device,
+            bound_mode=bound_mode,
+            adapt_rule=adapt_rule,
         )
 
         # See FastGridStickyZigZagSampler's identical hook for the full
@@ -498,6 +502,17 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
         binding = min(candidates, key=candidates.get)
         horizon = candidates[binding]
 
+        if self.bound_mode == "single_segment":
+            # GridBoomerangSampler._single_segment_bound -- sample() clears the
+            # node cache on every freeze/thaw/bounce/refresh and new minibatch
+            tau, stats = self._single_segment_bound(
+                self._make_rate_and_grad_fn_sticky(pos, vel),
+                lambda t: self._rate_scalar_sticky(t, pos.detach(), vel.detach()),
+                horizon, t_max_binding=(binding == "grid_t_max"),
+            )
+            stats["binding"] = binding
+            return tau, stats
+
         # n_segments computed ONCE from the incoming horizon and held fixed
         # for the lifetime of this grid_thinning call -- including across
         # any internal Section 4.7 shrink/rebuild on a bound violation.
@@ -678,6 +693,9 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
         t_prev_holder = [resume_time_offset]
         times[0] = resume_time_offset
 
+        # single_segment node cache never carries over between sample() calls
+        self._node_cache = None
+
         local_idx = 1  # row 0 already written above
         chunk_idx = 0
         global_row_start = 0
@@ -764,6 +782,9 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
 
             if self._resample_grad_batch is not None:
                 self._resample_grad_batch()
+                # A new minibatch is a new rate function, so a node cached
+                # under the previous one would bound the wrong function
+                self._node_cache = None
 
             # Bound-time vs loop-time split, gating whether the sync
             # reduction in fast_grid_bound.py is a meaningful fraction of
@@ -836,6 +857,7 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
                         self._time_scalar.fill_(time_passed + advance)
                         pos_now, vel_now = self.trajectory_sticky(self._time_scalar, x_prev, v_prev)
                     self._freeze(i_hit, vel_now, current_time + advance)
+                    self._node_cache = None
                     pos_now = pos_now.clone()
                     vel_now = vel_now.clone()
                     pos_now[i_hit] = 0.0
@@ -855,6 +877,7 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
                     vel_now = vel_now.clone()
                     vel_now[i_thaw] = self.frozen_velocity[i_thaw]
                     self._thaw(i_thaw)
+                    self._node_cache = None
 
                     time_passed += advance
                     current_time += advance
@@ -875,6 +898,7 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
                 pos_prop, vel_prop = self.trajectory_sticky(self._time_scalar, x_prev, v_prev)
                 grad_at_prop = self.grad_U_excess(pos_prop)
                 vel_reflected = self.reflect_velocity_sticky(vel_prop, grad_at_prop)
+                self._node_cache = None
 
                 grad_evals += 1
                 row["rate_evals"] += 1
@@ -894,6 +918,7 @@ class FastGridStickyBoomerangSampler_Cheap(GridBoomerangSampler):
             # output relative to the original for reasons unrelated to
             # this file's actual goal (see module docstring).
             if dt_refresh <= 1e-14:
+                self._node_cache = None
                 row["wall_seconds"] = _time.perf_counter() - _t0
                 diag_log.append(row)
                 diag_acc.update(row)

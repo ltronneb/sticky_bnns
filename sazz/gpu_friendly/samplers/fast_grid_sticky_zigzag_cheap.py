@@ -167,6 +167,8 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
         resample_grad_batch: Optional[Callable[[], None]] = None,
+        bound_mode: str = "grid",
+        adapt_rule: str = "alg4",
     ):
         super().__init__(
             grad_target=grad_target,
@@ -183,6 +185,8 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
             grid_kwargs=grid_kwargs,
             dtype=dtype,
             device=device,
+            bound_mode=bound_mode,
+            adapt_rule=adapt_rule,
         )
 
         # Optional zero-arg hook, called once per sample() loop iteration
@@ -517,6 +521,18 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
 
         rate_and_grad_fn = self._make_rate_and_grad_fn_sticky(pos, vel)
         rate_scalar_fn = partial(self._rate_scalar_sticky, x=pos.detach(), v=vel.detach())
+
+        if self.bound_mode == "single_segment":
+            # GridZigZagSampler._single_segment_bound -- offset is folded in
+            # at build time, and sample() clears the node cache on every
+            # freeze/thaw/bounce and on every new minibatch
+            tau, stats = self._single_segment_bound(
+                rate_and_grad_fn, rate_scalar_fn, horizon, offset=offset,
+                t_max_binding=(binding == "grid_t_max"),
+            )
+            stats["binding"] = binding
+            return tau, stats
+
         bound_fn = partial(
             build_grid_bound_vectorized,
             signed=(self.strategy == "vectorized_signed"),
@@ -715,6 +731,9 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
         t_prev_holder = [resume_time_offset]
         times[0] = resume_time_offset
 
+        # single_segment node cache never carries over between sample() calls
+        self._node_cache = None
+
         local_idx = 1  # row 0 already written above
         chunk_idx = 0
         global_row_start = 0
@@ -801,6 +820,9 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
 
             if self._resample_grad_batch is not None:
                 self._resample_grad_batch()
+                # A new minibatch is a new rate function, so a node cached
+                # under the previous one would bound the wrong function
+                self._node_cache = None
 
             # Bound-time vs loop-time split, gating whether the sync
             # reduction in fast_grid_bound.py is a meaningful fraction of
@@ -859,6 +881,7 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
                         pos_now, vel_now = self.trajectory_sticky(self._time_scalar, x_prev, v_prev)
                     # current_time has NOT yet been incremented below
                     self._freeze(i_hit, vel_now, current_time + advance)
+                    self._node_cache = None
                     pos_now = pos_now.clone()
                     vel_now = vel_now.clone()
                     # Hand-zero the newly-frozen coordinate
@@ -878,6 +901,7 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
                     vel_now = vel_now.clone()
                     vel_now[i_thaw] = self.frozen_velocity[i_thaw]
                     self._thaw(i_thaw)
+                    self._node_cache = None
 
                     time_passed += advance
                     current_time += advance
@@ -904,6 +928,7 @@ class FastGridStickyZigZagSampler_Cheap(GridZigZagSampler):
                 i_flip = int(torch.multinomial(probs, 1).item())
 
                 vel_flipped = self.flip_velocity(vel_prop, i_flip)
+                self._node_cache = None
                 grad_evals += 1
                 row["rate_evals"] += 1
                 row["flipped_coord"] = i_flip

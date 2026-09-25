@@ -142,6 +142,29 @@ GRID_STICKY_ZIGZAG_SPACING = GRID_SPACING_ZIGZAG
 
 GRID_STICKY_COLD_START_THRESHOLD = None
 
+# Bound construction (--bound-mode). "grid" (default) is grid_thinning over
+# n segments per t_max window. "single_segment" (single_segment_bound.py)
+# makes the whole t_max window one segment and reuses its right node, so
+# grid_spacing/n_segments are unused and t_max starts at the old segment
+# width (the sampler's grid spacing) unless --single-segment-t-max-init
+# overrides it. ADAPT_RULE (--adapt-rule) is the t_max adaptation used in
+# single_segment mode, see single_segment_bound.adapt_t_max.
+BOUND_MODE = "grid"
+ADAPT_RULE = "alg4"
+SINGLE_SEGMENT_T_MAX_INIT: Optional[float] = None
+
+
+def _bound_kwargs(t_max_init: float, spacing: float) -> dict:
+    """Sampler kwargs for the active BOUND_MODE -- "grid" passes exactly
+    what the builders passed before --bound-mode existed."""
+    if BOUND_MODE == "grid":
+        return {"grid_t_max_init": t_max_init}
+    if SINGLE_SEGMENT_T_MAX_INIT is not None:
+        t_max_init = SINGLE_SEGMENT_T_MAX_INIT
+    else:
+        t_max_init = spacing
+    return {"grid_t_max_init": t_max_init, "bound_mode": BOUND_MODE, "adapt_rule": ADAPT_RULE}
+
 NUTS_DRAWS  = 1_000
 NUTS_WARMUP = 1_000
 NUTS_CHAINS = 4
@@ -350,7 +373,7 @@ def build_zigzag_sampler(bm: BayesianModule):
         grad_target=torch.func.grad(bm.energy),
         D=bm.D,
         gamma=GAMMA,
-        grid_t_max_init=GRID_T_MAX_INIT_ZIGZAG,
+        **_bound_kwargs(GRID_T_MAX_INIT_ZIGZAG, GRID_SPACING_ZIGZAG),
         n_segments=GRID_N_SEGMENTS,
         grid_spacing=GRID_SPACING_ZIGZAG,
         alpha_plus=GRID_ALPHA_PLUS,
@@ -388,7 +411,7 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: BNNConfig):
         can_freeze=can_freeze,
         cold_start_threshold=GRID_STICKY_COLD_START_THRESHOLD,
         gamma=GAMMA,
-        grid_t_max_init=GRID_T_MAX_INIT_ZIGZAG,
+        **_bound_kwargs(GRID_T_MAX_INIT_ZIGZAG, GRID_STICKY_ZIGZAG_SPACING),
         n_segments=GRID_N_SEGMENTS,
         grid_spacing=GRID_STICKY_ZIGZAG_SPACING,
         alpha_plus=GRID_ALPHA_PLUS,
@@ -418,7 +441,7 @@ def build_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
         grad_target=torch.func.grad(bm.energy),
         D=bm.D,
         refresh_rate=REFRESH_RATE,
-        grid_t_max_init=GRID_T_MAX_INIT_BOOM,
+        **_bound_kwargs(GRID_T_MAX_INIT_BOOM, GRID_SPACING_BOOM),
         n_segments=GRID_N_SEGMENTS,
         grid_spacing=GRID_SPACING_BOOM,
         alpha_plus=GRID_ALPHA_PLUS,
@@ -454,7 +477,7 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: BNNConfig,
         cold_start_threshold=GRID_STICKY_COLD_START_THRESHOLD,
         grid_spacing=GRID_STICKY_BOOM_SPACING,
         refresh_rate=REFRESH_RATE,
-        grid_t_max_init=GRID_T_MAX_INIT_BOOM,
+        **_bound_kwargs(GRID_T_MAX_INIT_BOOM, GRID_STICKY_BOOM_SPACING),
         n_segments=GRID_N_SEGMENTS,
         alpha_plus=GRID_ALPHA_PLUS,
         alpha_minus=GRID_ALPHA_MINUS,
@@ -1116,6 +1139,7 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 def main():
     global N_SKELETON, N_RESAMPLE, GRAD_BUDGET, REFERENCE
     global LBBNN_BATCH_SIZE, LBBNN_EPOCHS
+    global BOUND_MODE, ADAPT_RULE, SINGLE_SEGMENT_T_MAX_INIT
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1127,7 +1151,17 @@ def main():
                          choices=list(SAMPLER_NAMES))
     parser.add_argument("--splits", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--out", type=Path, default=OUT_DIR)
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--bound-mode", choices=["grid", "single_segment"], default=BOUND_MODE,
+                         help="grid (default) or single_segment: one tangent-line segment "
+                              "per t_max window with right-node reuse, t_max starting at the "
+                              "old segment width. Default --out gets a _single_segment "
+                              "(or _single_segment_balanced) suffix.")
+    parser.add_argument("--adapt-rule", choices=["alg4", "balanced"], default=ADAPT_RULE,
+                         help="t_max adaptation in single_segment mode (ignored in grid mode).")
+    parser.add_argument("--single-segment-t-max-init", type=float, default=None,
+                         help="Initial t_max in single_segment mode (default: the "
+                              "sampler's grid spacing).")
     parser.add_argument("--hidden-variant", choices=list(HIDDEN_VARIANTS),
                          default=DEFAULT_HIDDEN_VARIANT,
                          help="Architecture size for this run -- see HIDDEN_VARIANTS. "
@@ -1180,6 +1214,16 @@ def main():
                               "spend skeleton events resolving. Only affects grid_sticky_zigzag/"
                               "grid_sticky_boomerang; plain grid_zigzag/grid_boomerang/NUTS ignore it.")
     args = parser.parse_args()
+
+    BOUND_MODE = args.bound_mode
+    ADAPT_RULE = args.adapt_rule
+    SINGLE_SEGMENT_T_MAX_INIT = args.single_segment_t_max_init
+    # Keep single_segment runs from overwriting grid results
+    suffix = "" if BOUND_MODE == "grid" else (
+        "_single_segment" if ADAPT_RULE == "alg4" else f"_single_segment_{ADAPT_RULE}"
+    )
+    if args.out is None:
+        args.out = OUT_DIR.with_name(OUT_DIR.name + suffix)
 
     N_SKELETON = args.n_skeleton
     N_RESAMPLE = args.n_resample

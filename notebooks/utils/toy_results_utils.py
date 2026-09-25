@@ -21,6 +21,7 @@ SAMPLER_STYLE = {
     "nuts":                  ("C4", "NUTS"),
     "svi":                   ("C5", "SVI"),
     "tf_boomerang":          ("C6", "TFB"),
+    "lbbnn":                 ("C6", "LBBNN"),
 }
 GRID_SAMPLERS = ["grid_boomerang", "grid_sticky_boomerang", "grid_zigzag", "grid_sticky_zigzag"]
 
