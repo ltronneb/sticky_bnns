@@ -49,12 +49,14 @@ def sigma_inv_scale(variant: str, ds: str) -> float:
     return {"small": 0.1, "medium": MEDIUM_SIGMA_INV_SCALE[ds], "large": 1.0}[variant]
 
 
-def reference(bm, path: Path, seed: int):
-    """MAP (Adam from N(0, I), 2e4 steps) and Laplace precision, cached at path."""
+def reference(bm, path: Path, seed=None):
+    """MAP (Adam from N(0, I), 2e4 steps) and Laplace precision, cached at path.
+    seed=None continues the current random stream."""
     if path.exists():
         r = torch.load(path, map_location=DEVICE)
         return r["x_ref"].to(DTYPE), r["Sigma_inv"].to(DTYPE)
-    seed_all(seed)
+    if seed is not None:
+        seed_all(seed)
     x_ref = fit_map(bm, 20_000)
     Sigma_inv = laplace_precision(bm, x_ref)
     save(path, x_ref=x_ref, Sigma_inv=Sigma_inv)
@@ -65,12 +67,13 @@ def run_split(args, ds: str, split: int, chain):
     cfg = VARIANTS[args.variant]
     data = uci_split(ds, split, DTYPE, DEVICE)
     layers = [data["X_train"].shape[1], *cfg["hidden"], 1]
+    seed_all(42 + split)  # before the network is built, which draws its default weights
     module = FFN(layers, "tanh")
     bm = BNN.build(module, "gaussian", data["X_train"], data["y_train"], prior_std(module, 1.0, 1.0),
                    prior_sigma_scale=NOISE_PRIOR_SCALE[ds], dtype=DTYPE, device=DEVICE)
     base = args.out / args.variant / ds / f"split_{split:02d}"
     if chain is None:
-        x_ref, Sigma_inv = reference(bm, base / "map.pt", 42 + split)
+        x_ref, Sigma_inv = reference(bm, base / "map.pt")
         seed = 42 + split
     else:
         x_ref, _ = reference(bm, base / "maps" / f"map_{chain}.pt", 90_000 + 1000 * split + chain)
