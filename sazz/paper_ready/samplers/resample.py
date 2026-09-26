@@ -74,16 +74,21 @@ class UniformTimeReservoir:
 
 
 def run_and_resample(sampler, x0: Tensor, n_out: int = 4000, burnin_frac: float = 0.2,
-                     chunk_size: int = 10_000, keep_skeleton: bool = False, **budget) -> dict:
+                     chunk_size: int = 10_000, keep_skeleton: bool = False,
+                     skeleton_dtype: torch.dtype = None, **budget) -> dict:
     """Run sampler.sample(x0, **budget) streaming chunks into a reservoir.
-    Returns {"samples", "elapsed_sec", **sampler summary} (+ "skeleton")."""
+    Returns {"samples", "elapsed_sec", **sampler summary} (+ "skeleton").
+    skeleton_dtype stores the kept positions and velocities in that dtype
+    (times keep theirs) to save memory."""
     reservoir = UniformTimeReservoir(n_out, burnin_frac)
     skeleton = []
 
     def on_chunk(pos, vel, times):
         reservoir.add_chunk(pos, vel, times, sampler.trajectory)
         if keep_skeleton:
-            skeleton.append((pos.cpu().clone(), vel.cpu().clone(), times.cpu().clone()))
+            dt = skeleton_dtype or pos.dtype
+            skeleton.append((pos.to("cpu", dt, copy=True), vel.to("cpu", dt, copy=True),
+                             times.cpu().clone()))
 
     t0 = time.perf_counter()
     out = sampler.sample(x0, chunk_size=chunk_size, on_chunk=on_chunk, **budget)

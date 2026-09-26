@@ -153,6 +153,14 @@ BOUND_MODE = "grid"
 ADAPT_RULE = "alg4"
 SINGLE_SEGMENT_T_MAX_INIT: Optional[float] = None
 
+# If set (via --save-skeleton), every grid sampler also saves its full raw
+# skeleton to SKELETON_OUT_DIR/<dataset>/split_XX/<sampler>_skeleton.pt (sampler
+# without the grid_ prefix, the paper_v2 naming), in
+# float32 (times in float64). Saving happens after resampling and draws no
+# random numbers, so the run's samples are unchanged.
+SAVE_SKELETON: bool = False
+SKELETON_OUT_DIR = Path("results/uci_skeletons")
+
 
 def _bound_kwargs(t_max_init: float, spacing: float) -> dict:
     """Sampler kwargs for the active BOUND_MODE -- "grid" passes exactly
@@ -843,6 +851,36 @@ def save_run(out_path: Path, *, dataset: str, split_id: int, sampler: str,
     }, out_path)
 
 
+def save_skeleton(dataset: str, split_id: int, sampler: str, result: dict,
+                  cfg: BNNConfig, x_ref: Optional[torch.Tensor] = None) -> None:
+    """Raw pre-resampling skeleton (positions/velocities/times), for
+    reconstructing the continuous PDMP trajectory downstream. Same payload
+    as toy_bnn_grid.py's save_skeleton, in float32. Only called when
+    SAVE_SKELETON is set."""
+    out_path = (split_dir(SKELETON_OUT_DIR, dataset, split_id)
+                / f"{sampler.removeprefix('grid_')}_skeleton.pt")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "dataset": dataset,
+        "split_id": split_id,
+        "sampler": sampler,
+        "positions": result["positions"].detach().to("cpu", torch.float32),
+        "velocities": result["velocities"].detach().to("cpu", torch.float32),
+        "times": result["times"].detach().to("cpu", torch.float64),
+        "bound_violations": result["bound_violations"],
+        "gradient_evals": result.get("gradient_evals"),
+        "prior_inclusion_weight": cfg.prior_inclusion_weight if "sticky" in sampler else None,
+        "bound_mode": BOUND_MODE,
+        "adapt_rule": ADAPT_RULE if BOUND_MODE == "single_segment" else None,
+    }
+    if x_ref is not None:
+        payload["x_ref"] = x_ref.detach().cpu()
+    if "frozen_mask_final" in result:
+        payload["frozen_mask_final"] = result["frozen_mask_final"].cpu()
+    torch.save(payload, out_path)
+    print(f"      saved skeleton ({result['positions'].shape[0]} events) -> {out_path}")
+
+
 # ===========================================================================
 # Per-(dataset, split) runners -- one BayesianModule build (MAP + Laplace)
 # is shared by grid_boomerang/grid_sticky_boomerang (they need x_ref/
@@ -866,6 +904,9 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
     n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
     print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations)")
+
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_zigzag", result, cfg, x_ref=x_ref)
 
     out_path = sd / "grid_zigzag.pt"
     save_run(
@@ -898,6 +939,9 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
           f"({result['bound_violations']} bound violations, "
           f"final sparsity {sparsity:.2f})")
 
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_sticky_zigzag", result, cfg, x_ref=x_ref)
+
     out_path = sd / "grid_sticky_zigzag.pt"
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler="grid_sticky_zigzag",
@@ -926,6 +970,9 @@ def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
     n_events = result["positions"].shape[0]  # actual events produced -- may be < N_SKELETON if grad_budget stopped early
     print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations)")
+
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_boomerang", result, cfg, x_ref=x_ref)
 
     out_path = sd / "grid_boomerang.pt"
     save_run(
@@ -957,6 +1004,9 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
     print(f"      sampled {n_events} skeleton events in {elapsed:.1f}s "
           f"({result['bound_violations']} bound violations, "
           f"final sparsity {sparsity:.2f})")
+
+    if SAVE_SKELETON:
+        save_skeleton(dataset_name, split_id, "grid_sticky_boomerang", result, cfg, x_ref=x_ref)
 
     out_path = sd / "grid_sticky_boomerang.pt"
     save_run(
@@ -1096,9 +1146,11 @@ def run_split(dataset_name: str, split_id: int, data: dict[str, Any],
 
     sd = split_dir(out_dir, dataset_name, split_id)
 
+    # A finished run also counts under its paper_v2 name, without the grid_ prefix
     pending = [
         s for s in samplers
-        if not (resume and (sd / f"{s}.pt").exists())
+        if not (resume and ((sd / f"{s}.pt").exists()
+                            or (sd / f"{s.removeprefix('grid_')}.pt").exists()))
     ]
     for s in samplers:
         if s not in pending:
@@ -1140,6 +1192,7 @@ def main():
     global N_SKELETON, N_RESAMPLE, GRAD_BUDGET, REFERENCE
     global LBBNN_BATCH_SIZE, LBBNN_EPOCHS
     global BOUND_MODE, ADAPT_RULE, SINGLE_SEGMENT_T_MAX_INIT
+    global SAVE_SKELETON, SKELETON_OUT_DIR
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1213,8 +1266,16 @@ def main():
                               "frozen longer -- reduces the effective active-D the sticky samplers "
                               "spend skeleton events resolving. Only affects grid_sticky_zigzag/"
                               "grid_sticky_boomerang; plain grid_zigzag/grid_boomerang/NUTS ignore it.")
+    parser.add_argument("--save-skeleton", action="store_true",
+                        help="Also save each grid sampler's full skeleton (float32) to "
+                             "<skeleton-out>/<dataset>/split_XX/<sampler>_skeleton.pt. Does not "
+                             "change the samples.")
+    parser.add_argument("--skeleton-out", type=Path, default=SKELETON_OUT_DIR,
+                        help=f"Where --save-skeleton writes (default: {SKELETON_OUT_DIR}).")
     args = parser.parse_args()
 
+    SAVE_SKELETON = args.save_skeleton
+    SKELETON_OUT_DIR = args.skeleton_out
     BOUND_MODE = args.bound_mode
     ADAPT_RULE = args.adapt_rule
     SINGLE_SEGMENT_T_MAX_INIT = args.single_segment_t_max_init

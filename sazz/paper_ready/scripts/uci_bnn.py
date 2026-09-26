@@ -14,6 +14,8 @@ large one only the sticky PDMPs run, with K = 1e6 events and minibatch gradients
 
 --piw with several values runs the prior inclusion sweep. --chains c starts
 chain c from its own MAP (seed 90000 + 1000 split + c) with chain 0's Sigma_inv.
+--save-skeleton also writes each PDMP's skeleton (float32) to <sampler>_skeleton.pt
+next to its result, without changing the draws.
 """
 
 import argparse
@@ -99,9 +101,14 @@ def run_split(args, ds: str, split: int, chain):
                                     alpha_violation=cfg["alpha_violation"])
                 budget = {k: args.budget or v for k, v in cfg["budget"].items()}
                 out = run_and_resample(sampler, x_ref, n_out=args.n_draws, chunk_size=cfg["chunk"],
-                                       **budget)
+                                       keep_skeleton=args.save_skeleton,
+                                       skeleton_dtype=torch.float32, **budget)
                 print("  " + summary(out))
+                skeleton = out.pop("skeleton", None)
                 save(path, **out, **meta, piw=piw)
+                if skeleton is not None:
+                    save(sd / f"{name}_skeleton.pt", **skeleton, x_ref=x_ref, piw=piw,
+                         n_events=out["n_events"], grad_evals=out["grad_evals"])
             elif name == "nuts":
                 draws, sec, evals = nuts(data["X_train"], data["y_train"], layers, "tanh", 1.0, 1.0,
                                          prior_sigma_scale=NOISE_PRIOR_SCALE[ds], x_init=x_ref, seed=seed)
@@ -130,6 +137,8 @@ def main():
                    help="override G (small, medium) or K (large), e.g. for a quick test")
     p.add_argument("--out", type=Path, default=Path("results/uci"))
     p.add_argument("--resume", action="store_true", help="skip runs whose file exists")
+    p.add_argument("--save-skeleton", action="store_true",
+                   help="also save each PDMP's skeleton to <sampler>_skeleton.pt")
     args = p.parse_args()
     for ds in args.datasets:
         for split in args.splits:
