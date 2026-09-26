@@ -11,17 +11,18 @@ the SAME sampler instance (see fast_grid_sticky_zigzag_cheap.py /
 fast_grid_sticky_boomerang_cheap.py's resume_state contract -- this is what
 makes concatenated stages equivalent to one continuous run, unlike naively
 calling sample(x0=...) repeatedly, which would cold-start every stage and
-throw away all sticky/velocity state). Immediately after each stage:
-  1. that stage's chunk_*.pt files are resampled into N_RESAMPLE/n_stages
-     draws (equal draws per stage, not time-proportional -- see the plan
-     discussion this implements),
-  2. the stage's chunk_*.pt files are deleted (diag_*.pt are kept -- cheap,
-     and still needed for the same per-iteration-diagnostics analysis
-     sticky_cnn_eval.ipynb already does for ordinary chunked runs),
-  3. the sampler instance's resume_state is carried into the next stage.
-All stages' draws are concatenated at the end into the same "samples"
-checkpoint field ordinary (non-staged) runs produce -- downstream consumers
-(sticky_cnn_eval.ipynb, evaluate_accuracy, etc.) see no difference.
+throw away all sticky/velocity state). Each stage is fed to a
+UniformTimeReservoir and then its whole stage dir is deleted, so the final
+N_RESAMPLE draws are iid uniform in simulated time over the whole trajectory
+after dropping the first BURNIN_FRAC of its TIME (utils/staged.py, the same
+loop as deep_wide_uci.py). They are saved sorted by time, with their times in
+"sample_times". Runs before 26.09 drew equal numbers per stage instead, which
+is not uniform in time.
+
+--bound-mode single_segment --adapt-rule balanced gives the paper_v2 bound
+(one tangent-line segment per t_max window, t_max starting at the old grid
+spacing). Every window draws a fresh minibatch, so the right-node reuse is
+off and a window costs 2 minibatch gradients.
 
 fast_mnist_cnn.py itself is never touched by this file -- every already-
 completed run using it keeps working exactly as before.
@@ -30,7 +31,8 @@ Usage (same flags as fast_mnist_cnn.py, plus --stage-size):
     python -m sazz.gpu_friendly.scripts.fast_cheap_mnist_cnn \\
         --map-path results/maps/lenet_reference_N60000_pruned_refit_N60k.pt \\
         --n-skeleton 1_000_000 --stage-size 10_000 \\
-        --n-resample 50_000 --n-save 10_000 --grad-batch-size 1024
+        --n-resample 4000 --n-save 4000 --grad-batch-size 1024 \\
+        --bound-mode single_segment --adapt-rule balanced
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ from sazz.gpu_friendly.utils.resample import (
     resample_zigzag_path_sticky_torch, resample_boomerang_path_sticky_torch,
     resample_zigzag_path_sticky_chunked_torch, resample_boomerang_path_sticky_chunked_torch,
 )
+from sazz.gpu_friendly.utils.staged import bound_kwargs, run_staged_uniform_time, run_provenance
 from sazz.gpu_friendly.samplers.fast_grid_sticky_zigzag_cheap import FastGridStickyZigZagSampler_Cheap
 from sazz.gpu_friendly.samplers.fast_grid_sticky_boomerang_cheap import FastGridStickyBoomerangSampler_Cheap
 from sazz.gpu_friendly.scripts.cnn_reference import eval_accuracy
@@ -119,6 +122,16 @@ SKELETON_CHUNK_DIR: Optional[Path] = None
 STAGE_SIZE: Optional[int] = None
 
 GRAD_BATCH_SIZE: Optional[int] = None
+
+# Bound construction (--bound-mode, --adapt-rule, --single-segment-t-max-init),
+# see utils/staged.bound_kwargs. The defaults keep the old grid bound.
+BOUND_MODE = "grid"
+ADAPT_RULE = "alg4"
+SINGLE_SEGMENT_T_MAX_INIT: Optional[float] = None
+
+# Most draws per resampler call when filling the reservoir, which bounds the
+# transient [n, D] allocation on the GPU
+POOL_PER_STAGE = 500
 
 DATA_DIR = Path("datasets")
 OUT_DIR = Path("results/grid/mnist_cnn")
@@ -380,7 +393,8 @@ def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: CNNConfig, cold_start_m
         can_freeze=can_freeze,
         cold_start_threshold=cold_start_mask,
         gamma=GAMMA,
-        grid_t_max_init=GRID_T_MAX_INIT_ZIGZAG,
+        **bound_kwargs(BOUND_MODE, ADAPT_RULE, GRID_T_MAX_INIT_ZIGZAG, GRID_SPACING_ZIGZAG,
+                       SINGLE_SEGMENT_T_MAX_INIT),
         n_segments=GRID_N_SEGMENTS,
         grid_spacing=GRID_SPACING_ZIGZAG,
         alpha_plus=GRID_ALPHA_PLUS,
@@ -408,7 +422,8 @@ def build_sticky_boomerang_sampler(bm: BayesianModule, cfg: CNNConfig,
         cold_start_threshold=cold_start_mask,
         grid_spacing=GRID_SPACING_BOOM,
         refresh_rate=1.0,
-        grid_t_max_init=GRID_T_MAX_INIT_BOOM,
+        **bound_kwargs(BOUND_MODE, ADAPT_RULE, GRID_T_MAX_INIT_BOOM, GRID_SPACING_BOOM,
+                       SINGLE_SEGMENT_T_MAX_INIT),
         n_segments=GRID_N_SEGMENTS,
         alpha_plus=GRID_ALPHA_PLUS,
         alpha_minus=GRID_ALPHA_MINUS,
@@ -577,8 +592,11 @@ def save_run(out_path: Path, *, sampler: str, samples: Tensor, x_ref: Optional[T
              gradient_evals: Optional[int] = None, grid_t_max_log: Optional[list[float]] = None,
              test_accuracy: Optional[float] = None, sparsity_frac: Optional[float] = None,
              prune_frac: Optional[float] = None, cold_start_mask: Optional[Tensor] = None,
-             diagnostics: Optional[list[dict]] = None) -> None:
+             diagnostics: Optional[list[dict]] = None, **extra) -> None:
     """
+    extra: further fields saved as given (the staging/resampling provenance
+    from utils/staged.run_provenance).
+
     x_ref here is whatever the caller actually sampled from/anchored to --
     for the sticky runners this MUST be the pruned x_ref (x_pruned), not
     the raw checkpoint vector, so a saved run's recorded provenance matches
@@ -610,6 +628,7 @@ def save_run(out_path: Path, *, sampler: str, samples: Tensor, x_ref: Optional[T
         "prune_frac": prune_frac,
         "cold_start_mask": cold_start_mask.cpu() if cold_start_mask is not None else None,
         "diagnostics": diagnostics,
+        **extra,
     }, out_path)
 
 
@@ -623,7 +642,7 @@ def _resume_skip(out_path: Path, n_skeleton: int) -> bool:
     if not out_path.exists():
         return False
     try:
-        ckpt = torch.load(out_path, weights_only=False)
+        ckpt = torch.load(out_path, map_location="cpu", weights_only=False, mmap=True)
     except Exception:
         return False
     return ckpt.get("n_events") == n_skeleton
@@ -647,217 +666,86 @@ def _resume_skip(out_path: Path, n_skeleton: int) -> bool:
 # single sample() call's chunk footprint.
 # ===========================================================================
 
-def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any], cfg: CNNConfig,
-                            sd: Path, bm: BayesianModule, x_pruned: Tensor, Sigma_inv: Tensor,
-                            cold_start_mask: Tensor) -> None:
-    out_path = sd / "grid_sticky_zigzag.pt"
-    if _resume_skip(out_path, N_SKELETON):
-        print(f"      skipping — exists at {out_path}")
-        return
-
-    assert STAGE_SIZE is not None, "fast_cheap_mnist_cnn.py requires --stage-size."
-
-    sampler = build_sticky_zigzag_sampler(bm, cfg, cold_start_mask)
-
+def _run_staged(sampler_name: str, sampler, resample_stage_fn, dataset_name: str, split_id: int,
+                data: dict[str, Any], cfg: CNNConfig, sd: Path, bm: BayesianModule,
+                x_pruned: Tensor, cold_start_mask: Tensor) -> None:
+    """Shared by both samplers. x_pruned is the sampler's start and, for
+    Boomerang, its reference (preprocess and resample_stage_fn)."""
+    out_path = sd / f"{sampler_name}.pt"
     n_freezable = int(sampler.can_freeze.sum())
     n_frozen_init = int(cold_start_mask.sum())
     print(f"      cold start: {n_frozen_init}/{n_freezable} freezable coords "
           f"frozen ({100 * n_frozen_init / max(n_freezable, 1):.1f}%)")
 
-    chunk_dir_base = SKELETON_CHUNK_DIR / dataset_name / f"split_{split_id:02d}" / "grid_sticky_zigzag"
-
-    # Staged run: N_SKELETON split into ceil(N_SKELETON / STAGE_SIZE)
-    # sample() calls chained via resume_state (see
-    # fast_grid_sticky_zigzag_cheap.py's resume contract). Each stage's
-    # chunk_*.pt files are resampled into draws_per_stage draws and then
-    # deleted immediately (diag_*.pt kept) so at most one stage's transient
-    # trajectory-chunk footprint is ever on disk at once. Stage 0 cold-
-    # starts from x_pruned; every later stage passes x0=None and
-    # resume_state=<previous stage's final state> instead.
-    t0 = time.perf_counter()
-    n_stages = math.ceil(N_SKELETON / STAGE_SIZE)
-    draws_per_stage = max(N_RESAMPLE // n_stages, 1)
-    all_draws = []
-    total_grad_evals = 0
-    total_bound_violations = 0
-    all_tmax_log: list[float] = []
-    frozen_mask_final = None
-    resume_state = None
-
-    for stage in range(n_stages):
-        # sample()'s N counts row 0 (the seed -- either a fresh cold start,
-        # or, on a resumed stage, a COPY of the previous stage's final row,
-        # not a new event) PLUS N-1 new skeleton events (see sample()'s
-        # `while iteration < N` loop and `local_idx = 1  # row 0 already
-        # written above`). So "N-1 new events per stage" is what needs to
-        # sum to N_SKELETON across stages, not N itself -- hence the +1
-        # here converts "how many NEW events this stage should produce"
-        # into the N argument sample() actually expects.
-        stage_new_events = min(STAGE_SIZE, N_SKELETON - stage * STAGE_SIZE)
-        stage_N = stage_new_events + 1
-        stage_dir = chunk_dir_base / f"stage_{stage:04d}"
-        print(f"      [stage {stage + 1}/{n_stages}] sampling {stage_new_events} skeleton points "
-              f"({'cold start' if stage == 0 else 'resumed'}) -> {stage_dir}")
-
-        result = sampler.sample(
-            N=stage_N,
-            x0=(x_pruned if stage == 0 else None),
-            resume_state=resume_state,
-            diagnostics=True,
-            chunk_size=STAGE_SIZE, chunk_dir=stage_dir,
-        )
-
-        stage_draws = resample_zigzag_path_sticky_chunked_torch(
-            result["chunk_files"], N_resample=draws_per_stage,
-            burnin_frac=(BURNIN_FRAC if stage == 0 else 0.0),
-            manifest_path=result["manifest_path"], dtype=DTYPE, device=DEVICE,
-        )
-        # Move off GPU immediately -- accumulating n_stages worth of
-        # on-device draws in all_draws (and then torch.cat'ing them, which
-        # transiently needs a SECOND full-size allocation on top of that)
-        # is what caused a real CUDA OOM on a 100-stage/1M-skeleton run:
-        # by the last stage, GPU memory held the ENTIRE accumulated
-        # posterior sample plus the concatenation target at once. System
-        # RAM (hundreds of GB on the training box) has no such ceiling for
-        # a tensor this size, unlike GPU VRAM.
-        all_draws.append(stage_draws.cpu())
-
-        total_grad_evals += result["gradient_evals"]
-        total_bound_violations += result["bound_violations"]
-        all_tmax_log.extend(result["grid_t_max_log"])
-        frozen_mask_final = result["frozen_mask_final"]
-        resume_state = result["resume_state"]
-
-        n_deleted = 0
-        for f in stage_dir.glob("chunk_*.pt"):
-            f.unlink()
-            n_deleted += 1
-        print(f"      [stage {stage + 1}/{n_stages}] freed {n_deleted} chunk_*.pt files from {stage_dir}")
-
-    elapsed = time.perf_counter() - t0
-    samples = torch.cat(all_draws, dim=0)
-
+    run = run_staged_uniform_time(
+        sampler, x_pruned, n_skeleton=N_SKELETON, stage_size=STAGE_SIZE,
+        stage_dir=SKELETON_CHUNK_DIR / dataset_name / f"split_{split_id:02d}" / sampler_name,
+        n_out=N_RESAMPLE, burnin_frac=BURNIN_FRAC, resample_stage_fn=resample_stage_fn,
+        pool_per_stage=POOL_PER_STAGE,
+    )
+    samples = run["samples"]
     acc, sparsity = evaluate_accuracy(bm, samples, data["X_test"], data["y_test"])
 
-    final_sparsity = float(frozen_mask_final.float().mean())
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s across {n_stages} stages "
-          f"({total_bound_violations} bound violations, "
+    final_sparsity = float(run["frozen_mask_final"].float().mean())
+    print(f"      sampled {N_SKELETON} skeleton events in {run['elapsed_sec']:.1f}s across "
+          f"{run['n_stages']} stages ({run['bound_violations']} bound violations, "
           f"final sparsity {final_sparsity:.2f}) "
           f"test_acc={acc:.3f} sample_sparsity={sparsity:.3f}")
 
     save_run(
-        out_path, sampler="grid_sticky_zigzag", samples=samples, x_ref=x_pruned, cfg=cfg,
-        elapsed_sec=elapsed, n_events=N_SKELETON,
-        bound_violations=total_bound_violations,
-        gradient_evals=total_grad_evals, grid_t_max_log=all_tmax_log,
+        out_path, sampler=sampler_name, samples=samples, x_ref=x_pruned, cfg=cfg,
+        elapsed_sec=run["elapsed_sec"], n_events=N_SKELETON,
+        bound_violations=run["bound_violations"],
+        gradient_evals=run["gradient_evals"], grid_t_max_log=run["grid_t_max_log"],
         test_accuracy=acc, sparsity_frac=sparsity,
         prune_frac=n_frozen_init / max(n_freezable, 1), cold_start_mask=cold_start_mask,
         diagnostics=None,
+        **run_provenance(run, lambda t: thin_to(t, N_SAVE), bound_mode=BOUND_MODE,
+                         adapt_rule=ADAPT_RULE if BOUND_MODE == "single_segment" else None,
+                         grad_batch_size=GRAD_BATCH_SIZE),
     )
     print(f"      saved -> {out_path}")
+
+
+def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any], cfg: CNNConfig,
+                            sd: Path, bm: BayesianModule, x_pruned: Tensor, Sigma_inv: Tensor,
+                            cold_start_mask: Tensor) -> None:
+    if _resume_skip(sd / "grid_sticky_zigzag.pt", N_SKELETON):
+        print(f"      skipping — exists at {sd / 'grid_sticky_zigzag.pt'}")
+        return
+    assert STAGE_SIZE is not None, "fast_cheap_mnist_cnn.py requires --stage-size."
+    sampler = build_sticky_zigzag_sampler(bm, cfg, cold_start_mask)
+
+    def resample_stage(chunk_files, manifest_path, n):
+        return resample_zigzag_path_sticky_chunked_torch(
+            chunk_files, N_resample=n, burnin_frac=0.0, manifest_path=manifest_path,
+            dtype=DTYPE, device=DEVICE, return_times=True,
+        )
+
+    _run_staged("grid_sticky_zigzag", sampler, resample_stage, dataset_name, split_id,
+                data, cfg, sd, bm, x_pruned, cold_start_mask)
 
 
 def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, Any], cfg: CNNConfig,
                                sd: Path, bm: BayesianModule, x_pruned: Tensor, Sigma_inv: Tensor,
                                cold_start_mask: Tensor) -> None:
-    out_path = sd / "grid_sticky_boomerang.pt"
-    if _resume_skip(out_path, N_SKELETON):
-        print(f"      skipping — exists at {out_path}")
+    if _resume_skip(sd / "grid_sticky_boomerang.pt", N_SKELETON):
+        print(f"      skipping — exists at {sd / 'grid_sticky_boomerang.pt'}")
         return
-
     assert STAGE_SIZE is not None, "fast_cheap_mnist_cnn.py requires --stage-size."
-
-    # x_pruned reaches the builder (-> preprocess -> self.x_ref), sample's
-    # x0, AND the resample call below -- all three, not just one. See the
-    # module docstring: an unpruned x_ref at preprocess() reintroduces a
-    # permanent spurious term in the excess gradient at every frozen
-    # coordinate, independent of what x0 is passed to sample().
+    # x_pruned reaches the builder (-> preprocess -> self.x_ref), sample's x0
+    # AND the resampler. An unpruned x_ref at preprocess() reintroduces a
+    # permanent spurious term in the excess gradient at every frozen coordinate.
     sampler = build_sticky_boomerang_sampler(bm, cfg, x_pruned, Sigma_inv, cold_start_mask)
 
-    n_freezable = int(sampler.can_freeze.sum())
-    n_frozen_init = int(cold_start_mask.sum())
-    print(f"      cold start: {n_frozen_init}/{n_freezable} freezable coords "
-          f"frozen ({100 * n_frozen_init / max(n_freezable, 1):.1f}%)")
-
-    chunk_dir_base = SKELETON_CHUNK_DIR / dataset_name / f"split_{split_id:02d}" / "grid_sticky_boomerang"
-
-    t0 = time.perf_counter()
-    n_stages = math.ceil(N_SKELETON / STAGE_SIZE)
-    draws_per_stage = max(N_RESAMPLE // n_stages, 1)
-    all_draws = []
-    total_grad_evals = 0
-    total_bound_violations = 0
-    all_tmax_log: list[float] = []
-    frozen_mask_final = None
-    resume_state = None
-
-    for stage in range(n_stages):
-        # sample()'s N counts row 0 (the seed -- either a fresh cold start,
-        # or, on a resumed stage, a COPY of the previous stage's final row,
-        # not a new event) PLUS N-1 new skeleton events (see sample()'s
-        # `while iteration < N` loop and `local_idx = 1  # row 0 already
-        # written above`). So "N-1 new events per stage" is what needs to
-        # sum to N_SKELETON across stages, not N itself -- hence the +1
-        # here converts "how many NEW events this stage should produce"
-        # into the N argument sample() actually expects.
-        stage_new_events = min(STAGE_SIZE, N_SKELETON - stage * STAGE_SIZE)
-        stage_N = stage_new_events + 1
-        stage_dir = chunk_dir_base / f"stage_{stage:04d}"
-        print(f"      [stage {stage + 1}/{n_stages}] sampling {stage_new_events} skeleton points "
-              f"({'cold start' if stage == 0 else 'resumed'}) -> {stage_dir}")
-
-        result = sampler.sample(
-            N=stage_N,
-            x0=(x_pruned if stage == 0 else None),
-            resume_state=resume_state,
-            diagnostics=True,
-            chunk_size=STAGE_SIZE, chunk_dir=stage_dir,
+    def resample_stage(chunk_files, manifest_path, n):
+        return resample_boomerang_path_sticky_chunked_torch(
+            chunk_files, x_pruned, N_resample=n, burnin_frac=0.0, manifest_path=manifest_path,
+            dtype=DTYPE, device=DEVICE, return_times=True,
         )
 
-        stage_draws = resample_boomerang_path_sticky_chunked_torch(
-            result["chunk_files"], x_pruned, N_resample=draws_per_stage,
-            burnin_frac=(BURNIN_FRAC if stage == 0 else 0.0),
-            manifest_path=result["manifest_path"], dtype=DTYPE, device=DEVICE,
-        )
-        # See run_grid_sticky_zigzag's identical .cpu() move for why --
-        # accumulating n_stages worth of on-device draws (plus the final
-        # torch.cat's own transient full-size allocation) is what caused a
-        # real CUDA OOM on the ZigZag side of a 100-stage/1M-skeleton run.
-        all_draws.append(stage_draws.cpu())
-
-        total_grad_evals += result["gradient_evals"]
-        total_bound_violations += result["bound_violations"]
-        all_tmax_log.extend(result["grid_t_max_log"])
-        frozen_mask_final = result["frozen_mask_final"]
-        resume_state = result["resume_state"]
-
-        n_deleted = 0
-        for f in stage_dir.glob("chunk_*.pt"):
-            f.unlink()
-            n_deleted += 1
-        print(f"      [stage {stage + 1}/{n_stages}] freed {n_deleted} chunk_*.pt files from {stage_dir}")
-
-    elapsed = time.perf_counter() - t0
-    samples = torch.cat(all_draws, dim=0)
-
-    acc, sparsity = evaluate_accuracy(bm, samples, data["X_test"], data["y_test"])
-
-    final_sparsity = float(frozen_mask_final.float().mean())
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s across {n_stages} stages "
-          f"({total_bound_violations} bound violations, "
-          f"final sparsity {final_sparsity:.2f}) "
-          f"test_acc={acc:.3f} sample_sparsity={sparsity:.3f}")
-
-    save_run(
-        out_path, sampler="grid_sticky_boomerang", samples=samples, x_ref=x_pruned, cfg=cfg,
-        elapsed_sec=elapsed, n_events=N_SKELETON,
-        bound_violations=total_bound_violations,
-        gradient_evals=total_grad_evals, grid_t_max_log=all_tmax_log,
-        test_accuracy=acc, sparsity_frac=sparsity,
-        prune_frac=n_frozen_init / max(n_freezable, 1), cold_start_mask=cold_start_mask,
-        diagnostics=None,
-    )
-    print(f"      saved -> {out_path}")
+    _run_staged("grid_sticky_boomerang", sampler, resample_stage, dataset_name, split_id,
+                data, cfg, sd, bm, x_pruned, cold_start_mask)
 
 
 SAMPLER_RUNNERS = {
@@ -916,6 +804,7 @@ def run_dataset(split_id: int, data: dict[str, Any], cfg: CNNConfig, out_dir: Pa
 
 def main():
     global N_SKELETON, N_RESAMPLE, N_SAVE, SKELETON_CHUNK_DIR, STAGE_SIZE, GRAD_BATCH_SIZE
+    global BOUND_MODE, ADAPT_RULE, SINGLE_SEGMENT_T_MAX_INIT, POOL_PER_STAGE
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -960,6 +849,16 @@ def main():
                               "N_full/batch_size) instead of the full training set -- a "
                               "statistically uncorrected subsampled-gradient PDMP, traded for "
                               "throughput. None (default) preserves exact full-batch behavior.")
+    parser.add_argument("--bound-mode", choices=["grid", "single_segment"], default=BOUND_MODE,
+                         help="grid (default) or single_segment: one tangent-line segment per "
+                              "t_max window, t_max starting at the old grid spacing.")
+    parser.add_argument("--adapt-rule", choices=["alg4", "balanced"], default=ADAPT_RULE,
+                         help="t_max adaptation in single_segment mode (ignored in grid mode).")
+    parser.add_argument("--single-segment-t-max-init", type=float, default=None,
+                         help="Initial t_max in single_segment mode (default: the grid spacing).")
+    parser.add_argument("--pool-per-stage", type=int, default=POOL_PER_STAGE,
+                         help="Most draws per resampler call when filling the reservoir. Only "
+                              "bounds GPU memory, does not change the draws' distribution.")
     args = parser.parse_args()
 
     N_SKELETON = args.n_skeleton
@@ -968,6 +867,10 @@ def main():
     STAGE_SIZE = args.stage_size
     SKELETON_CHUNK_DIR = args.skeleton_chunk_dir if args.skeleton_chunk_dir is not None else args.out / "chunks"
     GRAD_BATCH_SIZE = args.grad_batch_size
+    BOUND_MODE = args.bound_mode
+    ADAPT_RULE = args.adapt_rule
+    SINGLE_SEGMENT_T_MAX_INIT = args.single_segment_t_max_init
+    POOL_PER_STAGE = args.pool_per_stage
 
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -976,7 +879,8 @@ def main():
     n_stages_preview = math.ceil(N_SKELETON / STAGE_SIZE)
     print(f"\nRunning MNIST-CNN (staged) | samplers: {args.samplers} | splits: {args.splits} | "
           f"N_SKELETON={N_SKELETON} | STAGE_SIZE={STAGE_SIZE} ({n_stages_preview} stages) | "
-          f"device={DEVICE} dtype={DTYPE}")
+          f"N_RESAMPLE={N_RESAMPLE} uniform in time, burn-in {BURNIN_FRAC:.0%} of the time | "
+          f"bound_mode={BOUND_MODE} adapt_rule={ADAPT_RULE} | device={DEVICE} dtype={DTYPE}")
 
     # Sweep data (X_sweep/y_sweep) is only needed if run_dataset ends up
     # calling prune_x_ref -- i.e. the loaded checkpoint has no saved
