@@ -565,6 +565,10 @@ def main():
     parser.add_argument("--adapt-rule", choices=["alg4", "balanced"], default=ADAPT_RULE)
     parser.add_argument("--single-segment-t-max-init", type=float, default=None)
     parser.add_argument("--pool-per-stage", type=int, default=POOL_PER_STAGE)
+    parser.add_argument("--cudnn-benchmark", action="store_true",
+                         help="Let cuDNN time its convolution algorithms once and keep the "
+                              "fastest for ResNet's fixed shapes. Same convolutions, only a "
+                              "different algorithm, so results agree up to float rounding.")
     args = parser.parse_args()
 
     N_SKELETON = args.n_skeleton
@@ -578,6 +582,7 @@ def main():
     SINGLE_SEGMENT_T_MAX_INIT = args.single_segment_t_max_init
     POOL_PER_STAGE = args.pool_per_stage
     _cheap_cnn.N_SAVE = N_SAVE
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
 
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -591,7 +596,8 @@ def main():
     print(f"\nRunning CIFAR10-ResNet20 (staged) | samplers: {args.samplers} | splits: {args.splits} | "
           f"N_SKELETON={N_SKELETON} | STAGE_SIZE={STAGE_SIZE} ({n_stages_preview} stages) | "
           f"N_RESAMPLE={N_RESAMPLE} uniform in time, burn-in {BURNIN_FRAC:.0%} of the time | "
-          f"bound_mode={BOUND_MODE} adapt_rule={ADAPT_RULE} | device={DEVICE} dtype={DTYPE}")
+          f"bound_mode={BOUND_MODE} adapt_rule={ADAPT_RULE} | "
+          f"cudnn_benchmark={args.cudnn_benchmark} | device={DEVICE} dtype={DTYPE}")
 
     for split_id in args.splits:
         data = load_cifar10_subset(
