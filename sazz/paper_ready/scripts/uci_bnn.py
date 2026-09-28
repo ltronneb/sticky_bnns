@@ -12,9 +12,10 @@ large one only the sticky PDMPs run, with K = 1e6 events and minibatch gradients
     python -m sazz.paper_ready.scripts.uci_bnn --variant large --splits 0 --chains 0 1 2 3 \\
         --samplers sticky_zigzag sticky_boomerang        # convergence check
 
---piw with several values runs the prior inclusion sweep. --chains c starts
-chain c from its own MAP (seed 90000 + 1000 split + c) with the Sigma_inv of the
-main run (no --chains), which serves as chain 0 of a convergence check.
+--piw with several values runs the prior inclusion sweep. --chains c runs chain
+c from its own MAP and Laplace precision (seed 90000 + 1000 split + c), the full
+pipeline from a different random MAP. The main run (no --chains) serves as
+chain 0 of a convergence check.
 --save-skeleton also writes each PDMP's skeleton (float32) to <sampler>_skeleton.pt
 next to its result, without changing the draws.
 """
@@ -79,8 +80,7 @@ def run_split(args, ds: str, split: int, chain):
         x_ref, Sigma_inv = reference(bm, base / "map.pt")
         seed = 42 + split
     else:
-        _, Sigma_inv = reference(bm, base / "map.pt")  # the main run's, loaded first
-        x_ref, _ = reference(bm, base / "maps" / f"map_{chain}.pt", 90_000 + 1000 * split + chain)
+        x_ref, Sigma_inv = reference(bm, base / "maps" / f"map_{chain}.pt", 90_000 + 1000 * split + chain)
         seed = 42 + split + 10_000 * chain
     scale = torch.full_like(Sigma_inv, sigma_inv_scale(args.variant, ds))
     scale[-1] = 1.0  # log_sigma keeps its prior-only precision
