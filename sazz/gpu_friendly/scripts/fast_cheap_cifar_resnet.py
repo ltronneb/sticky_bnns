@@ -169,7 +169,7 @@ def build_target(data: dict[str, Any], cfg: CNNConfig, dtype=DTYPE, device=DEVIC
         "for a target this size."
     )
     print(f"\n  Loading reference checkpoint from {map_path} ...")
-    ckpt = torch.load(map_path, weights_only=False)
+    ckpt = torch.load(map_path, map_location="cpu", weights_only=False)
     assert ckpt.get("architecture") == "resnet20", (
         f"--map-path checkpoint architecture mismatch: expected 'resnet20', "
         f"got {ckpt.get('architecture')!r}"

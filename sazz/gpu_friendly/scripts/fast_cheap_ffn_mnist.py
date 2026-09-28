@@ -187,7 +187,7 @@ def build_target(data: dict[str, Any], cfg: FFNConfig, dtype=DTYPE, device=DEVIC
                   map_path: Optional[Path] = None):
     if map_path is not None:
         print(f"\n  Loading reference checkpoint from {map_path} ...")
-        ckpt = torch.load(map_path, weights_only=False)
+        ckpt = torch.load(map_path, map_location="cpu", weights_only=False)
         assert ckpt.get("architecture") == "ffn", (
             f"--map-path architecture mismatch: expected 'ffn', got {ckpt.get('architecture')!r}"
         )

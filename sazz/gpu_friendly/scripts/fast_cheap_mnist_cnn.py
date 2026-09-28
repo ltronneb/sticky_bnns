@@ -233,7 +233,7 @@ def build_target(data: dict[str, Any], cfg: CNNConfig, dtype=DTYPE, device=DEVIC
     """
     if map_path is not None:
         print(f"\n  Loading reference checkpoint from {map_path} ...")
-        ckpt = torch.load(map_path, weights_only=False)
+        ckpt = torch.load(map_path, map_location="cpu", weights_only=False)
         architecture = ckpt.get("architecture", "cnn")
 
     module_cls = ARCHITECTURES[architecture]
