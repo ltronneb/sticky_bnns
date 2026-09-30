@@ -503,7 +503,9 @@ def _run_staged_sticky(
     elapsed = time.perf_counter() - t0
     res_info = None
     if TIME_WEIGHTED_RESAMPLE:
-        samples, _, res_info = reservoir.finalize()
+        samples, sample_times, res_info = reservoir.finalize()
+        order = torch.argsort(sample_times)       # time order, so traces and ESS are meaningful
+        samples, sample_times = samples[order], sample_times[order]
         total_span = res_info["t_end"] - res_info["t0"]
         print(f"      uniform-in-time resample: total sim-time {total_span:.6g} across "
               f"{stages_done} stages, burn-in cut at t={res_info['burnin_t_cut']:.6g} "
@@ -536,6 +538,7 @@ def _run_staged_sticky(
     payload["resample_scheme"] = (
         "uniform_time_reservoir" if TIME_WEIGHTED_RESAMPLE else "equal_draws_per_stage"
     )
+    payload["sample_times"] = sample_times if TIME_WEIGHTED_RESAMPLE else None
     payload["stage_size"] = STAGE_SIZE
     payload["n_stages"] = stages_done
     payload["pool_per_stage"] = POOL_PER_STAGE if TIME_WEIGHTED_RESAMPLE else draws_per_stage

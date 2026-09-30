@@ -131,11 +131,10 @@ DEFAULT_N_MAPS = 4
 
 OUT_DIR = Path("results/paper/deep_wide_convergence")
 
-# This script covers only the sticky PDMP families. NUTS/NUTS-HS are
-# excluded deliberately: they do their own multi-chain warmup internally
-# (NUTS_CHAINS in uci_bnn_grid.py) and do not consume x_ref at all, so
-# "run NUTS from MAP_i" is not a meaningful instruction.
-SAMPLER_NAMES = dw.PDMP_SAMPLERS
+# The PDMP families, plus NUTS. uci_bnn_grid's NUTS runner starts all its
+# NUTS_CHAINS internal chains at x_ref, so "chain c" of NUTS is NUTS_CHAINS
+# chains from map_c. It is full batch and draws its own JAX key from the split.
+SAMPLER_NAMES = dw.PDMP_SAMPLERS + ("nuts",)
 
 
 # ===========================================================================
