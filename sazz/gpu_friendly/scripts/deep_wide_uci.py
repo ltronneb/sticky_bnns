@@ -204,8 +204,8 @@ DEFAULT_HIDDEN_VARIANT = "deep_wide"
 
 OUT_DIR = Path("results/grid/uci_bnn_deep_wide")
 
-SAMPLER_NAMES = ("grid_sticky_zigzag", "grid_sticky_boomerang", "nuts", "nuts_horseshoe")
-PDMP_SAMPLERS = ("grid_sticky_zigzag", "grid_sticky_boomerang")
+SAMPLER_NAMES = ("grid_sticky_zigzag", "grid_sticky_boomerang", "grid_zigzag", "nuts", "nuts_horseshoe")
+PDMP_SAMPLERS = ("grid_sticky_zigzag", "grid_sticky_boomerang", "grid_zigzag")
 
 
 # ===========================================================================
@@ -303,8 +303,12 @@ def _build_sticky_kappa_can_freeze(bm, cfg: BNNConfig):
     return kappa, can_freeze
 
 
-def build_sticky_zigzag_sampler(bm, cfg: BNNConfig) -> FastGridStickyZigZagSampler_Cheap:
+def build_sticky_zigzag_sampler(bm, cfg: BNNConfig, freeze: bool = True) -> FastGridStickyZigZagSampler_Cheap:
+    """freeze=False gives the plain ZigZag with the identical code path: no
+    coordinate may freeze, so there are no hitting or thaw events."""
     kappa, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
+    if not freeze:
+        can_freeze = torch.zeros_like(can_freeze)
     grad_target, resample_grad_batch = _grad_target_and_resample(bm)
     return FastGridStickyZigZagSampler_Cheap(
         grad_target=grad_target,
@@ -528,8 +532,9 @@ def _run_staged_sticky(
 
 
 def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
-                            cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
-    sampler = build_sticky_zigzag_sampler(bm, cfg)
+                            cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv,
+                            freeze: bool = True) -> None:
+    sampler = build_sticky_zigzag_sampler(bm, cfg, freeze=freeze)
 
     def resample_stage(chunk_files, manifest_path, n_draws, burnin_frac, return_times=False):
         return resample_zigzag_path_sticky_chunked_torch(
@@ -539,10 +544,16 @@ def run_grid_sticky_zigzag(dataset_name: str, split_id: int, data: dict[str, Any
         )
 
     _run_staged_sticky(
-        sampler, sampler_name="grid_sticky_zigzag",
+        sampler, sampler_name="grid_sticky_zigzag" if freeze else "grid_zigzag",
         dataset_name=dataset_name, split_id=split_id, data=data, cfg=cfg, sd=sd,
         x_ref=x_ref, resample_stage_fn=resample_stage,
     )
+
+
+def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
+                    cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
+    """Plain ZigZag, the sticky ZigZag with no freezable coordinates."""
+    run_grid_sticky_zigzag(dataset_name, split_id, data, cfg, sd, bm, x_ref, Sigma_inv, freeze=False)
 
 
 def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
@@ -566,6 +577,7 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
 SAMPLER_RUNNERS = {
     "grid_sticky_zigzag": run_grid_sticky_zigzag,
     "grid_sticky_boomerang": run_grid_sticky_boomerang,
+    "grid_zigzag": run_grid_zigzag,
     # NUTS runners imported verbatim from uci_bnn_grid.py -- full-batch,
     # grad_budget-aware (via that module's GRAD_BUDGET global, which main()
     # below sets).
