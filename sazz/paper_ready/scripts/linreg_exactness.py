@@ -87,7 +87,9 @@ def run(args):
             out = run_and_resample(cls(grad, args.D, kappa=kappa, t_max_init=1e-3, **kw), x_ref,
                                    n_out=args.n_draws, n_events=args.n_events)
             res[name] = out["samples"]
-            print(f"  seed {seed} {name}: {out['bound_violations']} bound violations")
+            res[f"{name}_stats"] = {k: out[k] for k in ("bound_violations", "grad_evals", "n_events", "elapsed_sec")}
+            print(f"  seed {seed} {name}: {out['bound_violations']} bound violations, "
+                  f"{out['grad_evals']:,} gradients, {out['elapsed_sec']:.0f} s")
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(res, path)
 
@@ -115,17 +117,20 @@ def summary(args):
 
     beta = res[0]["beta_true"].numpy()
     n_show = int((beta != 0).sum()) + 4
-    fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.9))
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
     ax = axes[0]
     for (key, label, color, marker), dx in zip([("gibbs", "Gibbs", "C4", "D")] + SAMPLERS, [-0.26, 0, 0.26]):
         m = np.mean([r[key].mean(0).numpy() for r in res], 0)[:n_show]
         sd = np.mean([r[key].std(0).numpy() for r in res], 0)[:n_show]
         ax.errorbar(np.arange(n_show) + dx, m, yerr=sd, fmt=marker, color=color, ms=3.4, lw=0,
                     elinewidth=1.0, label=label)
-    ax.scatter(np.arange(n_show), beta[:n_show], marker="*", s=15, color="C1", label=r"$\beta_i$", zorder=4)
+    ax.scatter(np.arange(n_show), beta[:n_show], marker="*", s=20, color="C1", label=r"$\beta_i$", zorder=4)
     ax.axhline(0, color="0.75", lw=0.7)
-    ax.set(xlabel="coordinate $i$", ylabel="Posterior mean", title="Posterior coefficients")
-    ax.legend(fontsize=9, ncol=2)
+    #ax.set(xlabel="coordinate $i$", ylabel="Posterior mean", title="Posterior coefficients")
+    ax.set_xlabel("Coordinate $i$", fontsize=12)
+    ax.set_ylabel("Posterior mean", fontsize=12)
+    ax.tick_params(labelsize=14)
+    ax.legend(fontsize=10, ncol=2)
     ax = axes[1]
     ax.axhline(0, color="0.35", lw=0.9)
     # +-2 Monte Carlo SD of the deviation, sqrt(p(1-p)(1/ESS_gibbs + 1/ESS_pdmp)),
@@ -143,13 +148,16 @@ def summary(args):
     for key, label, color, marker in SAMPLERS:
         dev = np.concatenate([incl(r[key]) for r in res]) - p_ref
         ax.scatter(p_ref, dev, s=20, color=color, marker=marker, alpha=0.75, lw=0, label=label)
-    ax.set(xlabel=r"Gibbs $P(\gamma_i=1\mid y)$", ylabel="Sticky PDMP deviation", title="Signed deviation")
-    ax.legend(fontsize=9)
+    #ax.set(xlabel=r"Gibbs $P(\gamma_i=1\mid y)$", ylabel="Sticky PDMP deviation", title="Signed deviation")
+    ax.set_xlabel(r"Gibbs $P(\gamma_i=1\mid y)$", fontsize=12)
+    ax.set_ylabel("Sticky PDMP deviation", fontsize=12)
+    ax.tick_params(labelsize=14)
+    ax.legend(fontsize=10)
     for a in axes:
         a.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     fig.savefig(args.out / "linreg_exactness.pdf", bbox_inches="tight")
-    print(f"figure -> {args.out / 'linreg_exactness.pdf'}")
+    print(f"figure -> {args.out / 'linreg_exactness.png'}")
 
 
 def main():
@@ -162,7 +170,7 @@ def main():
     p.add_argument("--w", type=float, default=0.2, help="prior inclusion probability")
     p.add_argument("--n-events", type=int, default=200_000)
     p.add_argument("--n-draws", type=int, default=50_000)
-    p.add_argument("--out", type=Path, default=Path("results/linreg_exactness"))
+    p.add_argument("--out", type=Path, default=Path("results/paper_v2/sticky_exactness"))
     args = p.parse_args()
     (run if args.command == "run" else summary)(args)
 

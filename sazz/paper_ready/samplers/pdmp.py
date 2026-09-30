@@ -10,6 +10,12 @@ and thaws after an Exp(kappa_i |v_i|) time with its old velocity. Without
 The skeleton is written in chunks of `chunk_size` events to `on_chunk(pos,
 vel, times)`, and consecutive chunks share their boundary row. The run stops after
 `n_events` events or `grad_budget` gradient evaluations.
+
+Gradient accounting. Building a window's bound costs 2 evaluations (1 when its
+left end is cached from the previous empty window), and every proposal costs 1
+for the true rate at the proposed time. A bounce reuses the gradient of the
+accepted proposal, so it costs nothing extra. (The paper experiments
+predate this and paid 1 more gradient per bounce.)
 """
 
 import math
@@ -160,16 +166,20 @@ class PDMP:
                 self.resample_grad_batch()
                 self._cache = None
 
+            self._proposal = None
             tau, s = self._next_event(x_t, v_t, dt_refresh, dt_hit, dt_thaw)
             used = s["rate_evals"]
             stats["bound_violations"] += s["violations"]
             stats["rejections"] += s["rejections"]
             if s["accepted"]:
-                xe, ve = self._at(st["elapsed"] + tau, st["x"], st["v"])
+                # The rate was last evaluated at the accepted time, so the bounce reuses
+                # that gradient, at the same point, instead of computing it again.
+                t_prop, grad = self._proposal
+                assert t_prop == tau, (t_prop, tau)
+                xe, ve = self._at(tau, x_t, v_t)
                 st["elapsed"] += tau
                 dt_refresh -= tau
-                used += 1
-                commit(xe, self._bounce(xe, ve), "bounce")
+                commit(xe, self._bounce(xe, ve, grad), "bounce")
             else:
                 adv = s["effective_horizon"]
                 st["elapsed"] += adv

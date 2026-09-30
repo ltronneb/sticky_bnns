@@ -31,8 +31,9 @@ class ZigZag(PDMP):
         bad = (v.abs() < 1e-14) | (x.abs() < 1e-14) | (t <= 0)
         return torch.where(bad, torch.full_like(t, math.inf), t)
 
-    def _coordinate_rates(self, x: Tensor, v: Tensor) -> Tensor:
-        return (torch.clamp(v * self.grad_target(x), min=0.0) + self.gamma) * (~self.frozen)
+    def _coordinate_rates(self, x: Tensor, v: Tensor, grad=None) -> Tensor:
+        g = self.grad_target(x) if grad is None else grad
+        return (torch.clamp(v * g, min=0.0) + self.gamma) * (~self.frozen)
 
     def _rate_closures(self, x: Tensor, v: Tensor, n_active: int):
         def signed(t):
@@ -47,14 +48,16 @@ class ZigZag(PDMP):
         @torch.no_grad()
         def rate(t: float) -> float:
             x_t, v_t = self._at(t, x, v)
-            return float(self._coordinate_rates(x_t, v_t).sum())
+            g = self.grad_target(x_t)
+            self._proposal = (t, g)
+            return float(self._coordinate_rates(x_t, v_t, g).sum())
 
         return rate_and_slope, rate, partial(tangent_bound, per_coord=True,
                                              offset=n_active * self.gamma)
 
     @torch.no_grad()
-    def _bounce(self, x: Tensor, v: Tensor) -> Tensor:
-        r = self._coordinate_rates(x, v)
+    def _bounce(self, x: Tensor, v: Tensor, grad=None) -> Tensor:
+        r = self._coordinate_rates(x, v, grad)
         i = int(torch.multinomial(r / r.sum(), 1))
         v = v.clone()
         v[i] = -v[i]

@@ -171,6 +171,8 @@ def collect(variant: str, datasets=None, samplers=None, use_cache: bool = True,
             for sampler in samplers:
                 p = split_dir / f"{sampler}.pt"
                 if not p.exists():
+                    p = split_dir / f"grid_{sampler}.pt"  # gpu_friendly name, before renaming
+                if not p.exists():
                     continue
                 key = _file_key(p)
                 if key in cache:
@@ -236,11 +238,11 @@ def summary_table(df: pd.DataFrame, dataset: str, dec: int = 2) -> pd.DataFrame:
             print(f"  warning, {dataset}/{sampler} has {len(g)} of {n_max} splits")
         sp = g["sparsity"]
         rows[SAMPLER_LABELS[sampler]] = {
+            "Sparsity (%)":   _pm(sp, 1) if (sp > 0).any() else "0",
             "RMSE": _pm(g["RMSE"], dec),
             "NLL":  _pm(g["NLL"], dec),
             "CRPS": _pm(g["CRPS"], dec),
             "Grad evals (M)": f"{(g['grad_evals'] / 1e6).mean():.2f}",
-            "Sparsity (%)":   _pm(sp, 1) if (sp > 0).any() else "0",
         }
     table = pd.DataFrame.from_dict(rows, orient="index")[TABLE_COLS]
     table.index.name = "Sampler"
@@ -252,3 +254,136 @@ def to_latex(table: pd.DataFrame, caption: str = None, label: str = None) -> str
                               "Sparsity (%)": r"Sparsity (\%)"})
     t = t.apply(lambda c: c.str.replace("±", r"$\pm$", regex=False)).reset_index()
     return t.to_latex(index=False, escape=False, caption=caption, label=label, position="t")
+
+
+# ---------------------------------------------------------------------------
+# The paper's per-dataset table (tab:boston), all three architectures
+# ---------------------------------------------------------------------------
+
+# Per architecture, the rows in table order as (label, folder under
+# RESULTS_ROOT, sampler file stem, prior inclusion weight w or None).
+# Rows whose files are missing are left out.
+PAPER_ROWS = {
+    "small": [
+        ("Boomerang",        "shallow",         "boomerang",        None),
+        ("ZigZag",           "shallow",         "zigzag",           None),
+        ("NUTS",             "shallow",         "nuts",             None),
+        ("Sticky Boomerang", "shallow",         "sticky_boomerang", 0.3),
+        ("Sticky ZigZag",    "shallow",         "sticky_zigzag",    0.3),
+        ("Sticky Boomerang", "shallow_piw_0.1", "sticky_boomerang", 0.1),
+        ("Sticky ZigZag",    "shallow_piw_0.1", "sticky_zigzag",    0.1),
+        ("LBBNN",            "shallow",         "lbbnn",            None),
+    ],
+    "medium": [
+        ("Boomerang",        "deep_narrow",         "boomerang",        None),
+        ("ZigZag",           "deep_narrow",         "zigzag",           None),
+        ("NUTS",             "deep_narrow",         "nuts",             None),
+        ("Sticky Boomerang", "deep_narrow",         "sticky_boomerang", 0.3),
+        ("Sticky ZigZag",    "deep_narrow",         "sticky_zigzag",    0.3),
+        ("Sticky Boomerang", "deep_narrow/piw_0.1", "sticky_boomerang", 0.1),
+        ("Sticky ZigZag",    "deep_narrow/piw_0.1", "sticky_zigzag",    0.1),
+        ("LBBNN",            "deep_narrow",         "lbbnn",            None),
+    ],
+    "large": [
+        ("Sticky Boomerang", "deep_wide_v2/deep_wide", "sticky_boomerang", 0.05),
+        ("Sticky ZigZag",    "deep_wide_v2/deep_wide", "sticky_zigzag",    0.05),
+        ("LBBNN",            "deep_wide_v2/deep_wide", "lbbnn",            None),
+    ],
+}
+
+
+def _pm_tex(x: pd.Series, dec: int) -> str:
+    """Mean $\\pm$ SEM, the SEM without its leading zero (0.19 -> .19) to save width."""
+    if len(x) < 2:
+        return f"{x.mean():.{dec}f}"
+    sem = f"{x.sem():.{dec}f}"
+    return f"{x.mean():.{dec}f} $\\pm$ {sem[1:] if sem.startswith('0.') else sem}"
+
+
+def _coverage90(dataset: str, archs) -> pd.DataFrame:
+    """C(0.9) per (arch, stem, w, split) from the coverage cache (coverage_utils),
+    computed there first for runs that are not cached yet."""
+    from . import coverage_utils as cu
+    recs = cu.collect(archs, (dataset,))
+    return pd.DataFrame([{"arch": r["arch"], "stem": r["stem"], "w": r["w"], "split": r["split"],
+                          "cov90": float(cu.coverage(r["u"], [0.9])[0])} for r in recs])
+
+
+def _n_params(folder: str, dataset: str, stem: str) -> int:
+    """d, the number of sampled coordinates (weights, biases and log sigma),
+    read off one run of this architecture."""
+    for pattern in (f"{stem}.pt", f"grid_{stem}.pt"):
+        for f in sorted((RESULTS_ROOT / folder / dataset).glob(f"split_*/{pattern}")):
+            return int(torch.load(f, map_location="cpu", weights_only=False, mmap=True)["samples"].shape[1])
+    raise FileNotFoundError(f"no {stem} run under {RESULTS_ROOT / folder / dataset}")
+
+
+def paper_table(dataset: str = "boston", dec: int = 2, caption: str = None, label: str = None,
+                use_cache: bool = True, verbose: bool = False) -> str:
+    """LaTeX for the paper's table of one dataset, mean $\\pm$ SEM over splits
+    for the three architectures, in the layout of tab:boston. Sparsity is the
+    mean fraction of weights that are exactly zero in the draws. Cov. is the
+    mean share of test responses inside the central 90% predictive interval,
+    with its SEM range given in the caption."""
+    archs = [a for a, rows in PAPER_ROWS.items()
+             if any((RESULTS_ROOT / f / dataset).exists() for _, f, _, _ in rows)]
+    cov = _coverage90(dataset, archs)
+    cov_sems = []
+    frames = {}
+    lines = [
+        "\\begin{table}",
+        "\\centering",
+        "\\resizebox{\\columnwidth}{!}{",
+        "\\begin{tabular}{rllccccc}",
+        "\\toprule",
+        "$d$ & Sampler & $w$ & Sparsity & RMSE & NLL & CRPS & Cov. \\\\",
+    ]
+    for arch, rows in PAPER_ROWS.items():
+        block = []
+        for lab, folder, stem, w in rows:
+            if folder not in frames:
+                if not (RESULTS_ROOT / folder / dataset).exists():
+                    frames[folder] = pd.DataFrame(columns=["sampler"])
+                else:
+                    frames[folder] = collect(folder, datasets=[dataset], use_cache=use_cache,
+                                             verbose=verbose)
+            df = frames[folder]
+            g = df[df["sampler"] == stem] if len(df) else df
+            if len(g) == 0:
+                continue
+            if len(g) < 5:
+                print(f"  warning, {arch} {lab} (w={w}) has {len(g)} of 5 splits")
+            sparse = stem.startswith("sticky") or stem == "lbbnn"
+            c = cov[(cov.arch == arch) & (cov.stem == stem)
+                    & (cov.w.isna() if w is None else cov.w == w)]["cov90"] if len(cov) else pd.Series(dtype=float)
+            if len(c) > 1:
+                cov_sems.append(100 * c.sem())
+            block.append((stem, [lab, "--" if w is None else f"{w:g}",
+                                 f"{g['sparsity'].mean():.0f}\\%" if sparse else "--",
+                                 _pm_tex(g["RMSE"], dec), _pm_tex(g["NLL"], dec),
+                                 _pm_tex(g["CRPS"], dec),
+                                 f"{100 * c.mean():.0f}\\%" if len(c) else "--"]))
+        if not block:
+            continue
+        d = _n_params(next(f for _, f, st, _ in rows if st == block[0][0]), dataset, block[0][0])
+        lines.append("\\midrule")
+        lines.append(str(d))
+        width = max(len(r[0]) for _, r in block)
+        for _, r in block:
+            lines.append(f"& {r[0]:<{width}} & {r[1]:<4} & {r[2]:<4} & " + " & ".join(r[3:]) + " \\\\")
+    lines += [
+        "\\bottomrule",
+        "\\end{tabular}",
+        "}",
+        "\\caption{",
+        caption or (f"Predictive performance on the UCI {dataset} test splits for three network "
+                    "architectures, reported as mean $\\pm$ SEM over 5 independent train/test "
+                    "splits. Sparsity is the mean fraction of weights sampled exactly zero."
+                    + (" Cov. is the share of test responses inside the central 90\\% predictive "
+                       f"interval, with an SEM of {min(cov_sems):.0f} to {max(cov_sems):.0f} "
+                       "percentage points." if cov_sems else "")),
+        "}",
+        f"\\label{{{label or 'tab:' + dataset}}}",
+        "\\end{table}",
+    ]
+    return "\n".join(lines)

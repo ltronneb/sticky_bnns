@@ -12,14 +12,14 @@ RESULTS_DIR = Path("results/paper_v2/toy_bnns")
 
 # Skeletons from toy_bnn_grid*.py --save-skeleton, one subfolder per arm.
 # Only the results/paper tree has them so far.
-SKELETON_DIR = Path("results/paper/toy_bnns/skeletons")
+SKELETON_DIR = Path("results/paper_v2/toy_bnns/skeletons")
 ARMS = {"MAP": "fullbatch", "Symmetric MAP": "negative_map"}
 
 SAMPLER_STYLE = {
-    "grid_boomerang":        ("C0", "Boomerang"),
-    "grid_sticky_boomerang": ("C1", "Sticky Boomerang"),
-    "grid_zigzag":           ("C2", "Zig Zag"),
-    "grid_sticky_zigzag":    ("C3", "Sticky Zig Zag"),
+    "boomerang":             ("C0", "Boomerang"),
+    "sticky_boomerang":      ("C1", "Sticky Boomerang"),
+    "zigzag":                ("C2", "Zig Zag"),
+    "sticky_zigzag":         ("C3", "Sticky Zig Zag"),
     "nuts":                  ("C4", "NUTS"),
     "svi":                   ("C5", "SVI"),
     "tf_boomerang":          ("C6", "TFB"),

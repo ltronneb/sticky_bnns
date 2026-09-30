@@ -559,21 +559,8 @@ def paper_style_figure(levels: list, agg: dict, run_display: dict[str, str],
     for label in labels:
         _line(ax, "p_true", label)
     ax.set(xlabel=xlabel, #ylabel="P(true class)", 
-           ylim=(-0.02, 1.02), title="P(true class)")
+           ylim=(-0.02, 1.02), title="P(true class)", fontsize=15)
 
-    # ax = axes[2]
-    # for label in labels:
-    #     #is_point = label in point_labels
-    #     #acc = [agg[label][("pool", lv)]["acc"] for lv in levels]
-    #     conf = [agg[label][("pool", lv)]["conf"] for lv in levels]
-    #     c = colors.get(label, None)
-    #     #ax.plot(levels, acc, marker="o", ms=4, lw=2.0 if is_point else 1.6,
-    #     #        ls="--" if is_point else "-", color=c,
-    #     #        label=f"{run_display.get(label, label)} acc")
-    #     ax.plot(levels, conf, marker="s", ms=4, lw=1.2, ls="--", color=c, alpha=0.7,
-    #             label=f"{run_display.get(label, label)} conf")
-    # ax.set(xlabel=xlabel, ylabel="Confidence", ylim=(-0.02, 1.02),
-    #       title="Confidence")
 
     ax = axes[2]
     for label in labels:

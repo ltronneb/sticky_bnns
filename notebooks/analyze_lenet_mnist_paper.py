@@ -5,6 +5,7 @@ from __future__ import annotations
 # 0. Config, imports, device
 # ==========================================================================
 import os
+import pickle
 import sys
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 from pathlib import Path
@@ -41,10 +42,15 @@ else:
 DTYPE = torch.float32
 print("device:", DEVICE)
 
-RUN_DIR = Path("results/paper/mnist_cnn/split_00")
+RUN_DIR = Path("results/paper_v2/mnist_cnn/split_00")
+# paper_v2 files have no grid_ prefix (renamed after sync), fall back to it if not renamed yet
+def _run_file(name):
+    return next((n for n in (name, "grid_" + name) if (RUN_DIR / n).exists()), name)
+
+
 RUN_SPECS = [
-    ("zigzag", "grid_sticky_zigzag.pt"),
-    ("boomerang", "grid_sticky_boomerang.pt"),
+    ("zigzag", _run_file("sticky_zigzag.pt")),
+    ("boomerang", _run_file("sticky_boomerang.pt")),
 ]
 RUN_DISPLAY = {"zigzag": "Sticky Zig-Zag", "boomerang": "Sticky Boomerang"}
 
@@ -78,8 +84,13 @@ ANGLES = [0, 15]#, 30, 45, 60, 90, 120, 150, 180]
 SIGMAS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0]
 SAMPLER_COLORS = {"zigzag": "#4C72B0", "boomerang": "#DD8452"}
 
-SAVE_DIR = Path("results/plots/MNIST_CNN/")
+SAVE_DIR = Path("results/plots_v2/MNIST_CNN/")
 # SAVE_DIR.mkdir(parents=True, exist_ok=True)
+# noise sweep results, reused while the settings below match. Delete the file to recompute.
+NOISE_CACHE = SAVE_DIR / "noise_sweep_cache.pkl"
+NOISE_META = {"sigmas": SIGMAS, "classes": CLASSES, "n_per_class": N_PER_CLASS,
+              "n_draws_pool": N_DRAWS_POOL, "pool_seed": POOL_SEED, "noise_seed": NOISE_SEED,
+              "runs": [f for _, f in RUN_SPECS]}
 
 plt.rcParams.update({
     "axes.spines.top": False, "axes.spines.right": False,
@@ -290,11 +301,18 @@ def _noise(X, lv, seed=0):
 # rot_levels, rot_spans, rot_X, rot_agg = inet.run_shift_sweep(
 #     ANGLES, _rotate, CLASSES, y_test, X_test, sweep_runs, predict_probs,
 #     N_PER_CLASS, N_DRAWS_POOL, POOL_SEED, NOISE_SEED)
-noi_levels, noi_spans, noi_X, noi_agg = inet.run_shift_sweep(
-    SIGMAS, _noise, CLASSES, y_test, X_test, sweep_runs, predict_probs,
-    N_PER_CLASS, N_DRAWS_POOL, POOL_SEED, NOISE_SEED)
+_cache = pickle.loads(NOISE_CACHE.read_bytes()) if NOISE_CACHE.exists() else None
+if _cache is not None and _cache["meta"] == NOISE_META:
+    noi_levels, noi_agg = _cache["levels"], _cache["agg"]
+    print(f"[noise] loaded {NOISE_CACHE}")
+else:
+    noi_levels, noi_spans, noi_X, noi_agg = inet.run_shift_sweep(
+        SIGMAS, _noise, CLASSES, y_test, X_test, sweep_runs, predict_probs,
+        N_PER_CLASS, N_DRAWS_POOL, POOL_SEED, NOISE_SEED)
+    NOISE_CACHE.write_bytes(pickle.dumps({"meta": NOISE_META, "levels": noi_levels, "agg": noi_agg}))
+    print(f"[noise] {len(sweep_runs)} models x {len(CLASSES)} digits x {len(SIGMAS)} levels, "
+          f"saved to {NOISE_CACHE}")
 # print(f"[rotation] {len(sweep_runs)} models x {len(CLASSES)} digits x {len(ANGLES)} levels")
-print(f"[noise]    {len(sweep_runs)} models x {len(CLASSES)} digits x {len(SIGMAS)} levels")
 
 
 # fig = inet.shift_figure("rotation", rot_levels, rot_agg, sweep_runs, SWEEP_DISPLAY, CLASSES,
@@ -305,14 +323,45 @@ print(f"[noise]    {len(sweep_runs)} models x {len(CLASSES)} digits x {len(SIGMA
 
 
 # %%
-# --- Izmailov et al. (2021) Figure-15-style single panel: pooled accuracy
-#     (NOT split by true digit) vs noise sigma, SGD vs MAP vs PDMP samplers
-#     on one axis, directly comparable in spirit to their SGD-vs-HMC plot.
-fig = inet.paper_style_figure(
-    noi_levels, noi_agg, SWEEP_DISPLAY, SWEEP_COLORS,
-    xlabel=r"Noise Scale $\sigma$", #title="MNIST LeNet5: robustness to pixel noise",
-    point_labels=("map", "sgd"), order=["sgd", "map", "zigzag", "boomerang"],
-)
-plt.show()
-fig.savefig(SAVE_DIR / "MNIST_noise_paperstyle.pdf", bbox_inches="tight")
+# --- Paper figure, Izmailov et al. (2021) Figure 15 style. Reads only the cache,
+# so after cell 0 this cell runs on its own in about a second. Edit and rerun freely.
 
+def plot_noise(levels, agg, save_name="MNIST_noise_paperstyle"):
+    TITLE, LABEL, TICK, LEGEND = 20, 20, 18, 20
+    order = ["sgd", "map", "zigzag", "boomerang"]
+    point = {"sgd", "map"}   # dashed lines
+    display = {"sgd": "SGD", "map": r"$\beta_{\mathrm{ref}}$",
+               "zigzag": "Sticky ZigZag", "boomerang": "Sticky Boomerang"}
+    colors = {"sgd": "#55A868", "map": "0.35", "zigzag": "#4C72B0", "boomerang": "#DD8452"}
+    panels = [("acc", "Accuracy", (-0.02, 1.02)),
+              ("p_true", "P(true class)", (-0.02, 1.02)),
+              ("entropy", "Predictive entropy", (-0.05, np.log(10) * 1.08))]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    for ax, (key, title, ylim) in zip(axes, panels):
+        for lbl in [l for l in order if l in agg]:
+            ax.plot(levels, [agg[lbl][("pool", lv)][key] for lv in levels],
+                    marker="o", ms=5, lw=2.2, ls="--" if lbl in point else "-",
+                    color=colors[lbl], label=display[lbl])
+        #ax.set_title(title, fontsize=TITLE)
+        ax.set_xlabel(r"Noise scale $\sigma$", fontsize=LABEL)
+        ax.set_ylim(*ylim)
+        ax.tick_params(labelsize=TICK)
+        ax.grid(alpha=0.25)
+        ax.spines[["top", "right"]].set_visible(False)
+    # leg = fig.legend(*axes[0].get_legend_handles_labels(), loc="upper center", ncol=len(order),
+    #                 fontsize=LEGEND, frameon=False, bbox_to_anchor=(0.5, 1.1), handlelength=3)
+    #for line in leg.get_lines():   # thicker lines and markers in the legend only
+    #    line.set_linewidth(4)
+    #    line.set_markersize(9)
+    fig.tight_layout()
+    for ext in ("pdf", "png"):
+        fig.savefig(SAVE_DIR / f"{save_name}.{ext}", bbox_inches="tight", dpi=200)
+    plt.show()
+
+
+_noise_cache = pickle.loads(NOISE_CACHE.read_bytes())
+plot_noise(_noise_cache["levels"], _noise_cache["agg"])
+
+
+# %%

@@ -32,8 +32,9 @@ class Boomerang(PDMP):
         c, s, dx = torch.cos(t), torch.sin(t), x - self.x_ref
         return self.x_ref + dx * c + v * s, v * c - dx * s
 
-    def grad_excess(self, x: Tensor) -> Tensor:
-        return self.grad_target(x) - self.Sigma_inv * (x - self.x_ref)
+    def grad_excess(self, x: Tensor, grad=None) -> Tensor:
+        g = self.grad_target(x) if grad is None else grad
+        return g - self.Sigma_inv * (x - self.x_ref)
 
     def _initial_velocity(self) -> Tensor:
         return self.Sigma_sqrt * torch.randn(self.D, dtype=self.dtype, device=self.device)
@@ -62,14 +63,16 @@ class Boomerang(PDMP):
         @torch.no_grad()
         def rate(t: float) -> float:
             x_t, v_t = self._at(t, x, v)
-            return float(torch.dot(v_t, self.grad_excess(x_t)))
+            g = self.grad_target(x_t)
+            self._proposal = (t, g)
+            return float(torch.dot(v_t, self.grad_excess(x_t, g)))
 
         return rate_and_slope, rate, partial(tangent_bound, per_coord=False)
 
     @torch.no_grad()
-    def _bounce(self, x: Tensor, v: Tensor) -> Tensor:
+    def _bounce(self, x: Tensor, v: Tensor, grad=None) -> Tensor:
         """Reflect the active velocity components in the Sigma-metric."""
-        g = self.grad_excess(x) * (~self.frozen)
+        g = self.grad_excess(x, grad) * (~self.frozen)
         Sg = self.Sigma * g
         denom = torch.dot(g, Sg)
         if float(denom) <= 1e-14:

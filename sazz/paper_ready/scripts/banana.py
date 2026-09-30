@@ -52,7 +52,8 @@ def run(sampler, args, path: Path):
     torch.manual_seed(args.seed)
     out = run_and_resample(sampler, X_REF, n_out=args.n_draws, burnin_frac=0.5,
                            n_events=args.n_events, progress=False)
-    res = {"draws": out["samples"], "bv": out["bound_violations"]}
+    res = {"draws": out["samples"], "bv": out["bound_violations"], "grad_evals": out["grad_evals"],
+           "n_events": out["n_events"], "sec": out["elapsed_sec"]}
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(res, path)
     return res
@@ -65,7 +66,9 @@ def main():
     p.add_argument("--n-events", type=int, default=50_000)
     p.add_argument("--n-draws", type=int, default=10_000)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out", type=Path, default=Path("results/banana"))
+    p.add_argument("--out", type=Path, default=Path("results/paper_v2/banana_sweep"))
+    p.add_argument("--featured", type=float, nargs=2, default=[0.1, 0.1], metavar=("REFRESH", "SCALE"),
+                   help="the Boomerang cell of the contour and marginal figures")
     args = p.parse_args()
 
     zz = run(ZigZag(grad_U, 2, gamma=0.01, t_max_init=0.05), args, args.out / "zigzag.pt")
@@ -106,8 +109,54 @@ def main():
     for h in leg.legend_handles:
         h.set_sizes([100])
     fig.tight_layout()
-    fig.savefig(args.out / "banana_sweep.pdf", bbox_inches="tight")
+    fig.savefig(args.out / "banana_sweep.png", bbox_inches="tight")
     print(f"figure -> {args.out / 'banana_sweep.pdf'}")
+
+    # One Boomerang cell against ZigZag, the draws over the target's contours and
+    # their marginals against the analytic ones. Same colours as the sweep.
+    boom = cells[tuple(args.featured)]
+    pair = [(zz, "C2", "ZigZag"), (boom, "C0", "Boomerang")]
+
+    d_all = np.concatenate([res["draws"].numpy() for res, _, _ in pair])
+    pad = 1.5
+    B1, B2 = np.meshgrid(np.linspace(d_all[:, 0].min() - pad, d_all[:, 0].max() + pad, 300),
+                         np.linspace(d_all[:, 1].min() - pad, d_all[:, 1].max() + pad, 300))
+    dens = np.exp(-(0.5 * (B1 / SCALE) ** 2 + 0.5 * (B2 - A * (B1 / SCALE) ** 2) ** 2))
+    # log-spaced density levels, dense near the peak and still out into the tails
+    levels = np.logspace(np.log10(dens.max()) - 4, np.log10(dens.max()), 12)
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.contour(B1, B2, dens, levels=levels, colors="black", linewidths=0.6, alpha=0.6)
+    for res, color, label in pair:
+        d = res["draws"].numpy()
+        ax.scatter(d[:, 0], d[:, 1], s=4, alpha=0.3, lw=0, color=color, label=label)
+    #ax.set(xlabel=r"$\beta_1$", ylabel=r"$\beta_2$")
+    ax.set_xlabel(r"$\beta_1$", fontsize=16)
+    ax.set_ylabel(r"$\beta_2$", fontsize=16)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=14)
+    #ax.spines[["left", "bottom"]].set_position("zero")
+    leg = ax.legend(fontsize=12, frameon=False, loc="upper center")
+    for h in leg.legend_handles:
+        h.set_sizes([40])
+        h.set_alpha(1)
+    fig.tight_layout()
+    for ext in ("pdf", "png"):
+        fig.savefig(args.out / f"banana_contour.{ext}", bbox_inches="tight", dpi=200)
+
+    fig, axes = plt.subplots(1, 2, figsize=(6.4, 3))
+    for k, (ax, (grid, pdf), name) in enumerate(zip(axes, marg, (r"$\beta_1$", r"$\beta_2$"))):
+        for res, color, label in pair:
+            ax.hist(res["draws"].numpy()[:, k], bins=60, density=True, alpha=0.5, color=color, label=label)
+        ax.plot(grid, pdf, "k--", lw=1.5, label="Analytic")
+        ax.set_title(name, fontsize=20)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.tick_params(labelsize=14)
+    axes[1].legend(fontsize=12, frameon=False)
+    fig.tight_layout()
+    for ext in ("pdf", "png"):
+        fig.savefig(args.out / f"banana_marginals.{ext}", bbox_inches="tight", dpi=200)
+    print(f"figures -> {args.out / 'banana_contour.pdf'}, {args.out / 'banana_marginals.pdf'} "
+          f"(Boomerang refresh {args.featured[0]:g}, scale {args.featured[1]:g})")
 
 
 if __name__ == "__main__":

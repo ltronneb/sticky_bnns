@@ -15,6 +15,7 @@ from __future__ import annotations
 # 0. Config, imports, device
 # ==========================================================================
 import os
+import pickle
 import sys
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")   # any op MPS lacks -> CPU
 from pathlib import Path
@@ -49,10 +50,15 @@ else:
 DTYPE = torch.float32
 print("device:", DEVICE)
 
-RUN_DIR = Path("results/paper/cifar")
+RUN_DIR = Path("results/paper_v2/resnet_cifar/split_00")
+# paper_v2 files have no grid_ prefix (renamed after sync), fall back to it if not renamed yet
+def _run_file(name):
+    return next((n for n in (name, "grid_" + name) if (RUN_DIR / n).exists()), name)
+
+
 RUN_SPECS = [
-    ("zigzag", "grid_sticky_zigzag.pt"),
-    ("boomerang", "grid_sticky_boomerang.pt"),   # slotted in automatically once present
+    ("zigzag", _run_file("sticky_zigzag.pt")),
+    ("boomerang", _run_file("sticky_boomerang.pt")),   # slotted in automatically once present
 ]
 RUN_DISPLAY = {"zigzag": "Sticky Zig-Zag", "boomerang": "Sticky Boomerang"}
 
@@ -86,12 +92,13 @@ CORRUPTIONS_TO_PLOT = ["gaussian_noise", "motion_blur", "brightness", "fog"]  # 
 SEVERITIES = [1, 2, 3, 4, 5]
 N_TEST_CORRUPT = 2_000   # subset size per severity (full 10k x 5 sev x 4 corruptions is heavy)
 N_DRAWS_CORRUPT = 50     # posterior draws per corruption point
-LOAD_CORRUPT_FROM_SAVED = False   # True -> read table_corruption_accuracy.csv instead of recomputing
 
 ZERO_TOL = 1e-8
 
-SAVE_DIR = Path("results/plots/CIFAR/")
+SAVE_DIR = Path("results/plots_v2/CIFAR/")
 # SAVE_DIR.mkdir(parents=True, exist_ok=True)   # uncomment when you start saving
+# corruption results, reused while the settings and loaded runs match. Delete the file to recompute.
+CORRUPT_CACHE = SAVE_DIR / "corruption_cache.pkl"
 
 plt.rcParams.update({
     "axes.spines.top": False, "axes.spines.right": False,
@@ -308,18 +315,15 @@ print(summary_df.to_string(float_format=lambda v: f"{v:.4f}"))
 # 1-5, on a fixed N_TEST_CORRUPT-image subset of X_test, and plot pooled
 # accuracy vs severity, one line per model (SGD / MAP / samplers).
 #
-# LOAD_CORRUPT_FROM_SAVED=True reads the CSV written by a previous run
-# instead of recomputing (which requires CIFAR-10-C and is slow); the figure
-# below only needs corruption_curves, rebuilt here from the loaded table.
-_corrupt_csv_path = SAVE_DIR / "table_corruption_accuracy.csv"
-if LOAD_CORRUPT_FROM_SAVED:
-    assert _corrupt_csv_path.exists(), f"no saved table at {_corrupt_csv_path}"
-    corrupt_table = pd.read_csv(_corrupt_csv_path, index_col=0)
-    corruption_curves = {}
-    for col in corrupt_table.columns:
-        corruption, name = col.split("/", 1)
-        corruption_curves.setdefault(corruption, {})[name] = corrupt_table[col].tolist()
-    print(f"loaded corruption table from {_corrupt_csv_path}")
+# The curves are cached in CORRUPT_CACHE and reloaded while the settings and
+# the loaded runs match, so the slow CIFAR-10-C pass runs once.
+CORRUPT_META = {"corruptions": CORRUPTIONS_TO_PLOT, "severities": SEVERITIES,
+                "n_test_corrupt": N_TEST_CORRUPT, "n_draws_corrupt": N_DRAWS_CORRUPT,
+                "runs": [f for label, f in RUN_SPECS if label in runs]}
+_cache = pickle.loads(CORRUPT_CACHE.read_bytes()) if CORRUPT_CACHE.exists() else None
+if _cache is not None and _cache["meta"] == CORRUPT_META:
+    corruption_curves = _cache["curves"]
+    print(f"loaded {CORRUPT_CACHE}")
 else:
     _rng_c = np.random.default_rng(0)
     _corrupt_pos = _rng_c.choice(N_TEST, size=min(N_TEST_CORRUPT, N_TEST), replace=False)
@@ -351,49 +355,65 @@ else:
         corruption_curves[corruption] = curves
         print(f"[{corruption}] done: {len(model_specs)} models x {len(levels)} severities")
 
-    corrupt_table = pd.DataFrame(
-        {f"{corruption}/{name}": accs
-         for corruption, curves in corruption_curves.items()
-         for name, accs in curves.items()},
-        index=[f"severity={lv}" for lv in [0] + SEVERITIES],
-    )
+    if set(corruption_curves) == set(CORRUPTIONS_TO_PLOT):   # no cache if a corruption was skipped
+        CORRUPT_CACHE.write_bytes(pickle.dumps({"meta": CORRUPT_META, "curves": corruption_curves}))
+        print(f"saved to {CORRUPT_CACHE}")
 
+corrupt_table = pd.DataFrame(
+    {f"{corruption}/{name}": accs
+     for corruption, curves in corruption_curves.items()
+     for name, accs in curves.items()},
+    index=[f"severity={lv}" for lv in [0] + SEVERITIES],
+)
+corrupt_table.to_csv(SAVE_DIR / "table_corruption_accuracy.csv")
 print(f"\n=== Pooled accuracy vs CIFAR-10-C severity ===")
 print(corrupt_table.to_string(float_format=lambda v: f"{v:.3f}"))
 
 
 # %%
-# --- FIGURE: 2x2 grid, accuracy vs corruption severity ---
-MODEL_COLORS = {"SGD": "#55A868", "MAP (pruned x_ref)": "0.35",
-                "Sticky Zig-Zag": "#4C72B0", "Sticky Boomerang": "#DD8452"}
+# --- Paper figure, 2x2 grid of accuracy vs corruption severity. Reads only the
+# cache, so after cell 0 this cell runs on its own in about a second. Edit and rerun freely.
 
-CORRUPTIONS_NAMES = {"gaussian_noise": "Gaussian noise", 
-                     "motion_blur":    "Motion blur", 
-                     "brightness":     "Brightness", 
-                     "fog":            "Fog"}
+def plot_corruption(curves_by_corruption, save_name="fig_corruption_grid"):
+    TITLE, LABEL, TICK, LEGEND = 20, 18, 15, 16
+    # keys are the model names used in the sweep cell
+    order = ["SGD", "MAP (pruned x_ref)", "Sticky Zig-Zag", "Sticky Boomerang"]
+    point = {"SGD", "MAP (pruned x_ref)"}   # dashed lines
+    display = {"SGD": "SGD", "MAP (pruned x_ref)": r"$\beta_{\mathrm{ref}}$",
+               "Sticky Zig-Zag": "Sticky ZigZag", "Sticky Boomerang": "Sticky Boomerang"}
+    colors = {"SGD": "#55A868", "MAP (pruned x_ref)": "0.35",
+              "Sticky Zig-Zag": "#4C72B0", "Sticky Boomerang": "#DD8452"}
+    titles = {"gaussian_noise": "Gaussian noise", "motion_blur": "Motion blur",
+              "brightness": "Brightness", "fog": "Fog"}
+    levels = [0] + SEVERITIES
 
-fig, axes = plt.subplots(2, 2, figsize=(10, 8), sharex=True, sharey=True)
-levels = [0] + SEVERITIES
-for ax, corruption in zip(axes.flat, CORRUPTIONS_TO_PLOT):
-    curves = corruption_curves.get(corruption)
-    if curves is None:
-        ax.set_title(f"{corruption} (missing)")
-        continue
-    for name, accs in curves.items():
-        if name =="MAP (pruned x_ref)":
-            ax.plot(levels, accs, marker="o", ms=4,
-                    color=MODEL_COLORS.get(name), label=r"$\beta_{ref}$")
-        else:
-            ax.plot(levels, accs, marker="o", ms=4,
-                    color=MODEL_COLORS.get(name), label=name)
-    ax.set(title=CORRUPTIONS_NAMES[corruption], xlabel="Severity", ylabel="Accuracy",
-          xticks=levels, ylim=(0, 1))
-axes.flat[0].legend(fontsize=15)
-fig.suptitle("CIFAR-10-C: Accuracy vs corruption severity", y=1.01)
-fig.tight_layout()
-plt.show()
-fig.savefig(SAVE_DIR / "fig_corruption_grid.pdf", bbox_inches="tight")
-if not LOAD_CORRUPT_FROM_SAVED:
-    corrupt_table.to_csv(_corrupt_csv_path)
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8), sharex=True, sharey=True)
+    for ax, corruption in zip(axes.flat, CORRUPTIONS_TO_PLOT):
+        curves = curves_by_corruption.get(corruption, {})
+        for name in [n for n in order if n in curves]:
+            ax.plot(levels, curves[name], marker="o", ms=5, lw=2.2,
+                    ls="--" if name in point else "-", color=colors[name], label=display[name])
+        ax.set_title(titles.get(corruption, corruption), fontsize=TITLE)
+        ax.set(xticks=levels, ylim=(0, 1))
+        ax.tick_params(labelsize=TICK)
+        ax.grid(alpha=0.25)
+        ax.spines[["top", "right"]].set_visible(False)
+    for ax in axes[1]:
+        ax.set_xlabel("Severity", fontsize=LABEL)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Accuracy", fontsize=LABEL)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    leg = fig.legend(handles, labels, loc="upper center", ncol=len(labels),
+                     fontsize=LEGEND, frameon=False, bbox_to_anchor=(0.5, 1.07), handlelength=3)
+    for line in leg.get_lines():   # thicker lines and markers in the legend only
+        line.set_linewidth(4)
+        line.set_markersize(9)
+    fig.tight_layout()
+    for ext in ("pdf", "png"):
+        fig.savefig(SAVE_DIR / f"{save_name}.{ext}", bbox_inches="tight", dpi=200)
+    plt.show()
+
+
+plot_corruption(pickle.loads(CORRUPT_CACHE.read_bytes())["curves"])
 
 # %%
