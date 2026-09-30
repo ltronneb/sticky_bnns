@@ -388,6 +388,7 @@ def cmd_sample(args) -> None:
     dw.N_RESAMPLE = args.n_resample
     dw.STAGE_SIZE = args.stage_size
     dw.GRAD_BATCH_SIZE = args.grad_batch_size
+    dw.PDMP_GRAD_BUDGET = args.grad_budget
     dw.TIME_WEIGHTED_RESAMPLE = not args.equal_draws_per_stage
     dw.POOL_PER_STAGE = args.pool_per_stage
     dw.STAGE_DIR = args.stage_dir if args.stage_dir is not None else (args.out / "chunks")
@@ -573,6 +574,9 @@ def main():
                     help="Same as deep_wide_uci.py's --adapt-rule.")
     ps.add_argument("--single-segment-t-max-init", type=float, default=None,
                     help="Same as deep_wide_uci.py's --single-segment-t-max-init.")
+    ps.add_argument("--grad-budget", type=int, default=None,
+                    help="stop each chain after the stage in which its gradient evaluations reach "
+                         "this budget, --n-skeleton then only caps the events (default: event count)")
     ps.add_argument("--grad-batch-size", type=int, default=None,
                     help="Opt into minibatched gradients. Default None = full batch, "
                          "matching deep_wide_uci.py and keeping the chains comparable "

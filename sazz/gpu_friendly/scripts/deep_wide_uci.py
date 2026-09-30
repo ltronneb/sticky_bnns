@@ -197,6 +197,10 @@ def _bound_kwargs(t_max_init: float, spacing: float) -> dict:
 # None (default) => exact full-batch, unchanged from this script's
 # original behavior.
 GRAD_BATCH_SIZE: Optional[int] = None
+# If set, a staged PDMP run stops after the stage in which its gradient
+# evaluations reach this budget (overshoot at most one stage), and N_SKELETON
+# is only an upper cap on the events. None keeps the event-count stopping rule.
+PDMP_GRAD_BUDGET: Optional[int] = None
 
 # This script exists FOR the wide variant; default accordingly (still
 # overridable via --hidden-variant for A/B checks against uci_bnn_grid.py).
@@ -204,8 +208,9 @@ DEFAULT_HIDDEN_VARIANT = "deep_wide"
 
 OUT_DIR = Path("results/grid/uci_bnn_deep_wide")
 
-SAMPLER_NAMES = ("grid_sticky_zigzag", "grid_sticky_boomerang", "grid_zigzag", "nuts", "nuts_horseshoe")
-PDMP_SAMPLERS = ("grid_sticky_zigzag", "grid_sticky_boomerang", "grid_zigzag")
+SAMPLER_NAMES = ("grid_sticky_zigzag", "grid_sticky_boomerang", "grid_zigzag", "grid_boomerang",
+                 "nuts", "nuts_horseshoe")
+PDMP_SAMPLERS = ("grid_sticky_zigzag", "grid_sticky_boomerang", "grid_zigzag", "grid_boomerang")
 
 
 # ===========================================================================
@@ -331,9 +336,12 @@ def build_sticky_zigzag_sampler(bm, cfg: BNNConfig, freeze: bool = True) -> Fast
 
 
 def build_sticky_boomerang_sampler(bm, cfg: BNNConfig,
-                                    x_ref: torch.Tensor, Sigma_inv: torch.Tensor
-                                    ) -> FastGridStickyBoomerangSampler_Cheap:
+                                    x_ref: torch.Tensor, Sigma_inv: torch.Tensor,
+                                    freeze: bool = True) -> FastGridStickyBoomerangSampler_Cheap:
+    """freeze=False gives the plain Boomerang with the identical code path."""
     kappa, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
+    if not freeze:
+        can_freeze = torch.zeros_like(can_freeze)
     grad_target, resample_grad_batch = _grad_target_and_resample(bm)
     sampler = FastGridStickyBoomerangSampler_Cheap(
         grad_target=grad_target,
@@ -416,6 +424,9 @@ def _run_staged_sticky(
     all_tmax_log: list[float] = []
     frozen_mask_final = None
     resume_state = None
+    if PDMP_GRAD_BUDGET is not None and not TIME_WEIGHTED_RESAMPLE:
+        raise ValueError("a gradient budget needs the time-weighted reservoir (the default)")
+    events_done = stages_done = 0
 
     t0 = time.perf_counter()
     for stage in range(n_stages):
@@ -482,6 +493,12 @@ def _run_staged_sticky(
         if stage_dir.exists():
             shutil.rmtree(stage_dir)
         print(f"      [stage {stage + 1}/{n_stages}] freed {stage_dir}")
+        events_done += stage_new_events
+        stages_done += 1
+        if PDMP_GRAD_BUDGET is not None and total_grad_evals >= PDMP_GRAD_BUDGET:
+            print(f"      gradient budget reached: {total_grad_evals:,} >= {PDMP_GRAD_BUDGET:,} "
+                  f"after {stages_done} stages")
+            break
 
     elapsed = time.perf_counter() - t0
     res_info = None
@@ -489,7 +506,7 @@ def _run_staged_sticky(
         samples, _, res_info = reservoir.finalize()
         total_span = res_info["t_end"] - res_info["t0"]
         print(f"      uniform-in-time resample: total sim-time {total_span:.6g} across "
-              f"{n_stages} stages, burn-in cut at t={res_info['burnin_t_cut']:.6g} "
+              f"{stages_done} stages, burn-in cut at t={res_info['burnin_t_cut']:.6g} "
               f"({BURNIN_FRAC:.0%} of the time), {res_info['n_survivors']}/{res_info['n_slots']} "
               f"slots after burn-in, kept {samples.shape[0]} "
               f"({res_info['n_evaluated']} trajectory evaluations in total)")
@@ -497,18 +514,19 @@ def _run_staged_sticky(
         samples = torch.cat(all_draws, dim=0)
 
     final_sparsity = float(frozen_mask_final.float().mean())
-    print(f"      sampled {N_SKELETON} skeleton events in {elapsed:.1f}s across {n_stages} stages "
+    print(f"      sampled {events_done} skeleton events ({total_grad_evals:,} gradients) in {elapsed:.1f}s "
+          f"across {stages_done} stages "
           f"({total_bound_violations} bound violations, final sparsity {final_sparsity:.2f})")
 
     out_path = sd / f"{sampler_name}.pt"
     save_run(
         out_path, dataset=dataset_name, split_id=split_id, sampler=sampler_name,
         samples=samples, x_ref=x_ref, cfg=cfg, y_std=data["y_std"],
-        elapsed_sec=elapsed, n_events=N_SKELETON,
+        elapsed_sec=elapsed, n_events=events_done,
         bound_violations=total_bound_violations,
         gradient_evals=total_grad_evals,
         grid_t_max_log=all_tmax_log,
-        grad_budget=None,  # _Cheap sample() has no grad_budget; PDMP here is event-count driven
+        grad_budget=PDMP_GRAD_BUDGET,  # None means the run was event-count driven
         grad_batch_size=GRAD_BATCH_SIZE,
     )
     # Staging provenance. save_run lives in uci_bnn_grid.py (imported verbatim,
@@ -519,7 +537,7 @@ def _run_staged_sticky(
         "uniform_time_reservoir" if TIME_WEIGHTED_RESAMPLE else "equal_draws_per_stage"
     )
     payload["stage_size"] = STAGE_SIZE
-    payload["n_stages"] = n_stages
+    payload["n_stages"] = stages_done
     payload["pool_per_stage"] = POOL_PER_STAGE if TIME_WEIGHTED_RESAMPLE else draws_per_stage
     payload["stage_time_spans"] = stage_spans if TIME_WEIGHTED_RESAMPLE else None
     payload["burnin_frac"] = BURNIN_FRAC
@@ -557,8 +575,9 @@ def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any],
 
 
 def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
-                               cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
-    sampler = build_sticky_boomerang_sampler(bm, cfg, x_ref, Sigma_inv)
+                               cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv,
+                               freeze: bool = True) -> None:
+    sampler = build_sticky_boomerang_sampler(bm, cfg, x_ref, Sigma_inv, freeze=freeze)
 
     def resample_stage(chunk_files, manifest_path, n_draws, burnin_frac, return_times=False):
         return resample_boomerang_path_sticky_chunked_torch(
@@ -568,16 +587,23 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
         )
 
     _run_staged_sticky(
-        sampler, sampler_name="grid_sticky_boomerang",
+        sampler, sampler_name="grid_sticky_boomerang" if freeze else "grid_boomerang",
         dataset_name=dataset_name, split_id=split_id, data=data, cfg=cfg, sd=sd,
         x_ref=x_ref, resample_stage_fn=resample_stage,
     )
+
+
+def run_grid_boomerang(dataset_name: str, split_id: int, data: dict[str, Any],
+                       cfg: BNNConfig, sd: Path, bm, x_ref, Sigma_inv) -> None:
+    """Plain Boomerang, the sticky Boomerang with no freezable coordinates."""
+    run_grid_sticky_boomerang(dataset_name, split_id, data, cfg, sd, bm, x_ref, Sigma_inv, freeze=False)
 
 
 SAMPLER_RUNNERS = {
     "grid_sticky_zigzag": run_grid_sticky_zigzag,
     "grid_sticky_boomerang": run_grid_sticky_boomerang,
     "grid_zigzag": run_grid_zigzag,
+    "grid_boomerang": run_grid_boomerang,
     # NUTS runners imported verbatim from uci_bnn_grid.py -- full-batch,
     # grad_budget-aware (via that module's GRAD_BUDGET global, which main()
     # below sets).
