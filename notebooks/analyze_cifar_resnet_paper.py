@@ -284,22 +284,36 @@ def accuracy_only(y_true: torch.Tensor, probs: torch.Tensor) -> float:
 # ==========================================================================
 # ANALYSIS A -- headline predictive-metrics table, full CIFAR-10 test set
 # ==========================================================================
-summary_rows = []
+# Cached in SUMMARY_CACHE while the settings and loaded runs match (200 draws x
+# 10k images per sampler is the slow part). Delete the file to recompute.
+SUMMARY_CACHE = SAVE_DIR / "summary_cache.pkl"
+SUMMARY_META = {"n_pred_draws": N_PRED_DRAWS, "n_test": N_TEST,
+                "map_ref": str(MAP_REF_PATH), "sgd_ref": str(SGD_REF_PATH),
+                "runs": [f for label, f in RUN_SPECS if label in runs]}
+_cache = pickle.loads(SUMMARY_CACHE.read_bytes()) if SUMMARY_CACHE.exists() else None
+if _cache is not None and _cache["meta"] == SUMMARY_META:
+    summary_rows = _cache["rows"]
+    print(f"loaded {SUMMARY_CACHE}")
+else:
+    summary_rows = []
 
-_p_sgd = predict_probs(X_SGD, X_test, module=_module_for(SGD_MSD))
-_m_sgd = calibration_metrics(y_test, _p_sgd)
-summary_rows.append({"model": "SGD", **{k: _m_sgd[k] for k in ("acc", "ece", "nll", "brier")}})
+    _p_sgd = predict_probs(X_SGD, X_test, module=_module_for(SGD_MSD))
+    _m_sgd = calibration_metrics(y_test, _p_sgd)
+    summary_rows.append({"model": "SGD", **{k: _m_sgd[k] for k in ("acc", "ece", "nll", "brier")}})
 
-_p_map = predict_probs(X_REF, X_test, module=_module_for(MSD))
-_m_map = calibration_metrics(y_test, _p_map)
-summary_rows.append({"model": "MAP (pruned x_ref)",
-                     **{k: _m_map[k] for k in ("acc", "ece", "nll", "brier")}})
+    _p_map = predict_probs(X_REF, X_test, module=_module_for(MSD))
+    _m_map = calibration_metrics(y_test, _p_map)
+    summary_rows.append({"model": "MAP (pruned x_ref)",
+                         **{k: _m_map[k] for k in ("acc", "ece", "nll", "brier")}})
 
-for label, ck in runs.items():
-    mean_p, _ = posterior_mean_probs(ck["samples"], X_test, N_PRED_DRAWS)
-    _m = calibration_metrics(y_test, mean_p)
-    summary_rows.append({"model": RUN_DISPLAY[label],
-                         **{k: _m[k] for k in ("acc", "ece", "nll", "brier")}})
+    for label, ck in runs.items():
+        mean_p, _ = posterior_mean_probs(ck["samples"], X_test, N_PRED_DRAWS)
+        _m = calibration_metrics(y_test, mean_p)
+        summary_rows.append({"model": RUN_DISPLAY[label],
+                             **{k: _m[k] for k in ("acc", "ece", "nll", "brier")}})
+
+    SUMMARY_CACHE.write_bytes(pickle.dumps({"meta": SUMMARY_META, "rows": summary_rows}))
+    print(f"saved to {SUMMARY_CACHE}")
 
 summary_df = pd.DataFrame(summary_rows).set_index("model")
 print(f"\n=== Predictive metrics on full CIFAR-10 test set (N={N_TEST}) ===")
