@@ -39,6 +39,9 @@ MODELS = {
                      piw=0.01, batch=128, t0={"zigzag": 1e-5, "boomerang": 1e-4}, chunk=2_000),
 }
 PRIOR_STD = 2.0
+# --smoke: a small data subset and a few optimisation steps, to check that the scripts run
+SMOKE_DATA = dict(n_train=2000, n_test=500, n_val=500)
+SMOKE_STEPS = dict(sgd_epochs=1, map_steps=30, refit=10, n_fisher=64)
 
 
 def build_target(model: str, data: dict, state_dict=None):
@@ -111,11 +114,19 @@ def main():
     p.add_argument("command", choices=["sgd", "map"])
     p.add_argument("--model", choices=list(MODELS), required=True)
     p.add_argument("--out", type=Path, default=Path("results/images/references"))
+    p.add_argument("--smoke", action="store_true", help=f"data subset {SMOKE_DATA} and {SMOKE_STEPS}")
     args = p.parse_args()
     cfg = MODELS[args.model]
+    sizes = dict(n_val=2000)
+    if args.smoke:
+        cfg = {**cfg, "sgd": {**cfg["sgd"], "epochs": SMOKE_STEPS["sgd_epochs"]},
+               "map": {**cfg["map"], "steps": SMOKE_STEPS["map_steps"], "refit": SMOKE_STEPS["refit"],
+                       "n_fisher": SMOKE_STEPS["n_fisher"]}}
+        sizes = SMOKE_DATA
     seed_all(0)
-    data = image_data(cfg["data"], n_val=2000, flatten=cfg["flatten"], dtype=DTYPE, device=DEVICE)
+    data = image_data(cfg["data"], flatten=cfg["flatten"], dtype=DTYPE, device=DEVICE, **sizes)
     result = (sgd if args.command == "sgd" else map_reference)(args, cfg, data)
+    result["smoke"] = args.smoke
     path = args.out / f"{args.model}_{args.command}.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({k: v.cpu() if torch.is_tensor(v) else v for k, v in result.items()}, path)

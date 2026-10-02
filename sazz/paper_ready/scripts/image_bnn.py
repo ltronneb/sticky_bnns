@@ -13,7 +13,7 @@ import torch
 from ..common import DEVICE, make_pdmp, save, seed_all, summary
 from ..data import image_data
 from ..samplers import run_and_resample
-from .image_reference import MODELS, PRIOR_STD, build_target
+from .image_reference import MODELS, PRIOR_STD, SMOKE_DATA, build_target
 
 
 @torch.no_grad()
@@ -38,8 +38,8 @@ def main():
     cfg = MODELS[args.model]
     seed_all(0)
     ref = torch.load(args.references / f"{args.model}_map.pt", map_location=DEVICE)
-    data = image_data(cfg["data"], n_val=2000, flatten=cfg["flatten"], dtype=ref["x_ref"].dtype,
-                      device=DEVICE)
+    sizes = SMOKE_DATA if ref.get("smoke") else dict(n_val=2000)   # same data as the reference
+    data = image_data(cfg["data"], flatten=cfg["flatten"], dtype=ref["x_ref"].dtype, device=DEVICE, **sizes)
     bm = build_target(args.model, data, ref["module_state_dict"])
     x_ref, Sigma_inv = ref["x_ref"].to(bm.X.dtype), ref["Sigma_inv"].to(bm.X.dtype)
 
@@ -51,7 +51,8 @@ def main():
         seed_all(42)
         sampler = make_pdmp(name, bm, x_ref, Sigma_inv, t_max_init=cfg["t0"][name.split("_")[-1]],
                             gamma=1e-6, refresh_rate=1.0, std_weight=PRIOR_STD, inclusion=cfg["piw"],
-                            cold_start=ref["cold_start_mask"], batch_size=cfg["batch"],
+                            cold_start=ref["cold_start_mask"],
+                            batch_size=32 if ref.get("smoke") else cfg["batch"],   # smoke: fast on a CPU
                             alpha=1.02, alpha_violation=1.1)
         out = run_and_resample(sampler, x_ref, n_out=args.n_draws, n_events=args.n_events,
                                chunk_size=args.chunk_size or cfg["chunk"])

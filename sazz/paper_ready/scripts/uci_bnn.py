@@ -36,6 +36,9 @@ from ..utils.reference import fit_map, laplace_precision
 DATASETS = ("boston", "energy", "concrete", "yacht")
 NOISE_PRIOR_SCALE = {"boston": 0.3, "energy": 0.03, "concrete": 0.2, "yacht": 0.01}
 MEDIUM_SIGMA_INV_SCALE = {"boston": 0.75, "energy": 0.5, "concrete": 10.0, "yacht": 0.5}
+# LBBNN, tuned 2.10 on energy and yacht (notes/lbbnn_tuning). Inclusion probabilities start
+# near 1 (logit ~ U(3.5, 4.5)), 5e4 full-batch epochs with a cosine decay of the learning rate.
+LBBNN_UCI = dict(epochs=50_000, cosine=True, lam_init=(3.5, 4.5))
 VARIANTS = {
     "small": dict(hidden=[50], piw=0.3, budget=dict(grad_budget=1_000_000), gamma=0.01,
                   refresh=1.0, t0={"zigzag": 2e-4, "boomerang": 3e-3}, batch=None,
@@ -53,7 +56,7 @@ def sigma_inv_scale(variant: str, ds: str) -> float:
     return {"small": 0.1, "medium": MEDIUM_SIGMA_INV_SCALE[ds], "large": 1.0}[variant]
 
 
-def reference(bm, path: Path, seed=None):
+def reference(bm, path: Path, seed=None, steps: int = 20_000):
     """MAP (Adam from N(0, I), 2e4 steps) and Laplace precision, cached at path.
     seed=None continues the current random stream."""
     if path.exists():
@@ -61,7 +64,7 @@ def reference(bm, path: Path, seed=None):
         return r["x_ref"].to(DTYPE), r["Sigma_inv"].to(DTYPE)
     if seed is not None:
         seed_all(seed)
-    x_ref = fit_map(bm, 20_000)
+    x_ref = fit_map(bm, steps)
     Sigma_inv = laplace_precision(bm, x_ref)
     save(path, x_ref=x_ref, Sigma_inv=Sigma_inv)
     return x_ref, Sigma_inv
@@ -77,10 +80,11 @@ def run_split(args, ds: str, split: int, chain):
                    prior_sigma_scale=NOISE_PRIOR_SCALE[ds], dtype=DTYPE, device=DEVICE)
     base = args.out / args.variant / ds / f"split_{split:02d}"
     if chain is None:
-        x_ref, Sigma_inv = reference(bm, base / "map.pt")
+        x_ref, Sigma_inv = reference(bm, base / "map.pt", steps=args.map_steps)
         seed = 42 + split
     else:
-        x_ref, Sigma_inv = reference(bm, base / "maps" / f"map_{chain}.pt", 90_000 + 1000 * split + chain)
+        x_ref, Sigma_inv = reference(bm, base / "maps" / f"map_{chain}.pt", 90_000 + 1000 * split + chain,
+                                     steps=args.map_steps)
         seed = 42 + split + 10_000 * chain
     scale = torch.full_like(Sigma_inv, sigma_inv_scale(args.variant, ds))
     scale[-1] = 1.0  # log_sigma keeps its prior-only precision
@@ -112,14 +116,15 @@ def run_split(args, ds: str, split: int, chain):
                          n_events=out["n_events"], grad_evals=out["grad_evals"])
             elif name == "nuts":
                 draws, sec, evals = nuts(data["X_train"], data["y_train"], layers, "tanh", 1.0, 1.0,
-                                         prior_sigma_scale=NOISE_PRIOR_SCALE[ds], x_init=x_ref, seed=seed)
+                                         prior_sigma_scale=NOISE_PRIOR_SCALE[ds], x_init=x_ref, seed=seed,
+                                         **args.nuts_kw)
                 save(path, samples=draws, elapsed_sec=sec, grad_evals=evals, **meta)
             elif name == "lbbnn":
                 draws, sec, evals, alpha = lbbnn(data, layers, "tanh", 1.0, 1.0,
                                                  prior_sigma_scale=NOISE_PRIOR_SCALE[ds],
                                                  batch_size=cfg["batch"] or 10_000,
                                                  learn_model_prior=False, n_draws=args.n_draws,
-                                                 seed=seed, device=DEVICE, dtype=DTYPE)
+                                                 seed=seed, device=DEVICE, dtype=DTYPE, **{**LBBNN_UCI, **args.lbbnn_kw})
                 save(path, samples=draws, elapsed_sec=sec, grad_evals=evals,
                      inclusion_probabilities=alpha, **meta)
 
@@ -140,7 +145,12 @@ def main():
     p.add_argument("--resume", action="store_true", help="skip runs whose file exists")
     p.add_argument("--save-skeleton", action="store_true",
                    help="also save each PDMP's skeleton to <sampler>_skeleton.pt")
+    p.add_argument("--smoke", action="store_true",
+                   help="tiny MAP fit, NUTS and LBBNN, to check that the script runs")
     args = p.parse_args()
+    args.map_steps = 500 if args.smoke else 20_000
+    args.nuts_kw = dict(n_warmup=50, n_draws=50) if args.smoke else {}
+    args.lbbnn_kw = dict(epochs=200) if args.smoke else {}
     for ds in args.datasets:
         for split in args.splits:
             for chain in args.chains or [None]:

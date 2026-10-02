@@ -20,7 +20,8 @@ def _toy(f, x_train, noise, rng):
     t = lambda a: torch.tensor(a, dtype=torch.float64)
     return {"X_train": t((x_train - xm) / xs).unsqueeze(1), "y_train": t((y_train - ym) / ys),
             "X_test": t((x_test - xm) / xs).unsqueeze(1), "y_test": t((y_test - ym) / ys),
-            "y_test_clean": t((y_clean - ym) / ys), "y_std": float(ys), "noise_std": noise / ys}
+            "y_test_clean": t((y_clean - ym) / ys), "x_test_raw": t(x_test), "y_std": float(ys),
+            "noise_std": noise / ys}
 
 
 def toy_data(name: str) -> dict:

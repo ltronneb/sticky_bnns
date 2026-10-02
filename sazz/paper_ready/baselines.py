@@ -78,7 +78,7 @@ def lbbnn(data: dict, layer_sizes, activation: str, prior_std_weight: float,
           prior_std_bias: float, noise_std: Optional[float] = None, prior_sigma_scale: float = 1.0,
           epochs: int = 15_000, temper: float = 0.2, batch_size: int = 10_000, lr: float = 1e-2,
           learn_model_prior: bool = True, n_draws: int = 4000, seed: int = 42,
-          device="cpu", dtype=torch.float64):
+          device="cpu", dtype=torch.float64, **extra):
     """Latent binary BNN by variational inference, see lbbnn.py. A fixed model
     prior is Beta-Binomial(1, 1). Returns (draws, elapsed_sec, gradient_evals,
     inclusion_probabilities)."""
@@ -88,5 +88,5 @@ def lbbnn(data: dict, layer_sizes, activation: str, prior_std_weight: float,
                       prior_sigma_scale=prior_sigma_scale, prior_std_weight=prior_std_weight,
                       prior_std_bias=prior_std_bias, temper=temper, prior_pa=ab, prior_pb=ab,
                       learn_model_prior=learn_model_prior, epochs=epochs,
-                      batch_size=batch_size, lr=lr)
+                      batch_size=batch_size, lr=lr, **extra)
     return run_lbbnn(data, cfg, seed, n_draws=n_draws, device=device, dtype=dtype)

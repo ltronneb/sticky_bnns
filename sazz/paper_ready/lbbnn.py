@@ -37,6 +37,11 @@ class LBBNNConfig:
     epochs: int = 5_000
     batch_size: int = 100
     lr: float = 1e-2
+    # initialization and optimization (defaults are the settings of the paper runs)
+    lam_init: tuple = (0.0, 1.0)      # inclusion logits ~ U(lo, hi), alpha = sigmoid(lam)
+    rho_init: tuple = (-5.0, -4.0)    # slab sd = softplus(rho), rho ~ U(lo, hi)
+    cosine: bool = False              # cosine decay of the learning rate to 1 % of lr
+    mc_samples: int = 1               # Monte Carlo samples of the ELBO per step
 
 
 def _normal_log_prob(x, mu, sigma):
@@ -47,9 +52,9 @@ class SpikeSlabLinear(nn.Module):
     def __init__(self, n_in: int, n_out: int, cfg: LBBNNConfig):
         super().__init__()
         u = lambda shape, lo, hi: nn.Parameter(torch.empty(shape).uniform_(lo, hi))
-        self.w_mu, self.w_rho = u((n_out, n_in), -0.2, 0.2), u((n_out, n_in), -5.0, -4.0)
-        self.lam = u((n_out, n_in), 0.0, 1.0)
-        self.b_mu, self.b_rho = u(n_out, -0.2, 0.2), u(n_out, -5.0, -4.0)
+        self.w_mu, self.w_rho = u((n_out, n_in), -0.2, 0.2), u((n_out, n_in), *cfg.rho_init)
+        self.lam = u((n_out, n_in), *cfg.lam_init)
+        self.b_mu, self.b_rho = u(n_out, -0.2, 0.2), u(n_out, *cfg.rho_init)
         pa, pb = torch.empty(1).uniform_(*cfg.prior_pa), torch.empty(1).uniform_(*cfg.prior_pb)
         if cfg.learn_model_prior:
             self.pa, self.pb = nn.Parameter(pa), nn.Parameter(pb)
@@ -139,14 +144,19 @@ def run_lbbnn(data: dict, cfg: LBBNNConfig, seed: int, n_draws: int = 4000,
     N = X.shape[0]
     bs = min(cfg.batch_size, N)
     n_batches = math.ceil(N / bs)
+    sched = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, cfg.epochs * n_batches, cfg.lr * 0.01)
+             if cfg.cosine else None)
     t0 = time.perf_counter()
     for epoch in range(cfg.epochs):
         perm = torch.randperm(N, device=device)
         for k in range(n_batches):
             idx = perm[k * bs:(k + 1) * bs]
             opt.zero_grad()
-            model.negative_elbo(X[idx], y[idx], n_batches).backward()
+            loss = sum(model.negative_elbo(X[idx], y[idx], n_batches) for _ in range(cfg.mc_samples))
+            (loss / cfg.mc_samples).backward()
             opt.step()
+            if sched:
+                sched.step()
         if epoch % 1000 == 0:
             alpha = torch.cat([L.alpha.flatten() for L in model.layers]).mean()
             print(f"  LBBNN epoch {epoch}/{cfg.epochs}  mean alpha {float(alpha):.3f}")
