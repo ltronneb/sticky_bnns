@@ -42,6 +42,9 @@ class LBBNNConfig:
     rho_init: tuple = (-5.0, -4.0)    # slab sd = softplus(rho), rho ~ U(lo, hi)
     cosine: bool = False              # cosine decay of the learning rate to 1 % of lr
     mc_samples: int = 1               # Monte Carlo samples of the ELBO per step
+    # fixed prior inclusion probability w (Bernoulli(w) on every indicator) instead of the
+    # Beta-Binomial, the same prior on the indicators as the sticky samplers
+    prior_inclusion: Optional[float] = None
 
 
 def _normal_log_prob(x, mu, sigma):
@@ -63,6 +66,7 @@ class SpikeSlabLinear(nn.Module):
             self.register_buffer("pb", pb)
         self.slab_std = cfg.prior_std_weight / math.sqrt(n_in)
         self.bias_std, self.temper = cfg.prior_std_bias, cfg.temper
+        self.prior_inclusion = cfg.prior_inclusion
 
     @property
     def alpha(self) -> Tensor:
@@ -77,11 +81,18 @@ class SpikeSlabLinear(nn.Module):
         log_slab = -0.5 * math.log(2 * math.pi) - math.log(self.slab_std) - w ** 2 / (2 * self.slab_std ** 2)
         log_p = ((g * log_slab + (1 - g) + 1e-8).sum()
                  + (_normal_log_prob(b, 0.0, torch.tensor(self.bias_std)) + 1e-8).sum()
-                 + self._beta_binomial(g))
+                 + self._model_prior(g))
         log_q = (torch.log(g * _normal_log_prob(w, self.w_mu, w_sd).exp() + (1 - g) + 1e-8).sum()
                  + (g * torch.log(a + 1e-8) + (1 - g) * torch.log(1 - a + 1e-8)).sum()
                  + _normal_log_prob(b, self.b_mu, b_sd).sum())
         return F.linear(x, w, b), log_p - log_q
+
+    def _model_prior(self, g: Tensor) -> Tensor:
+        """log p(gamma), Bernoulli(w) when prior_inclusion is set, else the Beta-Binomial."""
+        if self.prior_inclusion is not None:
+            w = self.prior_inclusion
+            return (g * math.log(w) + (1 - g) * math.log(1 - w)).sum()
+        return self._beta_binomial(g)
 
     def _beta_binomial(self, g: Tensor) -> Tensor:
         pa, pb, lg = self.pa, self.pb, torch.lgamma
