@@ -120,7 +120,7 @@ def crps_mixture(y: Tensor, preds: Tensor, sigma: Tensor, y_std: float,
 
 def run_metrics(run: dict, data: dict) -> dict:
     samples = run["samples"].to(DTYPE)
-    preds = predict(samples[:, :-1], run["layer_sizes"], run["activation"], data["X_test"])
+    preds = predict(samples[:, :-1], run["layer_sizes"], run.get("activation", "tanh"), data["X_test"])
     sigma = samples[:, -1].exp()
     y, y_std = data["y_test"], data["y_std"]
     w = weight_mask(run["layer_sizes"])
@@ -272,7 +272,9 @@ PAPER_ROWS = {
         ("Sticky ZigZag",    "shallow",         "sticky_zigzag",    0.3),
         ("Sticky Boomerang", "shallow_piw_0.1", "sticky_boomerang", 0.1),
         ("Sticky ZigZag",    "shallow_piw_0.1", "sticky_zigzag",    0.1),
-        ("LBBNN",            "shallow",         "lbbnn",            None),
+        # Bernoulli(w) inclusion prior, Status 18
+        ("LBBNN",            "lbbnn_bernoulli/small",        "lbbnn", 0.3),
+        ("LBBNN",            "lbbnn_bernoulli/small_piw0.1", "lbbnn", 0.1),
     ],
     "medium": [
         ("Boomerang",        "deep_narrow",         "boomerang",        None),
@@ -282,7 +284,9 @@ PAPER_ROWS = {
         ("Sticky ZigZag",    "deep_narrow",         "sticky_zigzag",    0.3),
         ("Sticky Boomerang", "deep_narrow/piw_0.1", "sticky_boomerang", 0.1),
         ("Sticky ZigZag",    "deep_narrow/piw_0.1", "sticky_zigzag",    0.1),
-        ("LBBNN",            "deep_narrow",         "lbbnn",            None),
+        # Bernoulli(w) inclusion prior, Status 18
+        ("LBBNN",            "lbbnn_bernoulli/medium",        "lbbnn", 0.3),
+        ("LBBNN",            "lbbnn_bernoulli/medium_piw0.1", "lbbnn", 0.1),
     ],
     "large": [
         ("Sticky Boomerang", "deep_wide_v2/deep_wide", "sticky_boomerang", 0.05),

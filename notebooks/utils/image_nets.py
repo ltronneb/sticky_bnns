@@ -28,6 +28,19 @@ import matplotlib.pyplot as plt
 # ==========================================================================
 # Checkpoint loading
 # ==========================================================================
+# The pruning threshold of the MAP references (refit_pruned_*_reference.py) was chosen on
+# 2000 test images, positions 500 to 2499 of a seed-42 permutation of the test set drawn
+# after the whole training set. Checked 2.10, this reproduces the stored refit accuracy.
+PRUNE_SEED, PRUNE_N_TEST, PRUNE_N_SWEEP = 42, 500, 2000
+
+
+def pruning_sweep_indices(n_train_pool: int, n_test_pool: int = 10_000) -> np.ndarray:
+    """Test-set indices (torchvision order) of the images that chose the pruning threshold."""
+    rng = np.random.default_rng(PRUNE_SEED)
+    rng.choice(n_train_pool, size=n_train_pool, replace=False)
+    return rng.permutation(n_test_pool)[PRUNE_N_TEST:PRUNE_N_TEST + PRUNE_N_SWEEP]
+
+
 def load_runs(run_dir: Path, run_specs: list[tuple[str, str]]) -> dict[str, dict]:
     """Load each (label, filename) in run_specs from run_dir; skip missing
     files with a printed note. Raises if none were found."""

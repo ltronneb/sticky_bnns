@@ -84,11 +84,20 @@ def draw_stats(path: Path, data: dict) -> dict:
         X, y = data[f"X_{split}"], data[f"y_{split}"]
         f = predict(z[:, :-1], L, "tanh", X, chunk=500)
         out[f"{split} RMSE"] = (((f - y) ** 2).mean(1).sqrt() * data["y_std"]).numpy()
+        # if split == "test":
+        #     out["f_test"] = (f * data["y_std"]).numpy()
+        # if run.get("x_ref") is not None:
+        #     f_map = predict(run["x_ref"].double()[None, :-1], L, "tanh", X)
+        #     out[f"MAP {split} RMSE"] = float(((f_map - y) ** 2).mean().sqrt() * data["y_std"])
         if split == "test":
             out["f_test"] = (f * data["y_std"]).numpy()
+            out["test mean prediction"] = out["f_test"].mean(1)          # per draw, y units
         if run.get("x_ref") is not None:
             f_map = predict(run["x_ref"].double()[None, :-1], L, "tanh", X)
             out[f"MAP {split} RMSE"] = float(((f_map - y) ** 2).mean().sqrt() * data["y_std"])
+            if split == "test":
+                out["MAP test mean prediction"] = float(f_map.mean() * data["y_std"])
+
     if run.get("x_ref") is not None:
         out["MAP log sigma"] = float(run["x_ref"][-1])
     w = weight_mask(L)

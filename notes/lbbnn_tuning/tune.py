@@ -31,6 +31,10 @@ CONFIGS = {
     "a98_long_cos":    dict(lam_init=(3.5, 4.5), epochs=50_000, cosine=True),
     "hi_long_cos_mp":  dict(lam_init=(2.0, 3.0), epochs=50_000, cosine=True, learn_model_prior=True),
     "a98_long_cos_mp": dict(lam_init=(3.5, 4.5), epochs=50_000, cosine=True, learn_model_prior=True),
+    # round 3, the original author's tempering (KL x tau with sigma = 1 on standardized y), which is
+    # the same as fixing the noise variance at tau. Same optimiser settings as a98_long_cos.
+    **{f"tau{t:g}": dict(lam_init=(3.5, 4.5), epochs=50_000, cosine=True, noise_var=t)
+       for t in (0.003, 0.01, 0.03, 0.1, 0.3, 1.0)},
 }
 NETS = {"small": [50], "medium": [50, 50, 50]}
 DATASETS = ["energy", "yacht", "concrete", "boston"]
@@ -55,15 +59,20 @@ def run(config, net, ds, split):
     layers = [data["X_train"].shape[1], *NETS[net], 1]
     kw = dict(CONFIGS[config])
     learn_mp = kw.pop("learn_model_prior", False)
+    noise_var = kw.pop("noise_var", None)
+    noise_std = None if noise_var is None else noise_var ** 0.5
     t0 = time.perf_counter()
-    draws, sec, evals, alpha = lbbnn(data, layers, "tanh", 1.0, 1.0,
+    draws, sec, evals, alpha = lbbnn(data, layers, "tanh", 1.0, 1.0, noise_std=noise_std,
                                      prior_sigma_scale=NOISE_PRIOR_SCALE[ds], batch_size=10_000,
                                      learn_model_prior=learn_mp, n_draws=4000, seed=42 + split, **kw)
     z = draws.double()
-    preds = ffn_predict(z[:, :-1], layers, data["X_test"].double())
-    m = regression_metrics(data["y_test"].double(), preds, z[:, -1].exp(), data["y_std"])
+    beta = z if noise_std is not None else z[:, :-1]
+    sig = (torch.full((z.shape[0],), noise_std, dtype=torch.float64) if noise_std is not None
+           else z[:, -1].exp())
+    preds = ffn_predict(beta, layers, data["X_test"].double())
+    m = regression_metrics(data["y_test"].double(), preds, sig, data["y_std"])
     row = dict(config=config, net=net, dataset=ds, split=split, **m,
-               sparsity=sparsity(z[:, :-1], freezable(FFN(layers))), sigma=float(z[0, -1].exp()),
+               sparsity=sparsity(beta, freezable(FFN(layers))), sigma=float(sig[0]),
                seconds=time.perf_counter() - t0, settings={k: str(v) for k, v in CONFIGS[config].items()})
     OUT.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(row))

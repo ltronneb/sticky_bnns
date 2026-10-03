@@ -60,7 +60,7 @@ def coverage(u: np.ndarray, levels) -> np.ndarray:
 
 def run_coverage(run: dict, data: dict) -> dict:
     samples = run["samples"].to(DTYPE)
-    f = predict(samples[:, :-1], run["layer_sizes"], run["activation"], data["X_test"])
+    f = predict(samples[:, :-1], run["layer_sizes"], run.get("activation", "tanh"), data["X_test"])
     sigma = samples[:, -1].exp()
     p = torch.tensor(REPORT_LEVELS, dtype=DTYPE)
     q = predictive_quantiles(f, sigma, torch.cat([(1 - p) / 2, (1 + p) / 2]))

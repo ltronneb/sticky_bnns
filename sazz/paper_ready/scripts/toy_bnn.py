@@ -1,6 +1,6 @@
 """1-D toy regression with a BNN with one hidden layer of 100 tanh units and known
 noise. The PDMPs get G = 2e5 gradient evaluations, NUTS 4 x (1000 + 1000),
-LBBNN 1.5e4 epochs.
+LBBNN 1.5e4 epochs with the sticky samplers' Bernoulli(w) inclusion prior.
 
     python -m sazz.paper_ready.scripts.toy_bnn --out results/toy_bnns
 """
@@ -20,7 +20,7 @@ from ..utils.reference import fit_map, laplace_precision
 
 DATASETS = ("hernandez", "gap", "sharp", "multiscale")
 LAYERS, ACT, PRIOR_STD = [1, 100, 1], "tanh", 3.0
-INCLUSION = 0.1          # sticky prior inclusion probability
+INCLUSION = 0.1          # prior inclusion probability, sticky samplers and LBBNN
 SIGMA_INV_SCALE = 0.1    # Boomerang reference precision = scale * Laplace precision
 T_MAX_INIT = {"zigzag": 2e-4, "boomerang": 3e-3}
 
@@ -74,7 +74,8 @@ def main():
             elif name == "lbbnn":
                 draws, sec, evals, alpha = lbbnn(data, LAYERS, ACT, PRIOR_STD, PRIOR_STD,
                                                  noise_std=data["noise_std"], epochs=lbbnn_epochs,
-                                                 temper=0.5, n_draws=args.n_draws)
+                                                 temper=0.5, n_draws=args.n_draws,
+                                                 learn_model_prior=False, prior_inclusion=INCLUSION)
                 save(sd / "lbbnn.pt", samples=draws, elapsed_sec=sec, grad_evals=evals,
                      inclusion_probabilities=alpha, **meta)
 

@@ -88,7 +88,7 @@ SAVE_DIR = Path("results/plots_v2/MNIST_FFN/")
 # SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # noise sweep results, reused while the settings below match. Delete the file to recompute.
 NOISE_CACHE = SAVE_DIR / "noise_sweep_cache.pkl"
-NOISE_META = {"sigmas": SIGMAS, "classes": CLASSES, "n_per_class": N_PER_CLASS,
+NOISE_META = {"test_set": "8000 without pruning images", "sigmas": SIGMAS, "classes": CLASSES, "n_per_class": N_PER_CLASS,
               "n_draws_pool": N_DRAWS_POOL, "pool_seed": POOL_SEED, "noise_seed": NOISE_SEED,
               "runs": [f for _, f in RUN_SPECS]}
 
@@ -172,6 +172,14 @@ _data = load_mnist_subset(60_000, N_TEST, BASE_SEED, Path("datasets"),
                           dtype=DTYPE, device="cpu")
 X_test = _data["X_test"]          # [N,1,28,28] normalised, CPU
 y_test = _data["y_test"]
+# Leave out the 2000 images that chose the pruning threshold of the MAP. load_mnist_subset
+# draws the training set, then permutes the test set, so replay that to get X_test's indices.
+_rng = np.random.default_rng(BASE_SEED)
+_ = _rng.choice(60_000, size=60_000, replace=False)
+TEST_IDX = _rng.permutation(10_000)[:N_TEST]
+_keep = torch.as_tensor(~np.isin(TEST_IDX, inet.pruning_sweep_indices(60_000)))
+X_test, y_test, TEST_IDX = X_test[_keep], y_test[_keep], TEST_IDX[_keep.numpy()]
+N_TEST = len(y_test)              # 8000, disjoint from the pruning images
 print("X_test:", tuple(X_test.shape), " class balance:",
       torch.bincount(y_test, minlength=10).tolist())
 
@@ -271,7 +279,7 @@ for row in clean_rows:
                          **{k: row[k] for k in ("acc", "ece", "nll", "brier")}})
 
 summary_df = pd.DataFrame(summary_rows).set_index("model")
-print(f"\n=== Analysis B: predictive metrics on full MNIST test set (N={N_TEST}) ===")
+print(f"\n=== Analysis B: predictive metrics on the MNIST test images not used for pruning (N={N_TEST}) ===")
 print(summary_df.to_string(float_format=lambda v: f"{v:.4f}"))
 # summary_df.to_csv(SAVE_DIR / "tableB_headline_metrics.csv")
 

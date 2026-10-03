@@ -167,6 +167,7 @@ del _sgd_module
 # 2. Data -- full seeded CIFAR-10 test set
 # ==========================================================================
 from sazz.gpu_friendly.scripts.fast_cifar_resnet import load_cifar10_subset
+from notebooks.utils import image_nets as inet
 
 _data = load_cifar10_subset(50_000, N_TEST, BASE_SEED, Path("datasets"),
                             dtype=DTYPE, device="cpu")
@@ -184,6 +185,10 @@ print("X_test:", tuple(X_test.shape), " class balance:",
 _rng = np.random.default_rng(BASE_SEED)
 _ = _rng.choice(50_000, size=50_000, replace=False)          # consume the train draw
 TEST_IDX = _rng.choice(10_000, size=N_TEST, replace=False)   # X_test's images, in order
+# Leave out the 2000 images that chose the pruning threshold of the MAP.
+_keep = torch.as_tensor(~np.isin(TEST_IDX, inet.pruning_sweep_indices(50_000)))
+X_test, y_test, TEST_IDX = X_test[_keep], y_test[_keep], TEST_IDX[_keep.numpy()]
+N_TEST = len(y_test)              # 8000, disjoint from the pruning images
 
 
 # %%
@@ -287,7 +292,7 @@ def accuracy_only(y_true: torch.Tensor, probs: torch.Tensor) -> float:
 # Cached in SUMMARY_CACHE while the settings and loaded runs match (200 draws x
 # 10k images per sampler is the slow part). Delete the file to recompute.
 SUMMARY_CACHE = SAVE_DIR / "summary_cache.pkl"
-SUMMARY_META = {"n_pred_draws": N_PRED_DRAWS, "n_test": N_TEST,
+SUMMARY_META = {"test_set": "8000 without pruning images", "n_pred_draws": N_PRED_DRAWS, "n_test": N_TEST,
                 "map_ref": str(MAP_REF_PATH), "sgd_ref": str(SGD_REF_PATH),
                 "runs": [f for label, f in RUN_SPECS if label in runs]}
 _cache = pickle.loads(SUMMARY_CACHE.read_bytes()) if SUMMARY_CACHE.exists() else None
@@ -316,7 +321,7 @@ else:
     print(f"saved to {SUMMARY_CACHE}")
 
 summary_df = pd.DataFrame(summary_rows).set_index("model")
-print(f"\n=== Predictive metrics on full CIFAR-10 test set (N={N_TEST}) ===")
+print(f"\n=== Predictive metrics on the CIFAR-10 test images not used for pruning (N={N_TEST}) ===")
 print(summary_df.to_string(float_format=lambda v: f"{v:.4f}"))
 # summary_df.to_csv(SAVE_DIR / "table_headline_metrics.csv")
 
@@ -331,7 +336,7 @@ print(summary_df.to_string(float_format=lambda v: f"{v:.4f}"))
 #
 # The curves are cached in CORRUPT_CACHE and reloaded while the settings and
 # the loaded runs match, so the slow CIFAR-10-C pass runs once.
-CORRUPT_META = {"corruptions": CORRUPTIONS_TO_PLOT, "severities": SEVERITIES,
+CORRUPT_META = {"test_set": "8000 without pruning images", "corruptions": CORRUPTIONS_TO_PLOT, "severities": SEVERITIES,
                 "n_test_corrupt": N_TEST_CORRUPT, "n_draws_corrupt": N_DRAWS_CORRUPT,
                 "runs": [f for label, f in RUN_SPECS if label in runs]}
 _cache = pickle.loads(CORRUPT_CACHE.read_bytes()) if CORRUPT_CACHE.exists() else None
