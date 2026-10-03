@@ -38,6 +38,7 @@ NOISE_PRIOR_SCALE = {"boston": 0.3, "energy": 0.03, "concrete": 0.2, "yacht": 0.
 MEDIUM_SIGMA_INV_SCALE = {"boston": 0.75, "energy": 0.5, "concrete": 10.0, "yacht": 0.5}
 # LBBNN, tuned 2.10 on energy and yacht (notes/lbbnn_tuning). Inclusion probabilities start
 # near 1 (logit ~ U(3.5, 4.5)), 5e4 full-batch epochs with a cosine decay of the learning rate.
+# The indicators get a Bernoulli(w) prior with the same w as the sticky samplers (--piw).
 LBBNN_UCI = dict(epochs=50_000, cosine=True, lam_init=(3.5, 4.5))
 VARIANTS = {
     "small": dict(hidden=[50], piw=0.3, budget=dict(grad_budget=1_000_000), gamma=0.01,
@@ -95,7 +96,9 @@ def run_split(args, ds: str, split: int, chain):
         sd = args.out / tag / ds / f"split_{split:02d}" / ("" if chain is None else f"chain_{chain}")
         for name in args.samplers:
             path = sd / f"{name}.pt"
-            if (args.resume and path.exists()) or (piw != cfg["piw"] and not name.startswith("sticky")):
+            # the prior inclusion probability w only matters for the sticky samplers and the LBBNN
+            sparse = name.startswith("sticky") or name == "lbbnn"
+            if (args.resume and path.exists()) or (piw != cfg["piw"] and not sparse):
                 continue
             print(f"\n[{tag} {ds} split {split}{'' if chain is None else f' chain {chain}'}] {name}")
             seed_all(seed)
@@ -123,10 +126,11 @@ def run_split(args, ds: str, split: int, chain):
                 draws, sec, evals, alpha = lbbnn(data, layers, "tanh", 1.0, 1.0,
                                                  prior_sigma_scale=NOISE_PRIOR_SCALE[ds],
                                                  batch_size=cfg["batch"] or 10_000,
-                                                 learn_model_prior=False, n_draws=args.n_draws,
-                                                 seed=seed, device=DEVICE, dtype=DTYPE, **{**LBBNN_UCI, **args.lbbnn_kw})
+                                                 learn_model_prior=False, prior_inclusion=piw,
+                                                 n_draws=args.n_draws, seed=seed, device=DEVICE, dtype=DTYPE,
+                                                 **{**LBBNN_UCI, **args.lbbnn_kw})
                 save(path, samples=draws, elapsed_sec=sec, grad_evals=evals,
-                     inclusion_probabilities=alpha, **meta)
+                     inclusion_probabilities=alpha, **meta, piw=piw)
 
 
 def main():
