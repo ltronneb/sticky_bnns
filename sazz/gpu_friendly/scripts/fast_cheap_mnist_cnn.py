@@ -136,7 +136,11 @@ POOL_PER_STAGE = 500
 DATA_DIR = Path("datasets")
 OUT_DIR = Path("results/grid/mnist_cnn")
 
-SAMPLER_NAMES = ("grid_sticky_zigzag", "grid_sticky_boomerang")
+SAMPLER_NAMES = ("grid_sticky_zigzag", "grid_sticky_boomerang", "grid_zigzag")
+# grid_zigzag is the dense ZigZag, the sticky ZigZag with nothing freezable, so the
+# slab is the Gaussian prior and the target is the dense posterior. It starts from
+# the unpruned MAP in --dense-start-path (the x_ref of the unpruned checkpoint).
+DENSE_START_PATH: Optional[Path] = None
 
 
 @dataclass
@@ -380,8 +384,11 @@ def _build_sticky_kappa_can_freeze(bm: BayesianModule, cfg: CNNConfig):
     return kappa, can_freeze
 
 
-def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: CNNConfig, cold_start_mask: Tensor):
+def build_sticky_zigzag_sampler(bm: BayesianModule, cfg: CNNConfig, cold_start_mask: Tensor,
+                                dense: bool = False):
     kappa, can_freeze = _build_sticky_kappa_can_freeze(bm, cfg)
+    if dense:   # nothing freezes, so this is the ordinary ZigZag on the Gaussian prior
+        can_freeze = torch.zeros_like(can_freeze)
     if GRAD_BATCH_SIZE is not None:
         grad_target, resample_grad_batch = build_minibatch_grad_target(bm, GRAD_BATCH_SIZE)
     else:
@@ -748,9 +755,36 @@ def run_grid_sticky_boomerang(dataset_name: str, split_id: int, data: dict[str, 
                 data, cfg, sd, bm, x_pruned, cold_start_mask)
 
 
+def run_grid_zigzag(dataset_name: str, split_id: int, data: dict[str, Any], cfg: CNNConfig,
+                    sd: Path, bm: BayesianModule, x_pruned: Tensor, Sigma_inv: Tensor,
+                    cold_start_mask: Tensor) -> None:
+    if _resume_skip(sd / "grid_zigzag.pt", N_SKELETON):
+        print(f"      skipping — exists at {sd / 'grid_zigzag.pt'}")
+        return
+    assert STAGE_SIZE is not None, "fast_cheap_mnist_cnn.py requires --stage-size."
+    assert DENSE_START_PATH is not None, "grid_zigzag needs --dense-start-path (the unpruned MAP)."
+    x0 = torch.load(DENSE_START_PATH, map_location="cpu", weights_only=False)["x_ref"]
+    x0 = x0.to(dtype=x_pruned.dtype, device=x_pruned.device)
+    assert x0.shape == x_pruned.shape, f"unpruned MAP has shape {tuple(x0.shape)}, target {tuple(x_pruned.shape)}"
+    no_freeze = torch.zeros_like(cold_start_mask, dtype=torch.bool)
+    print(f"      dense ZigZag from the unpruned MAP {DENSE_START_PATH.name}, "
+          f"{int((x0 == 0).sum())} exact zeros at the start")
+    sampler = build_sticky_zigzag_sampler(bm, cfg, no_freeze, dense=True)
+
+    def resample_stage(chunk_files, manifest_path, n):
+        return resample_zigzag_path_sticky_chunked_torch(
+            chunk_files, N_resample=n, burnin_frac=0.0, manifest_path=manifest_path,
+            dtype=DTYPE, device=DEVICE, return_times=True,
+        )
+
+    _run_staged("grid_zigzag", sampler, resample_stage, dataset_name, split_id,
+                data, cfg, sd, bm, x0, no_freeze)
+
+
 SAMPLER_RUNNERS = {
     "grid_sticky_zigzag": run_grid_sticky_zigzag,
     "grid_sticky_boomerang": run_grid_sticky_boomerang,
+    "grid_zigzag": run_grid_zigzag,
 }
 
 
@@ -804,7 +838,7 @@ def run_dataset(split_id: int, data: dict[str, Any], cfg: CNNConfig, out_dir: Pa
 
 def main():
     global N_SKELETON, N_RESAMPLE, N_SAVE, SKELETON_CHUNK_DIR, STAGE_SIZE, GRAD_BATCH_SIZE
-    global BOUND_MODE, ADAPT_RULE, SINGLE_SEGMENT_T_MAX_INIT, POOL_PER_STAGE
+    global BOUND_MODE, ADAPT_RULE, SINGLE_SEGMENT_T_MAX_INIT, POOL_PER_STAGE, DENSE_START_PATH
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -859,7 +893,10 @@ def main():
     parser.add_argument("--pool-per-stage", type=int, default=POOL_PER_STAGE,
                          help="Most draws per resampler call when filling the reservoir. Only "
                               "bounds GPU memory, does not change the draws' distribution.")
+    parser.add_argument("--dense-start-path", type=Path, default=None,
+                        help="unpruned MAP checkpoint whose x_ref starts grid_zigzag (dense)")
     args = parser.parse_args()
+    DENSE_START_PATH = args.dense_start_path
 
     N_SKELETON = args.n_skeleton
     N_RESAMPLE = args.n_resample

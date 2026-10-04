@@ -51,8 +51,9 @@ def _run_file(name):
 RUN_SPECS = [
     ("zigzag", _run_file("sticky_zigzag.pt")),
     ("boomerang", _run_file("sticky_boomerang.pt")),
+    ("dense", _run_file("zigzag.pt")),   # dense ZigZag from the unpruned MAP, step 19
 ]
-RUN_DISPLAY = {"zigzag": "Sticky Zig-Zag", "boomerang": "Sticky Boomerang"}
+RUN_DISPLAY = {"zigzag": "Sticky Zig-Zag", "boomerang": "Sticky Boomerang", "dense": "ZigZag"}
 
 # 88.8%-sparse pruned+refit MAP -- verified below to bit-match both runs.
 MAP_REF_PATH = Path("results/maps/lenet_reference_N60000_pruned_refit_N60k.pt")
@@ -90,7 +91,7 @@ SAVE_DIR = Path("results/plots_v2/MNIST_CNN/")
 NOISE_CACHE = SAVE_DIR / "noise_sweep_cache.pkl"
 NOISE_META = {"test_set": "8000 without pruning images", "sigmas": SIGMAS, "classes": CLASSES, "n_per_class": N_PER_CLASS,
               "n_draws_pool": N_DRAWS_POOL, "pool_seed": POOL_SEED, "noise_seed": NOISE_SEED,
-              "runs": [f for _, f in RUN_SPECS]}
+              "runs": [f for _, f in RUN_SPECS if (RUN_DIR / f).exists()]}   # only runs present, so a new run invalidates the cache
 
 plt.rcParams.update({
     "axes.spines.top": False, "axes.spines.right": False,
@@ -113,7 +114,7 @@ map_ck = torch.load(MAP_REF_PATH, map_location="cpu", weights_only=False)
 print(f"\nMAP ref: {MAP_REF_PATH.name}")
 print(f"  train_acc={map_ck['train_acc']:.4f}  test_acc={map_ck['test_acc']:.4f}  "
       f"sparsity={float((map_ck['x_ref'] == 0).float().mean()):.4f}")
-X_REF = inet.check_map_matches_runs(runs, map_ck, DTYPE)
+X_REF = inet.check_map_matches_runs({k: v for k, v in runs.items() if k != "dense"}, map_ck, DTYPE)   # the dense run starts unpruned
 D = int(X_REF.shape[0])
 
 sgd_ck = torch.load(SGD_REF_PATH, map_location="cpu", weights_only=False)
@@ -336,11 +337,11 @@ else:
 
 def plot_noise(levels, agg, save_name="MNIST_noise_paperstyle"):
     TITLE, LABEL, TICK, LEGEND = 20, 20, 18, 20
-    order = ["sgd", "map", "zigzag", "boomerang"]
+    order = ["sgd", "map", "dense", "zigzag", "boomerang"]
     point = {"sgd", "map"}   # dashed lines
     display = {"sgd": "SGD", "map": r"$\beta_{\mathrm{ref}}$",
-               "zigzag": "Sticky ZigZag", "boomerang": "Sticky Boomerang"}
-    colors = {"sgd": "#55A868", "map": "0.35", "zigzag": "#4C72B0", "boomerang": "#DD8452"}
+               "dense": "ZigZag", "zigzag": "Sticky ZigZag", "boomerang": "Sticky Boomerang"}
+    colors = {"sgd": "#55A868", "map": "0.35", "dense": "#8172B3", "zigzag": "#4C72B0", "boomerang": "#DD8452"}
     panels = [("acc", "Accuracy", (-0.02, 1.02)),
               ("p_true", "P(true class)", (-0.02, 1.02)),
               ("entropy", "Predictive entropy", (-0.05, np.log(10) * 1.08))]
