@@ -128,9 +128,10 @@ def run_split(args, ds: str, split: int, chain):
                                                  batch_size=cfg["batch"] or 10_000,
                                                  learn_model_prior=False, prior_inclusion=piw,
                                                  n_draws=args.n_draws, seed=seed, device=DEVICE, dtype=DTYPE,
+                                                 init=x_ref.detach().cpu() if args.lbbnn_map_init else None,
                                                  **{**LBBNN_UCI, **args.lbbnn_kw})
                 save(path, samples=draws, elapsed_sec=sec, grad_evals=evals,
-                     inclusion_probabilities=alpha, **meta, piw=piw)
+                     inclusion_probabilities=alpha, **meta, piw=piw, map_init=args.lbbnn_map_init)
 
 
 def main():
@@ -151,6 +152,8 @@ def main():
                    help="also save each PDMP's skeleton to <sampler>_skeleton.pt")
     p.add_argument("--smoke", action="store_true",
                    help="tiny MAP fit, NUTS and LBBNN, to check that the script runs")
+    p.add_argument("--lbbnn-map-init", action="store_true",
+                   help="start the LBBNN's variational means and noise std at the split's MAP")
     args = p.parse_args()
     args.map_steps = 500 if args.smoke else 20_000
     args.nuts_kw = dict(n_warmup=50, n_draws=50) if args.smoke else {}

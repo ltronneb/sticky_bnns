@@ -45,6 +45,9 @@ class LBBNNConfig:
     # fixed prior inclusion probability w (Bernoulli(w) on every indicator) instead of the
     # Beta-Binomial, the same prior on the indicators as the sticky samplers
     prior_inclusion: Optional[float] = None
+    # warm start, a MAP in the draw layout [W0, b0, W1, b1, ...] (+ log_sigma) that the
+    # variational means (and the learned log noise std) start from, None for random means
+    init: Optional[Tensor] = None
 
 
 def _normal_log_prob(x, mu, sigma):
@@ -127,6 +130,20 @@ class LBBNN(nn.Module):
         return nll + kl / n_batches
 
     @torch.no_grad()
+    def init_from(self, x: Tensor) -> None:
+        """Set the slab means, bias means and log noise std from a MAP x in the draw
+        layout. Inclusion logits and slab stds keep their initialization."""
+        i = 0
+        for L in self.layers:
+            for p in (L.w_mu, L.b_mu):
+                p.copy_(x[i:i + p.numel()].view_as(p))
+                i += p.numel()
+        if self.learns_noise:
+            self.log_sigma.fill_(x[i])
+            i += 1
+        assert i == x.numel(), f"MAP has {x.numel()} coordinates, the LBBNN uses {i}"
+
+    @torch.no_grad()
     def sample(self, n: int) -> Tensor:
         """Posterior draws with hard inclusion masks, flattened as
         [W0, b0, W1, b1, ...] (+ log_sigma)."""
@@ -151,6 +168,8 @@ def run_lbbnn(data: dict, cfg: LBBNNConfig, seed: int, n_draws: int = 4000,
     X = data["X_train"].to(dtype=dtype, device=device)
     y = data["y_train"].to(dtype=dtype, device=device)
     model = LBBNN(cfg).to(dtype=dtype, device=device)
+    if cfg.init is not None:
+        model.init_from(cfg.init.to(dtype=dtype, device=device))
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     N = X.shape[0]
     bs = min(cfg.batch_size, N)
