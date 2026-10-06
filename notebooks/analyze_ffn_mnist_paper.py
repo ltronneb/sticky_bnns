@@ -69,14 +69,14 @@ BASE_SEED = 42
 ACTIVATION = "relu"       # overridden from the checkpoint below if it disagrees
 LAYER_SIZES = [28 * 28, 256, 256, 10]
 
-N_PRED_DRAWS = 300  # FFN forwards are cheap; 300 draws is fine
+N_PRED_DRAWS = 500  # same number of draws as the noise sweep (N_DRAWS_POOL)
 N_TEST = 10_000  # full MNIST test pool
 ZERO_TOL = 1e-8
 
 MNIST_MEAN, MNIST_STD = 0.1307, 0.3081
 
 # --- rotation / noise sweep config (ported from ffn_pixel_noise.ipynb) ---
-CLASSES = [0, 2, 4, 6, 8]
+CLASSES = list(range(10))   # all digits, every test image of each (N_PER_CLASS is only a cap)
 N_PER_CLASS = 1_000
 N_DRAWS_POOL = 500
 POOL_SEED = 0
@@ -334,11 +334,11 @@ print(noise_table.to_string(float_format=lambda v: f"{v:.3f}"))
 
 def plot_noise(levels, agg, save_name="MNIST_noise_paperstyle"):
     TITLE, LABEL, TICK, LEGEND = 20, 20, 18, 20
-    order = ["sgd", "map", "dense", "zigzag", "boomerang"]
+    order = ["sgd", "map", "dense", "zigzag"]#, "boomerang"]
     point = {"sgd", "map"}   # dashed lines
     display = {"sgd": "SGD", "map": r"$\beta_{\mathrm{ref}}$",
-               "dense": "ZigZag", "zigzag": "Sticky ZigZag", "boomerang": "Sticky Boomerang"}
-    colors = {"sgd": "#55A868", "map": "0.35", "dense": "#8172B3", "zigzag": "#4C72B0", "boomerang": "#DD8452"}
+               "dense": "ZigZag", "zigzag": "Sticky ZigZag"} #, "boomerang": "Sticky Boomerang"}
+    colors = {"sgd": "C4", "map": "0.35", "dense": "C2", "zigzag": "C3"}#, "boomerang": "#DD8452"}
     panels = [("acc", "Accuracy", (-0.02, 1.02)),
               ("p_true", "P(true class)", (-0.02, 1.02)),
               ("entropy", "Predictive entropy", (-0.05, np.log(10) * 1.08))]
@@ -350,7 +350,7 @@ def plot_noise(levels, agg, save_name="MNIST_noise_paperstyle"):
                     marker="o", ms=5, lw=2.2, ls="--" if lbl in point else "-",
                     color=colors[lbl], label=display[lbl])
         ax.set_title(title, fontsize=TITLE)
-        #ax.set_xlabel(r"Noise scale $\sigma$", fontsize=LABEL)
+        ax.set_xlabel(r"Noise scale $\sigma$", fontsize=LABEL)
         ax.set_ylim(*ylim)
         ax.tick_params(labelsize=TICK)
         ax.grid(alpha=0.25)

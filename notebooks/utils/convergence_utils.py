@@ -7,6 +7,7 @@ a 20 % time burn-in, stored in time order. NUTS has 4 runs of 4 chains, one run 
 MAP 0 to 3.
 """
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +93,11 @@ def draw_stats(path: Path, data: dict) -> dict:
         if split == "test":
             out["f_test"] = (f * data["y_std"]).numpy()
             out["test mean prediction"] = out["f_test"].mean(1)          # per draw, y units
+            # NLL of each draw's own Gaussian, averaged over test points, on the original y
+            # scale. Not the NLL of the predictive mixture in the tables, which is lower.
+            s = z[:, -1:].exp()
+            out["test NLL"] = (0.5 * math.log(2 * math.pi) + s.log() + math.log(data["y_std"])
+                               + (f - y) ** 2 / (2 * s ** 2)).mean(1).numpy()
         if run.get("x_ref") is not None:
             f_map = predict(run["x_ref"].double()[None, :-1], L, "tanh", X)
             out[f"MAP {split} RMSE"] = float(((f_map - y) ** 2).mean().sqrt() * data["y_std"])
@@ -130,7 +136,7 @@ def cached_draw_stats(path: Path, data: dict, cache_path: Path) -> dict:
     cache = pickle.loads(cache_path.read_bytes()) if cache_path.exists() else {}
     st = path.stat()
     key = (str(path), st.st_size, int(st.st_mtime))
-    if key not in cache:
+    if key not in cache or "test NLL" not in cache[key]:   # entries from before test NLL existed
         cache[key] = draw_stats(path, data)
         cache_path.write_bytes(pickle.dumps(cache))
     return cache[key]

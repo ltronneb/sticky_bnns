@@ -79,7 +79,13 @@ def run(args):
         prec = X.T @ X / sigma ** 2 + torch.eye(args.D, dtype=DT) / tau ** 2
         x_ref = torch.linalg.solve(prec, X.T @ y / sigma ** 2)
         kappa = w / (1 - w) / (tau * math.sqrt(2 * math.pi))
-        res = {"beta_true": beta, "gibbs": collapsed_gibbs(X, y, sigma, tau, w, 20_000, 2_000, seed)}
+        if args.gibbs_from is not None:   # reuse the Gibbs reference of an earlier run on the same data
+            old = torch.load(args.gibbs_from / f"linreg_seed{seed}.pt", weights_only=False)
+            assert torch.equal(old["beta_true"], beta), "earlier run used different data"
+            gibbs = old["gibbs"]
+        else:
+            gibbs = collapsed_gibbs(X, y, sigma, tau, w, 20_000, 2_000, seed)
+        res = {"beta_true": beta, "gibbs": gibbs}
         for name, cls, kw in [("sticky_zigzag", StickyZigZag, dict(gamma=1e-3)),
                               ("sticky_boomerang", StickyBoomerang,
                                dict(x_ref=x_ref, Sigma_inv=0.1 * prec.diagonal()))]:
@@ -152,11 +158,12 @@ def summary(args):
     ax.set_xlabel(r"Gibbs $P(\gamma_i=1\mid y)$", fontsize=12)
     ax.set_ylabel("Sticky PDMP deviation", fontsize=12)
     ax.tick_params(labelsize=14)
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=10, ncol=2, frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.0))   # above the panel, off the data
     for a in axes:
         a.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     fig.savefig(args.out / "linreg_exactness.pdf", bbox_inches="tight")
+    fig.savefig(args.out / "linreg_exactness.png", bbox_inches="tight", dpi=200)
     print(f"figure -> {args.out / 'linreg_exactness.png'}")
 
 
@@ -171,6 +178,8 @@ def main():
     p.add_argument("--n-events", type=int, default=200_000)
     p.add_argument("--n-draws", type=int, default=50_000)
     p.add_argument("--out", type=Path, default=Path("results/paper_v2/sticky_exactness"))
+    p.add_argument("--gibbs-from", type=Path, default=None,
+                   help="folder of an earlier run whose Gibbs draws are reused instead of rerunning Gibbs")
     args = p.parse_args()
     (run if args.command == "run" else summary)(args)
 

@@ -275,6 +275,9 @@ PAPER_ROWS = {
         # Bernoulli(w) inclusion prior, Status 18
         ("LBBNN",            "lbbnn_bernoulli/small",        "lbbnn", 0.3),
         ("LBBNN",            "lbbnn_bernoulli/small_piw0.1", "lbbnn", 0.1),
+        # same LBBNN, variational means and noise std started at the split's MAP (Status 20)
+        ("LBBNN (MAP start)", "lbbnn_warm/small",            "lbbnn", 0.3),
+        ("LBBNN (MAP start)", "lbbnn_warm/small_piw0.1",     "lbbnn", 0.1),
     ],
     "medium": [
         ("Boomerang",        "deep_narrow",         "boomerang",        None),
@@ -287,6 +290,8 @@ PAPER_ROWS = {
         # Bernoulli(w) inclusion prior, Status 18
         ("LBBNN",            "lbbnn_bernoulli/medium",        "lbbnn", 0.3),
         ("LBBNN",            "lbbnn_bernoulli/medium_piw0.1", "lbbnn", 0.1),
+        ("LBBNN (MAP start)", "lbbnn_warm/medium",            "lbbnn", 0.3),
+        ("LBBNN (MAP start)", "lbbnn_warm/medium_piw0.1",     "lbbnn", 0.1),
     ],
     "large": [
         ("Sticky Boomerang", "deep_wide_v2/deep_wide", "sticky_boomerang", 0.05),
@@ -309,7 +314,7 @@ def _coverage90(dataset: str, archs) -> pd.DataFrame:
     computed there first for runs that are not cached yet."""
     from . import coverage_utils as cu
     recs = cu.collect(archs, (dataset,))
-    return pd.DataFrame([{"arch": r["arch"], "stem": r["stem"], "w": r["w"], "split": r["split"],
+    return pd.DataFrame([{"arch": r["arch"], "row": r["row"], "stem": r["stem"], "w": r["w"], "split": r["split"],
                           "cov90": float(cu.coverage(r["u"], [0.9])[0])} for r in recs])
 
 
@@ -358,7 +363,8 @@ def paper_table(dataset: str = "boston", dec: int = 2, caption: str = None, labe
             if len(g) < 5:
                 print(f"  warning, {arch} {lab} (w={w}) has {len(g)} of 5 splits")
             sparse = stem.startswith("sticky") or stem == "lbbnn"
-            c = cov[(cov.arch == arch) & (cov.stem == stem)
+            row_lab = lab if w is None else f"{lab} (w={w:g})"
+            c = cov[(cov.arch == arch) & (cov.row == row_lab)
                     & (cov.w.isna() if w is None else cov.w == w)]["cov90"] if len(cov) else pd.Series(dtype=float)
             if len(c) > 1:
                 cov_sems.append(100 * c.sem())

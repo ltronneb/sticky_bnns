@@ -36,6 +36,8 @@ def main():
     p.add_argument("--resume", action="store_true", help="skip runs whose file exists")
     p.add_argument("--smoke", action="store_true",
                    help="tiny MAP fit, NUTS and LBBNN, to check that the script runs")
+    p.add_argument("--lbbnn-map-init", action="store_true",
+                   help="start the LBBNN's variational means at the MAP the PDMPs start from")
     args = p.parse_args()
     map_steps, nuts_kw, lbbnn_epochs = ((500, dict(n_warmup=50, n_draws=50), 200) if args.smoke
                                         else (10_000, {}, 15_000))
@@ -75,7 +77,8 @@ def main():
                 draws, sec, evals, alpha = lbbnn(data, LAYERS, ACT, PRIOR_STD, PRIOR_STD,
                                                  noise_std=data["noise_std"], epochs=lbbnn_epochs,
                                                  temper=0.5, n_draws=args.n_draws,
-                                                 learn_model_prior=False, prior_inclusion=INCLUSION)
+                                                 learn_model_prior=False, prior_inclusion=INCLUSION,
+                                                 init=x_ref.detach().cpu() if args.lbbnn_map_init else None)
                 save(sd / "lbbnn.pt", samples=draws, elapsed_sec=sec, grad_evals=evals,
                      inclusion_probabilities=alpha, **meta)
 
