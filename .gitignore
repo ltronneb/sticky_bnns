@@ -25,6 +25,7 @@
 *.pt
 *.json
 *.pdf
+*.txt
 
 # Logs and databases #
 ######################
