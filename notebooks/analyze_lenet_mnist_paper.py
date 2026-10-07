@@ -57,6 +57,7 @@ RUN_DISPLAY = {"zigzag": "Sticky Zig-Zag", "boomerang": "Sticky Boomerang", "den
 
 # 88.8%-sparse pruned+refit MAP -- verified below to bit-match both runs.
 MAP_REF_PATH = Path("results/maps/lenet_reference_N60000_pruned_refit_N60k.pt")
+MAP_unpruned_REF_PATH = Path("results/maps/lenet_reference_N60000_steps10000.pt")   # the dense ZigZag's start
 
 # Plain SGD baseline (lenet_sgd.py) -- genuinely unrelated to the samplers
 SGD_REF_PATH = Path("results/maps/lenet_sgd_N60000_epochs40.pt")
@@ -123,6 +124,12 @@ assert int(X_SGD.shape[0]) == D, f"SGD x_ref dim {X_SGD.shape[0]} != D {D}"
 print(f"\nSGD ref: {SGD_REF_PATH.name}")
 print(f"  train_acc={sgd_ck['train_acc']:.4f}  test_acc={sgd_ck['test_acc']:.4f}  "
       f"sparsity={float((X_SGD == 0).float().mean()):.4f}  (dense, unrelated to MAP_REF_PATH)")
+
+# unpruned MAP, the dense ZigZag's start
+X_MAP_FULL = torch.load(MAP_unpruned_REF_PATH, map_location="cpu", weights_only=False)["x_ref"].to(DTYPE)
+assert int(X_MAP_FULL.shape[0]) == D, f"unpruned MAP dim {X_MAP_FULL.shape[0]} != D {D}"
+print(f"\nunpruned MAP ref: {MAP_unpruned_REF_PATH.name}  "
+      f"sparsity={float((X_MAP_FULL == 0).float().mean()):.4f}")
 
 
 # %%
@@ -212,6 +219,12 @@ posterior_mean_probs = inet.make_posterior_mean_probs(predict_probs)
 # ==========================================================================
 clean_probs, clean_rows = {}, []
 
+_p_map_full = predict_probs(X_MAP_FULL, X_test)
+clean_probs["MAP (unpruned)"] = {"post_mean": _p_map_full}
+_m = inet.calibration_metrics(y_test, _p_map_full)
+clean_rows.append({"model": "MAP (unpruned)",
+                   **{k: _m[k] for k in ("acc", "nll", "ece", "brier", "mean_entropy")}})
+
 _p_map = predict_probs(X_REF, X_test)
 clean_probs["MAP"] = {"post_mean": _p_map}
 _m = inet.calibration_metrics(y_test, _p_map)
@@ -298,6 +311,10 @@ sweep_runs["sgd"] = {"samples": X_SGD.unsqueeze(0)}
 SWEEP_DISPLAY = {**RUN_DISPLAY, "map": r"$\beta_{\mathrm{ref}}$", "sgd": "SGD"}
 SWEEP_COLORS = {**SAMPLER_COLORS, "map": "0.35", "sgd": "#55A868"}
 
+# unpruned MAP (the dense ZigZag's start), a single network like the pruned MAP and SGD
+sweep_runs["map_full"] = {"samples": X_MAP_FULL.unsqueeze(0)}
+SWEEP_DISPLAY["map_full"] = "MAP"
+
 
 def _rotate(X, lv, seed=0):
     return inet.rotate_batch(X, lv, MNIST_MEAN, MNIST_STD)
@@ -321,6 +338,17 @@ else:
     NOISE_CACHE.write_bytes(pickle.dumps({"meta": NOISE_META, "levels": noi_levels, "agg": noi_agg}))
     print(f"[noise] {len(sweep_runs)} models x {len(CLASSES)} digits x {len(SIGMAS)} levels, "
           f"saved to {NOISE_CACHE}")
+
+# models added after the cache was written are swept on their own and merged in;
+# the pooled images and the noise come from the same seeds, so the results are comparable
+_missing = {lbl: run for lbl, run in sweep_runs.items() if lbl not in noi_agg}
+if _missing:
+    _, _, _, _new_agg = inet.run_shift_sweep(
+        SIGMAS, _noise, CLASSES, y_test, X_test, _missing, predict_probs,
+        N_PER_CLASS, N_DRAWS_POOL, POOL_SEED, NOISE_SEED)
+    noi_agg.update(_new_agg)
+    NOISE_CACHE.write_bytes(pickle.dumps({"meta": NOISE_META, "levels": noi_levels, "agg": noi_agg}))
+    print(f"[noise] added {list(_missing)} to {NOISE_CACHE}")
 # print(f"[rotation] {len(sweep_runs)} models x {len(CLASSES)} digits x {len(ANGLES)} levels")
 
 
@@ -337,11 +365,11 @@ else:
 
 def plot_noise(levels, agg, save_name="MNIST_noise_paperstyle"):
     TITLE, LABEL, TICK, LEGEND = 20, 20, 18, 20
-    order = ["sgd", "map", "dense", "zigzag"]#, "boomerang"]
-    point = {"sgd", "map"}   # dashed lines
-    display = {"sgd": "SGD", "map": r"$\beta_{\mathrm{ref}}$",
+    order = ["sgd", "map_full", "map", "dense", "zigzag"]#, "boomerang"]
+    point = {"sgd", "map", "map_full"}   # dashed lines
+    display = {"sgd": "SGD", "map_full": r"$\beta_{\mathrm{ref}}$", "map": r"$\beta_{\mathrm{ref}}^{\star}$",
                "dense": "ZigZag", "zigzag": "Sticky ZigZag"}#, "boomerang": "Sticky Boomerang"}
-    colors = {"sgd": "C4", "map": "0.35", "dense": "C2", "zigzag": "C3"}#, "boomerang": "#DD8452"}
+    colors = {"sgd": "C4", "map_full": "0.65", "map": "0.35", "dense": "C2", "zigzag": "C3"}#, "boomerang": "#DD8452"}
     panels = [("acc", "Accuracy", (-0.02, 1.02)),
               ("p_true", "P(true class)", (-0.02, 1.02)),
               ("entropy", "Predictive entropy", (-0.05, np.log(10) * 1.08))]

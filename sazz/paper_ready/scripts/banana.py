@@ -96,7 +96,7 @@ def main():
             for res, color, label in [(zz, "C2", "ZigZag"), (cells[(rr, ss)], "C0", "Boomerang")]:
                 d = res["draws"].numpy()
                 ax.scatter(d[:, 0], d[:, 1], s=2, alpha=0.45, lw=0, color=color, label=label)
-            ax.set_title(rf"$\lambda_{{\rm ref}}={rr:g}$,  $\gamma={ss:g}$", fontsize=18)
+            ax.set_title(rf"$\lambda_{{\rm ref}}={rr:g}$,  $c={ss:g}$", fontsize=18)
             ax.set(xlim=(-10, 10), ylim=(-5, 20))
             ax.tick_params(labelsize=18)
             ax.spines[["top", "right"]].set_visible(False)
@@ -109,7 +109,7 @@ def main():
     for h in leg.legend_handles:
         h.set_sizes([100])
     fig.tight_layout()
-    fig.savefig(args.out / "banana_sweep.png", bbox_inches="tight")
+    fig.savefig(args.out / "banana_sweep.pdf", bbox_inches="tight")
     print(f"figure -> {args.out / 'banana_sweep.pdf'}")
 
     # One Boomerang cell against ZigZag, the draws over the target's contours and
