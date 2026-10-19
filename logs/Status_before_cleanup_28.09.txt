@@ -1,0 +1,968 @@
+===========================================================================
+PAPER V2 STATUS, updated 28.09 evening
+single_segment bound + balanced t_max adaptation, S = 4000 uniform in time
+===========================================================================
+Full copy of this file before the 27.09 cleanup in logs/Status_before_cleanup_27.09.txt
+
+SYNC, on the Mac (use a good connection, eduroam). 1 to 4 done 28.09. The staging
+folders paper_v2_medium, paper_v2_ablation and paper_v2_small_nuts are deleted locally,
+their results are in paper_v2 (and the originals are still on the server).
+Set these three first in the same terminal
+R='ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -J augusa@login.math.uio.no'
+S=augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results
+L=/Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results
+✅ 1. deep wide, boston + energy (28.09, 20 GB, concrete + yacht come later)
+until rsync -av --progress --partial --exclude=chunks -e "$R" $S/paper_v2/deep_wide_v2/ $L/paper_v2/deep_wide_v2/; do sleep 30; done
+✅ 2. deep wide convergence (28.09, 5.8 GB)
+until rsync -av --progress --partial --exclude=chunks -e "$R" $S/paper_v2/deep_wide_convergence/ $L/paper_v2/deep_wide_convergence/; do sleep 30; done
+✅ 3. shallow PIW 0.1 skeletons (28.09, 2 files, 3.8 GB)
+mkdir -p results/paper_v2/skeletons/shallow/piw_0.1     # the Mac rsync cannot create parent folders
+until rsync -av --progress --partial -e "$R" $S/paper_v2/skeletons/shallow/piw_0.1/ $L/paper_v2/skeletons/shallow/piw_0.1/; do sleep 30; done
+✅ 4. deep narrow skeletons (28.09, 6 files, 93 GB, all load and check out, moved into place)
+until rsync -av --progress --partial -e "$R" $S/paper_v2_ablation/ $L/paper_v2_ablation/; do sleep 30; done
+python -m sazz.gpu_friendly.scripts.convert_paper_ready_results --src results/paper_v2_ablation --dst results/paper_v2 --ablation
+find results/paper_v2/skeletons -name '*_skeleton.pt' | wc -l      # expect 8 (12 after step 10a)
+☐ 5. drop the grid_ prefix in the convergence folder (it is final)
+for f in $(find results/paper_v2/deep_wide_convergence -name 'grid_*.pt'); do mv -n "$f" "$(dirname $f)/$(basename $f | sed 's/^grid_//')"; done
+   NOT yet in deep_wide_v2. rsync matches files by name, so renamed files would
+   be downloaded again when 1 is rerun. Rename deep_wide_v2 only after its last sync.
+Later, rerun 1 when deep wide concrete + yacht are done (about 29 or 30 September),
+then rename deep_wide_v2 the same way, and sync CIFAR when it has run.
+
+OVERVIEW
+  0   setup and reference copies                                   ✅
+  1   toy BNNs, 4 PDMPs (NUTS and LBBNN already rerun)             ✅ 16/16, 0 violations, skeletons saved (28.09)
+  2   UCI small, default PIW, 4 PDMPs (Mac)                        ✅ boston ✅ energy ✅ concrete ✅ (running) yacht ✅
+  2e  UCI small, NUTS rerun (server CPU)                           ✅ 20/20, synced and replaced (28.09)
+  3   UCI small, PIW 0.1, sticky (server CPU)                      ✅ 40/40, 0 violations, synced (28.09)
+  4   UCI medium, all PDMPs + NUTS (server CPU)                    ✅ synced and converted
+  6a  UCI large, LBBNN reference copy                              ☐
+  6b  UCI large, sticky (server GPU)                               ⏳ boston ✅ energy ✅ (both synced), concrete ⏳ yacht ⏳ (4/10 each at 28.09 midday, done about 30.09)
+  6c  UCI large, convergence 4 chains                              ✅ done, synced, analysed (see 6c)   ☐ grid_ rename (sync 5)
+  6d  UCI large, Boomerang chains 1-3 with their own covariance    ☐ when GPU 0 is free (about 30.09)
+  7   sparse linreg and banana                                     ☐ need script changes
+  8   images, LeNet and FFN (server GPU)                           ✅ done and synced   CIFAR ⏳ 1M with --cudnn-benchmark (8d), about 2 days
+  9   PIW sweep, boston split 0, shallow and deep narrow           ✅ 44/44 in place (28.09)
+  10  skeletons, boston split 0                                    ✅ deep narrow 6/6   ✅ shallow 0.1 2/2   ⏳ shallow 0.3 running (Mac, 10a)
+  11  convergence chains, small + medium, boston split 0 (server)  ☐ push code, then launch (36 jobs, 5 to 6 h)
+  12  LBBNN tuning, boston small (Mac, scratch script)             ⏳ round 2 running
+
+Run everything from the repo root with the venv active
+    cd ~/Documents/sticky_samplers/sticky_bnns && source .venv/bin/activate
+Server jobs run in tmux (session pdmp_bnn), in a shell where python works, after
+    export PY=$(which python)
+File names in results/paper_v2 have no grid_ prefix (since 26.09). The
+gpu_friendly scripts still write grid_*.pt, rename after syncing (see TOOLS).
+
+
+===========================================================================
+OPEN, still running or not started
+===========================================================================
+
+---------------------------------------------------------------------------
+1. Toy BNNs [1, 100, 1], 4 datasets, split 0, 4 PDMPs, G = 200K, S = 4000 (Mac)
+   Tiny, start all four at once. NUTS (4 x 1000) and LBBNN (1.5e4 epochs) were
+   rerun 25.09. LBBNN saved 8000 draws, keep the first 4000 in the analysis
+   (iid draws from the variational posterior, so any 4000 will do).
+---------------------------------------------------------------------------
+for ds in hernandez gap sharp multiscale; do
+  OMP_NUM_THREADS=2 nohup caffeinate -i python -m sazz.gpu_friendly.scripts.toy_bnn_grid \
+    --datasets $ds --splits 0 \
+    --samplers grid_zigzag grid_sticky_zigzag grid_boomerang grid_sticky_boomerang \
+    --bound-mode single_segment --adapt-rule balanced \
+    --grad-budget 200_000 --n-skeleton 200_000 --n-resample 4000 \
+    --save-skeleton --skeleton-out results/paper_v2/toy_bnns/skeletons/fullbatch \
+    --out results/paper_v2/toy_bnns --resume \
+    > logs/v2_01_toy_$ds.log 2>&1 &
+done
+
+Status ✅ hernandez ✅ gap ✅ sharp ✅ multiscale (28.09), 16/16 at G = 200K, 0 violations,
+       S = 4000, skeletons in results/paper_v2/toy_bnns/skeletons/fullbatch.
+       Renamed without the grid_ prefix (results and skeletons, 28.09). Switch
+       notebooks/utils/toy_results_utils.py to results/paper_v2 and the new names.
+
+---------------------------------------------------------------------------
+2c 2d. UCI small, concrete and yacht, default PIW, 4 PDMPs, G = 1M (Mac)
+   2 at a time, about 30 min per run, 3 to 6 GB RAM each. --resume skips
+   finished runs under both names (grid_zigzag.pt and zigzag.pt).
+---------------------------------------------------------------------------
+for ds in concrete yacht; do
+  OMP_NUM_THREADS=2 nohup caffeinate -i python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets $ds --splits 0 1 2 3 4 \
+    --samplers grid_zigzag grid_sticky_zigzag grid_boomerang grid_sticky_boomerang \
+    --bound-mode single_segment --adapt-rule balanced \
+    --grad-budget 1_000_000 --n-skeleton 600_000 --n-resample 4000 \
+    --out results/paper_v2/shallow --resume \
+    > logs/v2_02$([ $ds = concrete ] && echo c || echo d)_shallow_$ds.log 2>&1 &
+done
+
+Status ⏳ concrete 18/20 (running 28.09)   ✅ yacht 20/20
+
+---------------------------------------------------------------------------
+2e. UCI small, NUTS rerun (server CPU)
+   WHY. The shallow nuts.pt in paper_v2 are v1 copies cut by the 1M gradient
+   budget (976 to 1956 draws instead of 4 x 1000 = 4000). Same MAP as the v2
+   PDMPs (checked), so only the draw count changes. LBBNN is fine.
+   Launched 27.09 with -P 10, the command is under DONE (2e launch).
+---------------------------------------------------------------------------
+Progress (server), expect 20
+ls results/paper_v2_small_nuts/small/*/split_*/nuts.pt 2>/dev/null | wc -l
+grep -al Traceback logs/v2_02e_*.log
+
+Sync back and replace the old files (Mac)
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2_small_nuts/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2_small_nuts/
+rm results/paper_v2/shallow/*/split_*/nuts.pt
+python -m sazz.gpu_friendly.scripts.convert_paper_ready_results --src results/paper_v2_small_nuts --dst results/paper_v2
+find results/paper_v2/shallow -name 'nuts.pt' | wc -l        # expect 20
+
+Status ✅ 20/20 done (S = 4000 each)   ✅ synced + replaced (28.09)
+
+---------------------------------------------------------------------------
+3. UCI small, PIW 0.1, 5 splits, sticky PDMPs, G = 1M, S = 4000 (server CPU)
+   40 jobs (dataset x split x sampler), 20 at a time, 1.5 to 2.5 h each.
+   Boston split 0 also saves its skeleton (step 10, PIW 0.1). Launched 27.09,
+   the command is under DONE (3 launch).
+---------------------------------------------------------------------------
+Progress (server), expect 40 files and 2 skeletons
+ls results/paper_v2/shallow_piw_0.1/*/split_*/*.pt | wc -l
+ls results/paper_v2/skeletons/shallow/piw_0.1/boston/split_00/
+grep -al Traceback logs/v2_03_*.log
+
+Sync back (Mac), rename the grid_ files (TOOLS), then copy boston split 0 into
+the PIW sweep, which completes step 9 (44/44)
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2/shallow_piw_0.1/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2/shallow_piw_0.1/
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2/skeletons/shallow/piw_0.1/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2/skeletons/shallow/piw_0.1/
+A=results/paper_v2/uci_sparsity_ablation/shallow/boston/split_00
+mkdir -p $A/piw_0.1
+for s in sticky_zigzag sticky_boomerang; do cp -n results/paper_v2/shallow_piw_0.1/boston/split_00/$s.pt $A/piw_0.1/; done
+find results/paper_v2/uci_sparsity_ablation -name '*.pt' | wc -l     # expect 44
+
+Status ✅ 40/40 done   ✅ synced + renamed   ✅ copied into the sweep   ✅ skeletons synced (28.09)
+
+---------------------------------------------------------------------------
+6a. UCI large, copy the LBBNN references (server)
+---------------------------------------------------------------------------
+mkdir -p results/paper_v2/deep_wide_v2
+rsync -a --ignore-existing --exclude 'grid_*' --exclude 'chunks/' --exclude '.DS_Store' \
+    results/paper/deep_wide_v2/ results/paper_v2/deep_wide_v2/
+
+Status ☐
+
+---------------------------------------------------------------------------
+6b. UCI large [n_in, 256, 128, 64, 1], sticky PDMPs, K = 1M, minibatch 128,
+    PIW 0.05, S = 4000 (server GPU). About 10 h per split, 5 splits per job.
+    The jobs are limited by the CPU, not the GPU (about 11 % utilization with
+    two jobs), so several jobs can share one GPU.
+---------------------------------------------------------------------------
+Running
+  boston  ✅ 10/10 (27.09 afternoon)
+  energy  zigzag + boomerang, GPU 2, stage 10_000, 6/10 at 27.09 midday, about 14 to 17 h left
+
+Concrete and yacht, launched 27.09 afternoon, all four jobs on GPU 0. Stage size
+5_000 so four fit (about 3.5 to 4 GB each), it does not change the samples.
+About 2 to 2.5 days for 5 splits, so done around 29 or 30 September.
+ls results/paper_v2/deep_wide_v2/deep_wide/boston/split_*/grid_sticky_*.pt | wc -l    # must be 10 first
+for ds in concrete yacht; do for s in grid_sticky_zigzag grid_sticky_boomerang; do
+  CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci \
+    --datasets $ds --splits 0 1 2 3 4 \
+    --hidden-variant deep_wide --samplers $s \
+    --n-skeleton 1_000_000 --stage-size 5_000 --n-resample 4000 \
+    --prior-inclusion-weight 0.05 --grad-batch-size 128 \
+    --bound-mode single_segment --adapt-rule balanced \
+    --out results/paper_v2/deep_wide_v2 --resume \
+    > logs/v2_06_deep_wide_${ds}_${s}.log 2>&1 &
+done; done
+Ten minutes later, GPU 0 should sit around 16 GB and there should be no Traceback
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
+grep -al Traceback logs/v2_06_deep_wide_{concrete,yacht}_*.log
+
+Progress (server)
+for ds in boston energy concrete yacht; do echo "$ds $(ls results/paper_v2/deep_wide_v2/deep_wide/$ds/split_*/grid_sticky_*.pt 2>/dev/null | wc -l)/10"; done
+for f in logs/v2_06_deep_wide_*.log; do
+  printf "%-44s %s\n" "$(basename $f .log)" "$(tr '\r' '\n' < $f | grep -aE '\[stage [0-9]+/[0-9]+\] sampling' | tail -1 | grep -o 'stage [0-9]*/100.*split_0[0-9]' | sed 's|->.*chunks/||')"
+done
+
+Sync back (Mac), then rename the grid_ files (TOOLS)
+rsync -av --progress --partial --exclude chunks -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2/deep_wide_v2/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2/deep_wide_v2/
+
+Status  boston ✅   energy ✅   concrete ⏳   yacht ⏳ (launched 27.09, 4/10 each at 28.09 midday)
+        ✅ boston + energy synced (28.09)   ☐ concrete + yacht synced   ☐ grid_ rename after the last sync
+
+---------------------------------------------------------------------------
+6c. UCI large, convergence check, boston split 0, 4 chains from 4 MAPs
+    Done 27.09 morning (8/8), the commands are under DONE (6c).
+---------------------------------------------------------------------------
+rsync -av --progress --partial --exclude chunks -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2/deep_wide_convergence/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2/deep_wide_convergence/
+
+Status ✅ 8/8   ✅ synced (28.09, 5.8 GB)   ☐ grid_ rename (sync 5)
+
+Analysis 28.09 in notebooks/deep_wide_convergence.ipynb. The draws of these runs
+are stored in random order without their times (the deep wide driver drops them),
+so there are no traces in time and no within-chain ESS, only cross-chain
+comparison of statistics invariant to permutations and sign flips.
+  MAPs     energies 413 (MAP 0), 500, 473, 453. Test RMSE 2.71, 3.19, 3.37, 3.13.
+           Parameter distance about 1.4 relative (as for unrelated vectors),
+           test predictions differ by 0.3 to 1.6 RMS (y units).
+  ZigZag   partly mixed. R-hat 1.00 to 1.02 for rmse_test, middle-layer norms and
+           sparsity, but 1.11 log sigma, 1.14 train fit, 1.11 and 1.25 last layer,
+           f_test median 1.07 max 1.24. Chain test RMSE 3.14 to 3.19, chains differ
+           by 0.30 to 0.62 against a posterior sd of f of 0.71.
+  Boomerang stays in its starting mode. R-hat 1.2 to 1.9, chain 0 test RMSE 3.02
+           against 3.32 to 3.44, chains differ by 0.6 to 1.2 (about 2 posterior sd).
+  CAVEAT. Chains 1 to 3 used MAP 0's covariance (--shared-sigma-inv, the default),
+  which is mismatched to their own modes coordinate by coordinate, since hidden
+  units are arranged differently at each MAP. ZigZag does not use it, so its
+  result stands. Boomerang chains 1 to 3 are rerun with their own covariance in 6d.
+
+---------------------------------------------------------------------------
+6d. UCI large, Boomerang chains 1 to 3 with their own MAP's covariance (server GPU)
+    Same as 6c but --per-chain-sigma-inv, so every chain is the full pipeline
+    from its own MAP (as in step 11). Chain 0 is unchanged (its own covariance
+    is MAP 0's), so it is copied. 3 jobs on one GPU, stage 5_000 so they fit,
+    about 10 to 12 h. Launch when GPU 0 is free (deep wide concrete + yacht done).
+    The draws are again stored without times.
+---------------------------------------------------------------------------
+N=results/paper_v2/deep_wide_convergence_own_sigma/deep_wide/boston/split_00
+O=results/paper_v2/deep_wide_convergence/deep_wide/boston/split_00
+mkdir -p $N/chain_0
+cp -r $O/maps $N/
+cp $O/chain_0/grid_sticky_boomerang.pt $N/chain_0/
+for c in 1 2 3; do
+  CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence sample \
+    --datasets boston --splits 0 --chains $c \
+    --samplers grid_sticky_boomerang --per-chain-sigma-inv \
+    --n-skeleton 1_000_000 --stage-size 5_000 --n-resample 4000 \
+    --prior-inclusion-weight 0.05 --grad-batch-size 128 \
+    --bound-mode single_segment --adapt-rule balanced \
+    --out results/paper_v2/deep_wide_convergence_own_sigma --resume \
+    > logs/v2_06d_deep_wide_boom_own_sigma_chain$c.log 2>&1 &
+done
+Check the logs say shared_sigma_inv False (or per-chain) and have no Traceback.
+
+Status ☐ launched   ☐ 3/3 done   ☐ synced   ☐ rerun the notebook's step 2 on this folder
+
+---------------------------------------------------------------------------
+11. Convergence chains for the small and medium networks, boston split 0,
+    server CPU. All 4 samplers, the sticky ones at w = 0.3 and w = 0.1.
+    Chain 0 is the published run (results/paper_v2/shallow, deep_narrow and their
+    piw_0.1 folders). Chains 1 to 3 each fit their own MAP and Laplace covariance
+    (seed 90000 + 1000 split + c), so every chain is the full pipeline from a
+    different random MAP. Code change in sazz/paper_ready/scripts/uci_bnn.py
+    (28.09), commit + push, then git pull on the server before launching.
+    Unlike the large network, these draws are stored sorted in time, so each
+    chain gives traces, autocorrelation and ESS, and across chains R-hat. The
+    skeletons of chain 0 (step 10) give the full path. No new skeletons needed.
+    For the small network, chain 0 came from the older gpu_friendly driver on the
+    Mac and chains 1 to 3 from the trimmed driver (same algorithm, statistically
+    equivalent, not bit-identical).
+    36 jobs (2 networks x 3 chains x 6 sampler settings), medium first,
+    -P 26 next to the GPU jobs, medium 3 to 4.5 h, small 1.5 to 2.5 h, about
+    5 to 6 h in total. Run in tmux with $PY set.
+---------------------------------------------------------------------------
+export PY=$(which python)
+for v in medium small; do for c in 1 2 3; do
+  for sp in "zigzag 0.3" "boomerang 0.3" "sticky_zigzag 0.3" "sticky_boomerang 0.3" "sticky_zigzag 0.1" "sticky_boomerang 0.1"; do
+    echo "$v $c $sp"
+  done
+done; done > logs/v2_11_conv_jobs.txt
+wc -l logs/v2_11_conv_jobs.txt      # expect 36
+nohup xargs -P 26 -L 1 sh -c 'CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
+    $PY -m sazz.paper_ready.scripts.uci_bnn --variant $0 --datasets boston --splits 0 \
+    --chains $1 --samplers $2 --piw $3 --out results/paper_v2_convergence --resume \
+    > logs/v2_11_conv_$0_chain$1_$2_piw$3.log 2>&1' \
+    < logs/v2_11_conv_jobs.txt > logs/v2_11_conv_xargs.log 2>&1 &
+
+Check (server)
+pgrep -fc "uci_bnn --variant (small|medium) --datasets boston --splits 0 --chains"    # 26 while running
+ls results/paper_v2_convergence/*/boston/split_00/chain_*/*.pt | wc -l                 # expect 36
+grep -al Traceback logs/v2_11_conv_*.log
+
+Output results/paper_v2_convergence/{small,medium}[_piw0.1]/boston/split_00/chain_{1,2,3}/<sampler>.pt,
+chain MAPs in .../{small,medium}/boston/split_00/maps/map_{1,2,3}.pt.
+
+Sync back (Mac)
+until rsync -av --progress --partial -e "$R" $S/paper_v2_convergence/ $L/paper_v2_convergence/; do sleep 30; done
+
+Status ☐ code pushed + pulled   ☐ launched   ☐ 36/36 done   ☐ synced   ☐ analysed
+
+---------------------------------------------------------------------------
+12. LBBNN tuning, boston small network (Mac, preliminary)
+    The UCI LBBNN is well behind NUTS (boston small 3.52 against 2.86 RMSE,
+    medium 4.25 against 2.73). Tuning script (not in the repo) at
+    /private/tmp/claude-501/.../scratchpad/lbbnn_tune.py, results in
+    lbbnn_small.jsonl next to it. Each fit about 70 s on one thread.
+    Round 1 (splits 0 to 2, NUTS 2.69, sticky ZigZag 2.86 on these splits)
+      baseline (v1 setup)               3.37   sparsity 75 %   noise sd 0.40
+      inclusion probabilities start ~1  3.17   75 %
+      wider initial variational sd      3.17   75 %
+      learning rate 3e-3                3.19   74 %
+      temperature 0.5                   3.01   3 %  (no longer sparse, not usable)
+      fixed or learned model prior      3.32 to 3.56   95 to 98 %
+    The LBBNN underfits at 75 % sparsity (noise sd 0.40 against about 0.29 for the
+    PDMPs). Starting dense and wide lets it fit first and prune after.
+    Round 2 (running) combines the helpful changes with lr 3e-3, cosine,
+    temperature 0.3 and 0.35, 50k epochs and 5 MC samples. The best goes to all
+    5 splits, then to the medium network.
+---------------------------------------------------------------------------
+Status ✅ round 1   ⏳ round 2   ☐ best on 5 splits   ☐ medium   ☐ decide and rerun UCI LBBNN
+
+---------------------------------------------------------------------------
+7. Later, need script changes first (not ready to run)
+---------------------------------------------------------------------------
+☐ Sparse linear regression (sticky_exactness_linreg.py, uses the fast_* samplers)
+☐ Banana toy
+
+---------------------------------------------------------------------------
+8. Image models, sticky PDMPs, K = 1M, minibatch gradients, S = 4000 (server GPU)
+   Same MAPs as v1 (results/maps, pruned + refit, pruned weights start frozen).
+   What changed vs v1 (tested 26.09 on LeNet, draws match the path exactly,
+   times uniform, KS p 0.84 and 0.29, 0 violations)
+   - single_segment bound + balanced adaptation, t_max starts at the old grid
+     spacing (1e-5 ZigZag, 1e-3 Boomerang, 1e-4 Boomerang ResNet).
+   - Draws uniform in time over the whole trajectory, burn-in the first 20 %
+     of the time. v1 took equal draws per stage, which is NOT uniform in time.
+   - S = 4000 saved, sorted by time, times in "sample_times".
+   NOTE FOR THE PAPER TEXT. The image runs adapt t_max with alpha = 1.02 (as in
+   v1), UCI uses 1.01. Same balanced rule, only the step differs. State it.
+   The stage size only sets GPU memory and disk, not the samples.
+---------------------------------------------------------------------------
+Running (launched 27.09 morning, about a sixth done at 27.09 midday)
+  LeNet  zigzag + boomerang, GPU 1, stage 5_000, about 8.5 GB each
+  FFN    zigzag + boomerang, GPU 3, stage 1_250, about 8 GB each
+Launch commands under DONE (8b, 8c).
+
+Progress (server)
+for f in logs/v2_08*.log; do
+  echo "== $f"; tr '\r' '\n' < $f | grep -aE "\[stage|saved ->|test_acc|Traceback" | tail -2
+done
+
+8d. CIFAR-10 ResNet-20, PLAN 28.09 morning on GPUs 1 and 3 once LeNet and FFN are done
+    Timing test 28.09 (4000 events, 2 stages). --cudnn-benchmark halves the time.
+      ZigZag     1240 s, with cudnn 627 s, 4.0 grads/event, 0 violations
+      Boomerang  1764 s, with cudnn 686 s, 2.1 to 2.4 grads/event, 19 and 22 violations
+    With cudnn, 1M events take about 1.8 days (ZigZag) and 2 days (Boomerang).
+    Boomerang violates on ResNet (ReLU makes the rate non-smooth), as in v1 where
+    CIFAR Boomerang was left out. Decide from its full violation rate.
+    (v1 took about 5 days per sampler, single segment may be faster).
+    ZigZag on GPU 1, Boomerang on GPU 3, one job per GPU (about 10 GB each).
+for s in grid_sticky_zigzag grid_sticky_boomerang; do
+  [ $s = grid_sticky_zigzag ] && GPU=1 || GPU=3
+  CUDA_VISIBLE_DEVICES=$GPU nohup python -m sazz.gpu_friendly.scripts.fast_cheap_cifar_resnet \
+    --map-path results/maps/resnet/resnet20_reference_N50000_steps2000_v2_pruned_refit.pt \
+    --samplers $s --n-skeleton 1_000_000 --stage-size 2_000 \
+    --n-resample 4000 --n-save 4000 --grad-batch-size 128 \
+    --bound-mode single_segment --adapt-rule balanced --cudnn-benchmark \
+    --out results/paper_v2/resnet_cifar \
+    > logs/v2_08d_cifar_${s}.log 2>&1 &
+done
+
+8f. Sync back (Mac). The notebooks read ffn_mnist and cifar without a split
+    folder and mnist_cnn with split_00, as in results/paper, so move ffn_mnist
+    up one level after the sync (check the folder names match the notebooks).
+for d in mnist_cnn ffn_mnist; do
+  rsync -av --progress --partial --exclude chunks -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2/$d/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2/$d/
+done
+mv results/paper_v2/ffn_mnist/split_00/grid_*.pt results/paper_v2/ffn_mnist/
+
+Status  LeNet ✅   FFN ✅   synced + renamed (28.09)
+        CIFAR ✅ timing test (cudnn halves the time)   ⏳ full run, 1M, cudnn, GPU 1 + 3 (28.09)   ☐ synced
+
+---------------------------------------------------------------------------
+9. PIW sweep, what is left (the rest is done, see DONE 9)
+---------------------------------------------------------------------------
+✅ shallow piw_0.1 copied in (28.09), 44/44
+✅ deep narrow skeletons synced and moved (28.09, 93 GB),
+  then rerun the converter, which moves them to results/paper_v2/skeletons
+until rsync -av --progress --partial -e 'ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2_ablation/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2_ablation/; do echo "retrying in 30 s"; sleep 30; done
+python -m sazz.gpu_friendly.scripts.convert_paper_ready_results --src results/paper_v2_ablation --dst results/paper_v2 --ablation
+find results/paper_v2/skeletons/deep_narrow -name '*_skeleton.pt' | wc -l      # expect 6
+☐ uci_sparsity_ablation.ipynb still points at results/paper and grid_* names,
+  switch OUT_DIR to results/paper_v2/uci_sparsity_ablation and drop the prefix.
+
+---------------------------------------------------------------------------
+10. Skeletons, boston split 0 (full skeleton, float32, next to the results)
+    deep narrow  PIW 0.3 (4 PDMPs) and 0.1 (sticky), saved in step 9a, see 9 for the sync
+    shallow 0.1  sticky, saved inside step 3 on the server, synced with step 3
+    shallow 0.3  4 PDMPs, exact rerun of the main runs on the Mac, below
+---------------------------------------------------------------------------
+10a. Shallow PIW 0.3 (Mac, same command as the main run for boston split 0,
+     results to a scratch folder so the main files stay untouched), about 2 h.
+OMP_NUM_THREADS=2 nohup caffeinate -i python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets boston --splits 0 \
+    --samplers grid_zigzag grid_sticky_zigzag grid_boomerang grid_sticky_boomerang \
+    --bound-mode single_segment --adapt-rule balanced \
+    --grad-budget 1_000_000 --n-skeleton 600_000 --n-resample 4000 \
+    --save-skeleton --skeleton-out results/paper_v2/skeletons/shallow/piw_0.3 \
+    --out results/paper_v2_skeleton_check/shallow --resume \
+    > logs/v2_10a_shallow_skeleton.log 2>&1 &
+Check, then delete the scratch results
+python - <<'PY'
+import torch
+for s in ["zigzag", "sticky_zigzag", "boomerang", "sticky_boomerang"]:
+    a = torch.load(f"results/paper_v2_skeleton_check/shallow/boston/split_00/grid_{s}.pt", weights_only=False)
+    b = torch.load(f"results/paper_v2/shallow/boston/split_00/{s}.pt", weights_only=False)
+    print(f"{s:18s} identical to main: {torch.equal(a['samples'], b['samples'])}")
+PY
+rm -r results/paper_v2_skeleton_check
+If a run is NOT identical (a different thread count or load can change the
+floating point order), the skeleton is still a valid run of the same sampler,
+it just is not the published one.
+
+Status  deep narrow ✅ synced (93 GB, 150K to 480K rows each)   shallow 0.1 ✅ synced   shallow 0.3 ⏳ running (28.09) ☐ identical
+
+Expected at the end
+find results/paper_v2/skeletons -name '*_skeleton.pt' | wc -l      # expect 12
+
+
+===========================================================================
+TOOLS
+===========================================================================
+Drop the grid_ prefix after syncing gpu_friendly results (safe to rerun,
+mv -n never overwrites, only run it on finished files)
+for f in $(find results/paper_v2 -name 'grid_*.pt'); do mv -n "$f" "$(dirname $f)/$(basename $f | sed 's/^grid_//')"; done
+
+rsync on a flaky connection (phone), retries on its own and continues where
+it stopped. The Mac rsync is old (2.6.9), write --exclude='pattern' with "=".
+until rsync -av --progress --partial --exclude='*_skeleton.pt' -e 'ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -J augusa@login.math.uio.no' augusa@nam-shub-02:<server path>/ <local path>/; do echo "retrying in 30 s"; sleep 30; done
+Switching networks kills the shared ssh connection (ControlMaster in
+~/.ssh/config), just run the command again.
+
+Local jobs (Mac)
+ps aux | grep -c "[u]ci_bnn_grid\|[t]oy_bnn_grid"
+tail -c 300 logs/v2_02c_shallow_concrete.log | tr '\r' '\n' | tail -1
+
+Server load and GPUs
+uptime; nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv
+df -h .     # the shared disk was at 93 % on 26.09, about 150 GB free
+
+Count finished runs in paper_v2 (expected toy 16, shallow 80, shallow_piw_0.1 40,
+deep_narrow 80, deep_narrow/piw_0.1 40, deep_wide_v2 40). Every budget run should
+show 200K (toy) or 1M (UCI small/medium) grad evals, fewer means the event cap bound.
+python - <<'PY'
+import glob, torch
+from collections import defaultdict
+PDMP = {"zigzag", "sticky_zigzag", "boomerang", "sticky_boomerang"}
+agg = defaultdict(lambda: [0, 0, None, 0])
+for f in glob.glob("results/paper_v2/**/*.pt", recursive=True):
+    name = f.rsplit("/", 1)[1][:-3].removeprefix("grid_")
+    if name not in PDMP or "skeletons" in f or "uci_sparsity_ablation" in f:
+        continue
+    r = torch.load(f, map_location="cpu", weights_only=False, mmap=True)
+    parts = f.split("/")
+    key = parts[2] + ("/piw_0.1" if parts[3] == "piw_0.1" else "")
+    ev = r.get("gradient_evals") or r.get("grad_evals") or 0
+    a = agg[key]
+    a[0] += 1
+    a[1] += r.get("bound_violations") or 0
+    a[2] = ev if a[2] is None else min(a[2], ev)
+    a[3] = max(a[3], r["samples"].shape[0])
+for k, (n, viol, min_ev, s) in sorted(agg.items()):
+    print(f"{k:28s} runs {n:3d}   bound violations {viol:4d}   min grad evals {min_ev:,}   S {s}")
+PY
+
+
+===========================================================================
+DONE, kept to check how results were produced
+===========================================================================
+
+What is different from results/paper
+- Every PDMP run uses --bound-mode single_segment --adapt-rule balanced. One
+  tangent-line segment per t_max window, the right end is reused as the next
+  window's left end (off with minibatches), t_max starts at the old grid spacing.
+- Budgets. Toy G = 200K, UCI small and medium G = 1M, UCI large and images
+  K = 1M events. --n-skeleton is only a ceiling on events for the budget runs.
+- Every PDMP run saves S = 4000 draws, uniform in time over the trajectory
+  after a burn-in of the first 20 % of the time.
+- elapsed_sec in v2 is not comparable with v1 (threads, parallel jobs), compare
+  gradient_evals instead.
+
+---------------------------------------------------------------------------
+0. Setup and reference copies (about 14 GB, safe to rerun, never overwrites)
+---------------------------------------------------------------------------
+mkdir -p logs results/paper_v2
+for d in toy_bnns shallow deep_narrow; do
+  rsync -a --ignore-existing --exclude 'grid_*' --exclude 'chunks/' \
+    --exclude 'skeletons/' --exclude 'minibatch_32/' --exclude 'piw_0.1/' \
+    --exclude '.DS_Store' results/paper/$d/ results/paper_v2/$d/
+done
+
+---------------------------------------------------------------------------
+2a 2b. UCI small, boston and energy (Mac, 20/20 each). Same command as 2c 2d
+       above with --datasets boston / energy.
+---------------------------------------------------------------------------
+
+---------------------------------------------------------------------------
+2e launch (server, 27.09)
+---------------------------------------------------------------------------
+for ds in boston energy concrete yacht; do for split in 0 1 2 3 4; do echo "$ds $split"; done; done \
+    > logs/v2_02e_small_nuts_jobs.txt
+nohup xargs -P 10 -L 1 sh -c 'CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
+    XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1" \
+    $PY -m sazz.paper_ready.scripts.uci_bnn --variant small --datasets $0 --splits $1 \
+    --samplers nuts --out results/paper_v2_small_nuts --resume \
+    > logs/v2_02e_small_nuts_$0_$1.log 2>&1' \
+    < logs/v2_02e_small_nuts_jobs.txt > logs/v2_02e_small_nuts_xargs.log 2>&1 &
+
+---------------------------------------------------------------------------
+3 launch (server, 27.09, moved from the Mac, where it would take about 2 days)
+---------------------------------------------------------------------------
+for ds in boston energy concrete yacht; do for sp in 0 1 2 3 4; do
+  for s in grid_sticky_zigzag grid_sticky_boomerang; do echo "$ds $sp $s"; done
+done; done > logs/v2_03_jobs.txt
+nohup xargs -P 20 -L 1 sh -c 'SK=; [ "$0 $1" = "boston 0" ] && SK="--save-skeleton --skeleton-out results/paper_v2/skeletons/shallow/piw_0.1"; \
+    CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
+    $PY -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets $0 --splits $1 --samplers $2 \
+    --prior-inclusion-weight 0.1 --bound-mode single_segment --adapt-rule balanced \
+    --grad-budget 1_000_000 --n-skeleton 600_000 --n-resample 4000 $SK \
+    --out results/paper_v2/shallow_piw_0.1 --resume \
+    > logs/v2_03_shallow_piw0.1_$0_$1_$2.log 2>&1' \
+    < logs/v2_03_jobs.txt > logs/v2_03_xargs.log 2>&1 &
+
+---------------------------------------------------------------------------
+4. UCI medium [n_in, 50, 50, 50, 1] (deep_narrow), server CPU, trimmed code
+   (sazz/paper_ready). Default PIW 0.3 with the 4 PDMPs and PIW 0.1 with the
+   sticky PDMPs, 5 splits, G = 1M, S = 4000. The skeleton streams into the
+   uniform-in-time reservoir, so a run needs about 1 GB.
+   ✅ all 120 runs, 0 bound violations, S = 4000, all at the 1M budget
+   ✅ NUTS 20/20 rerun from the same MAP (4 x 1000, S = 4000)
+   ✅ synced and converted into results/paper_v2/deep_narrow (27.09)
+---------------------------------------------------------------------------
+4b. PDMPs (launched 25.09 about 21:40), 24 jobs, one per dataset and sampler
+    (x PIW), each over the 5 splits
+NJOBS=24
+for ds in boston energy concrete yacht; do
+  for s in zigzag sticky_zigzag boomerang sticky_boomerang; do echo "$ds $s 0.3"; done
+  for s in sticky_zigzag sticky_boomerang; do echo "$ds $s 0.1"; done
+done > logs/v2_04_medium_jobs.txt
+nohup xargs -P $NJOBS -L 1 sh -c 'CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    $PY -m sazz.paper_ready.scripts.uci_bnn --variant medium \
+    --datasets $0 --samplers $1 --piw $2 --out results/paper_v2_medium --resume \
+    > logs/v2_04_medium_$0_$1_piw$2.log 2>&1' \
+    < logs/v2_04_medium_jobs.txt > logs/v2_04_medium_xargs.log 2>&1 &
+
+4e. NUTS rerun for the medium network (server CPU)
+    WHY. The medium PDMPs start from a MAP fitted on the server CPU in float64,
+    the v1 medium NUTS from a different MAP (GPU, float32), and v1 NUTS for
+    boston and concrete kept only 976 draws. The rerun starts from the PDMPs'
+    map.pt with 4 x (1000 + 1000), S = 4000. Needs all 20 map.pt first.
+    The first launch (26.09 morning) crashed, JAX fails when it sees no GPU
+    instead of falling back to the CPU, hence JAX_PLATFORMS=cpu.
+for ds in boston energy concrete yacht; do for split in 0 1 2 3 4; do echo "$ds $split"; done; done \
+    > logs/v2_04e_medium_nuts_jobs.txt
+nohup xargs -P 20 -L 1 sh -c 'CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
+    XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1" \
+    $PY -m sazz.paper_ready.scripts.uci_bnn --variant medium --datasets $0 --splits $1 \
+    --samplers nuts --out results/paper_v2_medium --resume \
+    > logs/v2_04e_medium_nuts_$0_$1.log 2>&1' \
+    < logs/v2_04e_medium_nuts_jobs.txt > logs/v2_04e_medium_nuts_xargs.log 2>&1 &
+
+4d. Sync and convert (Mac, done 27.09). The old v1 medium nuts.pt were removed
+    first, the converter never overwrites.
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper_v2_medium/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper_v2_medium/
+rm results/paper_v2/deep_narrow/*/split_*/nuts.pt
+python -m sazz.gpu_friendly.scripts.convert_paper_ready_results --src results/paper_v2_medium --dst results/paper_v2
+find results/paper_v2/deep_narrow \( -name 'zigzag.pt' -o -name 'boomerang.pt' -o -name 'sticky_*.pt' \) | wc -l   # expect 120
+find results/paper_v2/deep_narrow -name 'nuts.pt' | wc -l        # expect 20
+
+---------------------------------------------------------------------------
+6b launches so far (server GPU)
+---------------------------------------------------------------------------
+boston on GPU 0 (25.09 night), energy on GPU 2 (26.09 morning), both stage 10_000
+for s in grid_sticky_zigzag grid_sticky_boomerang; do
+  CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci \
+    --datasets boston --splits 0 1 2 3 4 \
+    --hidden-variant deep_wide --samplers $s \
+    --n-skeleton 1_000_000 --stage-size 10_000 --n-resample 4000 \
+    --prior-inclusion-weight 0.05 --grad-batch-size 128 \
+    --bound-mode single_segment --adapt-rule balanced \
+    --out results/paper_v2/deep_wide_v2 --resume \
+    > logs/v2_06_deep_wide_boston_${s}.log 2>&1 &
+done
+(energy the same with --datasets energy and CUDA_VISIBLE_DEVICES=2)
+
+---------------------------------------------------------------------------
+6c. Convergence check, GPU 1, boston split 0, 4 chains from 4 MAPs (✅ 27.09)
+    MAPs are the v1 ones, pairwise relative distance 1.2 to 1.35, energies
+    413 to 500.
+---------------------------------------------------------------------------
+mkdir -p results/paper_v2/deep_wide_convergence/deep_wide/boston/split_00
+rsync -a --ignore-existing results/paper/deep_wide_convergence/deep_wide/boston/split_00/maps \
+    results/paper_v2/deep_wide_convergence/deep_wide/boston/split_00/
+CUDA_VISIBLE_DEVICES=1 python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence fit-maps \
+    --datasets boston --splits 0 --n-maps 4 --prior-inclusion-weight 0.05 \
+    --out results/paper_v2/deep_wide_convergence --resume \
+    > logs/v2_06c_deep_wide_fit_maps.log 2>&1
+for chains in "0 1" "2 3"; do
+  CUDA_VISIBLE_DEVICES=1 nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence sample \
+    --datasets boston --splits 0 --chains $chains \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --n-skeleton 1_000_000 --stage-size 10_000 --n-resample 4000 \
+    --prior-inclusion-weight 0.05 --grad-batch-size 128 \
+    --bound-mode single_segment --adapt-rule balanced \
+    --out results/paper_v2/deep_wide_convergence --resume \
+    > logs/v2_06c_deep_wide_chains_${chains// /_}.log 2>&1 &
+done
+
+---------------------------------------------------------------------------
+8b 8c. Image launches (server GPU, 27.09 morning)
+---------------------------------------------------------------------------
+MAPs checked on the server first
+ls -la results/maps/ffn_mnist_reference_N60000_steps10000_pruned_refit_tol03_longrefit.pt \
+       results/maps/lenet_reference_N60000_pruned_refit_N60k.pt \
+       results/maps/resnet/resnet20_reference_N50000_steps2000_v2_pruned_refit.pt
+LeNet-5, both samplers on GPU 1
+for s in grid_sticky_zigzag grid_sticky_boomerang; do
+  CUDA_VISIBLE_DEVICES=1 nohup python -m sazz.gpu_friendly.scripts.fast_cheap_mnist_cnn \
+    --map-path results/maps/lenet_reference_N60000_pruned_refit_N60k.pt \
+    --samplers $s --n-skeleton 1_000_000 --stage-size 5_000 \
+    --n-resample 4000 --n-save 4000 --grad-batch-size 1024 \
+    --bound-mode single_segment --adapt-rule balanced \
+    --out results/paper_v2/mnist_cnn \
+    > logs/v2_08b_lenet_${s}.log 2>&1 &
+done
+FFN, both samplers on GPU 3
+for s in grid_sticky_zigzag grid_sticky_boomerang; do
+  CUDA_VISIBLE_DEVICES=3 nohup python -m sazz.gpu_friendly.scripts.fast_cheap_ffn_mnist \
+    --map-path results/maps/ffn_mnist_reference_N60000_steps10000_pruned_refit_tol03_longrefit.pt \
+    --samplers $s --n-skeleton 1_000_000 --stage-size 1_250 \
+    --n-resample 4000 --n-save 4000 --grad-batch-size 1024 \
+    --bound-mode single_segment --adapt-rule balanced \
+    --out results/paper_v2/ffn_mnist \
+    > logs/v2_08c_ffn_${s}.log 2>&1 &
+done
+
+---------------------------------------------------------------------------
+9. PIW sweep (sparsity ablation), boston split 0, shallow and deep narrow
+   Same scheme as the main results (single_segment + balanced, G = 1M,
+   S = 4000 uniform in time), the 11 PIW values of v1, sticky PDMPs. Each
+   network uses the driver its main results came from, so the PIW 0.1 and
+   0.3 points are the main results.
+   ✅ 9a deep narrow 24/24 + 6 skeletons, the 6 reruns at PIW 0.1 and 0.3 are
+      bit-for-bit identical to the main results (checked 27.09)
+   ✅ 9b shallow 18/18
+   ✅ 9d synced (without the skeletons) and converted, 42/44 in
+      results/paper_v2/uci_sparsity_ablation (27.09)
+---------------------------------------------------------------------------
+9a. Deep narrow, 24 jobs (11 PIW x 2 sticky + ZigZag and Boomerang at 0.3)
+mkdir -p results/paper_v2_ablation/medium/boston/split_00
+cp results/paper_v2_medium/medium/boston/split_00/map.pt results/paper_v2_ablation/medium/boston/split_00/
+for w in 0.01 0.05 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9; do
+  for s in sticky_zigzag sticky_boomerang; do echo "$w $s"; done
+done > logs/v2_09a_jobs.txt
+echo "0.3 zigzag" >> logs/v2_09a_jobs.txt; echo "0.3 boomerang" >> logs/v2_09a_jobs.txt
+nohup xargs -P 24 -L 1 sh -c 'case $0 in 0.1|0.3) SK=--save-skeleton;; *) SK=;; esac; \
+    CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
+    $PY -m sazz.paper_ready.scripts.uci_bnn --variant medium --datasets boston --splits 0 \
+    --piw $0 --samplers $1 $SK --out results/paper_v2_ablation --resume \
+    > logs/v2_09a_medium_piw$0_$1.log 2>&1' \
+    < logs/v2_09a_jobs.txt > logs/v2_09a_xargs.log 2>&1 &
+
+9b. Shallow, 18 jobs (9 PIW x 2 sticky, 0.1 and 0.3 come from the main results)
+for w in 0.01 0.05 0.2 0.4 0.5 0.6 0.7 0.8 0.9; do
+  for s in grid_sticky_zigzag grid_sticky_boomerang; do echo "$w $s"; done
+done > logs/v2_09b_jobs.txt
+nohup xargs -P 8 -L 1 sh -c 'CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
+    $PY -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets boston --splits 0 \
+    --prior-inclusion-weight $0 --samplers $1 \
+    --bound-mode single_segment --adapt-rule balanced \
+    --grad-budget 1_000_000 --n-skeleton 600_000 --n-resample 4000 \
+    --out results/paper_v2_ablation_shallow/piw_$0 --resume \
+    > logs/v2_09b_shallow_piw$0_$1.log 2>&1' \
+    < logs/v2_09b_jobs.txt > logs/v2_09b_xargs.log 2>&1 &
+
+9c. Check that the deep narrow reruns equal the main results (server)
+$PY - <<'PY'
+import torch
+for tag in ["medium", "medium_piw0.1"]:
+    for s in ["zigzag", "boomerang", "sticky_zigzag", "sticky_boomerang"]:
+        if tag.endswith("0.1") and not s.startswith("sticky"):
+            continue
+        a = torch.load(f"results/paper_v2_ablation/{tag}/boston/split_00/{s}.pt", weights_only=False, mmap=True)
+        b = torch.load(f"results/paper_v2_medium/{tag}/boston/split_00/{s}.pt", weights_only=False, mmap=True)
+        print(f"{tag:15s} {s:18s} identical to main: {torch.equal(a['samples'], b['samples'])}")
+PY
+
+9d. Convert and move (Mac)
+python -m sazz.gpu_friendly.scripts.convert_paper_ready_results --src results/paper_v2_ablation --dst results/paper_v2 --ablation
+A=results/paper_v2/uci_sparsity_ablation/shallow/boston/split_00
+for d in results/paper_v2_ablation_shallow/piw_*; do
+  w=${d##*piw_}; mkdir -p $A/piw_$w
+  for s in sticky_zigzag sticky_boomerang; do mv -n $d/boston/split_00/grid_$s.pt $A/piw_$w/$s.pt; done
+done
+mkdir -p $A/piw_0.3
+for s in sticky_zigzag sticky_boomerang; do cp -n results/paper_v2/shallow/boston/split_00/$s.pt $A/piw_0.3/; done
+
+
+===========================================================================
+ARCHIVE, v1 notes from before 25.09 (kept as they were)
+===========================================================================
+24.09:
+
+Tror det eneste vi mangler er nå denne deep_wide kjøringen med unifrom sampling i tid + konvergens sjekken.
+Kjør dette:
+
+setsid env CUDA_VISIBLE_DEVICES=2 python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence fit-maps \
+    --datasets boston --splits 0 --n-maps 4
+
+på en ledig GPU for konvergens. Den vanlige må også kjøres for yacht.
+
+setsid env CUDA_VISIBLE_DEVICES=2 python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence sample --datasets boston --splits 0 --chains 0 --samplers grid_sticky_boomerang --n-skeleton 1_000_000 --stage-size 5_000
+
+
+
+
+
+
+
+Før 24.09: 
+Kjører nå 4 ting før helgen.
+CIFAR ResNet-20 får bare jobba på. 200/500 ferdig. Resultater under results/grid/cifar
+FFN MNIST får jobba på. 35/200 på ZigZag. Boomerang kommer etterpå. Resultatet kommer under results/grid/ffn_mnist
+Deep wide for Energy og Boston kjører, kommer til å fortsette. 1/5 splits så langt. Resultatet kommer under results/paper/deep_wide_minibatch
+
+Alle de som kjører har tilhørende chunks/ filer som må slettes etter kjøring.
+Etter disse er kjørt, så gjelder det å få opp
+
+- Aliaksandir sin modell
+- Minibatching på små modeller av concrete + energy + boston + yacht (noen er allerede ferdig)
+- Er noen småtteri som vi driver å kjører lokalt, e.g. minibatching for leke dataset med lagring av skeleton points
+- Sparsity ablation studien for deep_narrow
+- Så må vi ta en sjekk på alle UCI modeller så vi ikke glemmer noe. Tror en del mangler nuts.
+
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper/deep_narrow/deep_narrow/yacht/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper/deep_narrow/yacht/
+
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/grid/cifar_resnet/split_00/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper/cifar/
+
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper/deep_wide_minibatched_fixed/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper/deep_wide_v2
+
+For å synce med deep_wide:
+rsync -av --progress --partial -e 'ssh -J augusa@login.math.uio.no' augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results/paper/deep_wide_minibatch/deep_wide/ /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results/paper/deep_wide_minibatch/
+
+For å kjøre minibatch på deep_narrow:
+
+For å kjøre resten av toy dataset med skeletons og negative MAP/minibatch analyse:
+python -m sazz.gpu_friendly.scripts.toy_bnn_grid_minibatch --datasets sharp --save-skeleton
+
+For å kjøre sparsity ablation:
+python -m sazz.gpu_friendly.scripts.uci_bnn_grid   --datasets boston --splits 0 --hidden-variant deep_narrow --n-skeleton 100_000 --samplers grid_sticky_zigzag grid_sticky_boomerang --grad-budget 250_000 --resume  --out results/paper/uci_sparsity_ablation/ --reference empirical_fisher --prior-inclusion-weight 0.5
+
+
+
+python -m sazz.gpu_friendly.scripts.uci_bnn_grid --datasets concrete --splits 0 1 2 3 4 --samplers grid_sticky_zigzag grid_sticky_boomerang --prior-inclusion-weight 0.1 --out results/paper/shallow_piw_0.1/
+
+===========================================================================
+PRIORITIZED EXPERIMENT QUEUE (2026-09-14)
+===========================================================================
+
+NOTES ON OUTPUT PATHS -- READ BEFORE RUNNING:
+- results/paper/shallow/<dataset>/split_XX/grid_sticky_*.pt already holds the
+  DEFAULT-PIW sticky runs for boston, concrete, energy (and yacht). A PIW=0.1
+  run must NOT reuse that folder -- it would overwrite those files. Every
+  PIW=0.1 shallow run below therefore uses a sibling "shallow_piw_0.1"
+  output dir (matching the pattern already used at the bottom of this file
+  for the concrete shallow PIW=0.1 command).
+- results/paper/deep_narrow/<dataset>/split_XX/grid_sticky_*.pt already holds
+  the DEFAULT-PIW deep_narrow runs for boston, concrete, energy, yacht. Same
+  problem, same fix: PIW=0.1 deep_narrow runs use a sibling "deep_narrow_piw_0.1"
+  output dir, never the bare deep_narrow/ dir.
+- deep_wide_minibatch runs use the separate deep_wide_uci.py driver
+  (--hidden-variant deep_wide --grad-batch-size B), not uci_bnn_grid.py's
+  --hidden-variant. The existing results/paper/deep_wide_minibatch/<dataset>/
+  runs (boston + energy: all 5 splits done; concrete: split_00 only) were run
+  at DEFAULT PIW (no prior_inclusion_weight recorded in the checkpoint) with
+  grad_batch_size=128 and n_skeleton=1_000_000 -- matched here so the PIW=0.1
+  runs are comparable apples-to-apples. PIW=0.1 runs below go to a sibling
+  "deep_wide_minibatch_piw_0.1" dir so they never touch the existing
+  default-PIW files. --stage-size is REQUIRED by this script for any sticky
+  PDMP run (it asserts otherwise); 5_000 is used here to match. --resume
+  makes it safe to target all 5 splits even where some already exist.
+- boston's sparsity-ablation PIW sweep (job 9 below) already has piw values
+  0.01/0.05/0.1/0.2/0.3/0.4/0.5/0.6/0.7/0.8/0.9 for split_00 under
+  results/paper/uci_sparsity_ablation/boston/split_00/ and 0.01-0.4 for
+  deep_narrow/boston (splits 00-04) under
+  results/paper/uci_sparsity_ablation/deep_narrow/boston/. --resume makes
+  rerunning that exact command a no-op except for genuinely missing output.
+- NUTS for concrete/energy on deep_narrow: split_00 already exists under
+  results/paper/deep_narrow/<dataset>/split_00/nuts.pt. --resume is passed
+  so existing files are skipped automatically -- targeting all splits 0-4
+  is therefore safe, but splits are listed explicitly anyway for clarity.
+  yacht has no nuts.pt yet under deep_narrow, so all 5 splits run fresh.
+- Neither uci_bnn_grid.py nor deep_wide_uci.py has a --device/--gpu flag;
+  device is auto-detected (cuda if available, else cpu). To pin a GPU,
+  prefix the command with CUDA_VISIBLE_DEVICES=<idx>. Every GPU command
+  below is set to GPU=0 as a placeholder -- change the index per job
+  before launching if you need them on different devices.
+- All long-running commands are backgrounded with nohup and logged under
+  logs/. Check progress with: tail -f logs/<name>.log
+- Run commands from the repo root: /Users/augustarnstad/Documents/sticky_samplers/sticky_bnns
+
+mkdir -p logs
+
+---------------------------------------------------------------------------
+1. Concrete, shallow, PIW=0.1, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets concrete --splits 0 1 2 3 4 \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/shallow_piw_0.1/ \
+    > logs/01_concrete_shallow_piw0.1.log 2>&1 &
+
+Status: ✅
+
+---------------------------------------------------------------------------
+2. Concrete, deep_narrow, PIW=0.1, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=1 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets concrete --splits 0 1 2 3 4 \
+    --hidden-variant deep_narrow \
+    --n-skeleton 300_000 \
+    --grad-budget 1_000_000 \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/deep_narrow_piw_0.1/ \
+    > results/02_concrete_deep_narrow_piw0.1.log 2>&1 &
+
+Status: ✅
+
+---------------------------------------------------------------------------
+3. Concrete, deep_wide_minibatch, PIW=0.05, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci \
+    --datasets concrete --splits 0 1 2 3 4 \
+    --hidden-variant deep_wide \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --n-skeleton 1_000_000 --stage-size 5_000 \
+    --prior-inclusion-weight 0.05 --grad-batch-size 128 --resume \
+    --out results/paper/deep_wide_minibatch_piw_0.1/ \
+    > logs/03_concrete_deep_wide_minibatch_piw0.1.log 2>&1 &
+
+Status: ⏳
+
+---------------------------------------------------------------------------
+4. Boston, deep_narrow, PIW=0.1, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets boston --splits 0 1 2 3 4 \
+    --hidden-variant deep_narrow \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/deep_narrow_piw_0.1/ \
+    > logs/04_boston_deep_narrow_piw0.1.log 2>&1 &
+
+Status: ✅
+
+---------------------------------------------------------------------------
+5a. Yacht, shallow, PIW=0.1, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets yacht --splits 0 1 2 3 4 \
+    --hidden-variant shallow \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/shallow_piw_0.1/ \
+    > logs/05_yacht_shallow_piw0.1.log 2>&1 &
+
+Status: ❌
+
+---------------------------------------------------------------------------
+5b. Yacht, deep_narrow, PIW=0.1, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets yacht --splits 0 1 2 3 4 \
+    --hidden-variant deep_narrow \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/deep_narrow_piw_0.1/ \
+    > logs/05_yacht_deep_narrow_piw0.1.log 2>&1 &
+
+Status: ❌
+
+---------------------------------------------------------------------------
+6. Energy, shallow, PIW=0.1, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets energy --splits 0 1 2 3 4 \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/shallow_piw_0.1/ \
+    > logs/06_energy_shallow_piw0.1.log 2>&1 &
+
+Status: ✅
+
+---------------------------------------------------------------------------
+7. Energy, deep_narrow, PIW=0.1, all splits, sticky zigzag + boomerang
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets energy --splits 0 1 2 3 4 \
+    --hidden-variant deep_narrow \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/deep_narrow_piw_0.1/ \
+    > logs/07_energy_deep_narrow_piw0.1.log 2>&1 &
+
+Status: ✅
+
+
+---------------------------------------------------------------------------
+9. Finish sparsity ablation: boston, split_00, deep_narrow, sticky zigzag + boomerang
+   (this is the exact command already in this file above -- --resume makes
+   it a no-op for anything already done and fills any gap.)
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets boston --splits 0 \
+    --hidden-variant deep_narrow \
+    --n-skeleton 100_000 \
+    --samplers grid_sticky_zigzag grid_sticky_boomerang \
+    --grad-budget 250_000 --resume \
+    --out results/paper/uci_sparsity_ablation/ \
+    --reference empirical_fisher --prior-inclusion-weight 0.6 \
+    > logs/09_sparsity_ablation_boston_deep_narrow.log 2>&1 &
+
+Status: ✅
+
+---------------------------------------------------------------------------
+10. NUTS for energy, yacht on deep_narrow
+    (energy/split_00 already have nuts.pt -- --resume
+    skips those and fills the rest; yacht has none yet, all 5 splits run.)
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=1 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets energy yacht --splits 0 1 2 3 4 \
+    --hidden-variant deep_narrow \
+    --samplers nuts --resume \
+    --out results/paper/deep_narrow/ \
+    > results/10_nuts_deep_narrow_energy_yacht.log 2>&1 &
+
+Status: ✅
+
+---------------------------------------------------------------------------
+11. NUTS HS for energy, yacht on deep_narrow
+    (energy/split_00 already have nuts.pt -- --resume
+    skips those and fills the rest; yacht has none yet, all 5 splits run.)
+---------------------------------------------------------------------------
+CUDA_VISIBLE_DEVICES=0 nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets energy yacht --splits 0 1 2 3 4 \
+    --hidden-variant deep_narrow \
+    --samplers nuts_horseshoe --resume \
+    --out results/paper/deep_narrow/ \
+    > results/10_nuts_deep_narrow_energy_yacht_horseshoe.log 2>&1 &
+
+Status: ✅
+
+
+---------------------------------------------------------------------------
+Checking on things:
+  tail -f logs/01_concrete_shallow_piw0.1.log
+  jobs -l               # see which backgrounded PIDs are still running
+  nvidia-smi             # GPU utilization, on the GPU box
+---------------------------------------------------------------------------
+
+
+Debugging:
+
+nohup python -m sazz.gpu_friendly.scripts.uci_bnn_grid \
+    --datasets energy --splits 1 \
+    --samplers grid_sticky_boomerang \
+    --prior-inclusion-weight 0.1 --resume \
+    --out results/paper/shallow_piw_0.1_debug/ \
+    > logs/01_concrete_shallow_piw0.1_debug.log 2>&1 &

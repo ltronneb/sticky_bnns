@@ -59,3 +59,10 @@ goan_scripts/
 tbnn/
 goan_esbps/
 goan_tpdmp/
+# Generated reports and TensorBoard logs #
+reports/
+logdir/
+
+# Lab notebook (overrides *.txt above) #
+!Status.txt
+!logs/Status_before_cleanup_*.txt

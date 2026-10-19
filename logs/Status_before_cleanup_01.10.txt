@@ -1,0 +1,490 @@
+===========================================================================
+PAPER V2 STATUS, updated 1.10 morning
+single_segment bound + balanced t_max adaptation, S = 4000 uniform in time
+===========================================================================
+Earlier versions with the launch command of every finished run are in
+logs/Status_before_cleanup_30.09.txt (and _28.09, _27.09).
+
+Mac      cd ~/Documents/sticky_samplers/sticky_bnns && source .venv/bin/activate
+Server   tmux attach -t pdmp_bnn, then export PY=$(which python) before any xargs job
+Files in results/paper_v2 have no grid_ prefix. The gpu_friendly scripts still
+write grid_*.pt, so rename after the LAST sync of a folder (see TOOLS).
+
+Decision 30.09. The UCI tables keep only the small and medium networks (full batch,
+exact, compared with NUTS). The large network becomes one full-batch convergence
+experiment on boston split 0 (step 14). The minibatch large runs (6b, 6c) are kept
+only for the minibatch comparison in the supplement. 6a (large LBBNN) and 6d (large
+Boomerang, own covariance) are no longer needed.
+
+
+===========================================================================
+OVERVIEW
+===========================================================================
+  1   toy BNNs, 4 PDMPs + NUTS + LBBNN                       ✅
+  2   UCI small, 4 PDMPs, default PIW                        ✅ 80/80
+  2e  UCI small, NUTS rerun (S = 4000)                       ✅ 20/20
+  3   UCI small, sticky at PIW 0.1                           ✅ 40/40
+  4   UCI medium, 4 PDMPs + sticky PIW 0.1 + NUTS rerun      ✅ 120 + 20
+  6b  UCI large, sticky, minibatch, K = 1M                   ✅ 40/40   ⏳ syncing 30.09
+  6c  UCI large, convergence, minibatch, 4 chains            ✅ analysed (deep_wide_convergence.ipynb)
+  7   sparse linreg and banana                               ✅ figures in results/paper_v2
+  8   images, LeNet + FFN                                    ✅ synced
+  8d  images, CIFAR ResNet-20, 1M, cudnn                     ✅ synced
+  9   PIW sweep, boston split 0, small + medium              ✅ 44/44
+  10  skeletons, boston split 0                              ✅ 12/12
+  11  convergence, small + medium, 1e6, + NUTS (11b)         ✅ analysed (uci_convergence.ipynb)
+  11c convergence, medium, 1e7 (server CPU)                  ✅ 24/24, synced 1.10
+  11d convergence, small, 1e7 (server CPU)                   ⏳ 24 jobs launched 1.10 morning
+  12  LBBNN tuning (Mac)                                     ✅ 3 rounds   ☐ decide
+  13  grid vs single segment, constant-rate cost             ✅ notes/constant_rate_cost
+  14  UCI large, full-batch convergence, boston split 0      ⏳ ZigZag running   ✅ NUTS 4/4   ⏳ Boomerang running
+
+
+===========================================================================
+CONVERGENCE, WHERE EACH PIECE STANDS (1.10)
+===========================================================================
+            PDMPs 1e6 (delete after 1e7)    PDMPs 1e7 (4 MAPs)                   NUTS (4 MAPs x 4 chains)
+small       ✅ 11                           ⏳ 11d, launched 1.10 morning         ✅ 11b (about 3.7M grads per MAP)
+medium      ✅ 11                           ✅ 11c, synced 1.10                   ✅ 11b (about 7.1M grads per MAP)
+large       6c minibatch only               ⏳ 14 ZigZag, ☐ 14 Boomerang          ✅ 14, 4/4 (MAPs 0, 1 about 1.10 01:00)
+Deadline 6.10. Large ZigZag measured 30.09 at about 50 stages per hour (sticky needs 1400
+to 1800 stages, plain about 1200), so done 1.10 evening to 2.10 morning. Plain ZigZag
+chain 0 already finished (grid_zigzag.pt synced 1.10). Boomerang on GPU 1 and 3 once
+CIFAR exits (1.10), done about 2.10 to 3.10. If it is not done by 4.10, the paper goes
+with ZigZag and NUTS for the large network.
+The large NUTS test (06e, 7.2M grads, 70 min on 4 GPUs, R-hat 1.00 over its 4 chains)
+started from a fifth MAP, not one of the four, so it is only an extra reference.
+Step 14 PDMP draws from the ZigZag runs launched 30.09 morning are saved in random
+order without times (R-hat only). The fix (time order + sample_times) is in the
+30.09 commit, so the NUTS and Boomerang runs launched after it have ESS and traces.
+11d, small at 1e7, uses chains 1 to 4 (no chain 0, the published small runs came from
+the gpu_friendly driver and saved no map.pt). Chains 1 to 3 reuse the MAPs of step 11,
+chain 4 has a fresh MAP (map_4, seed 90_004). Commands in TO DO, 11d.
+
+
+===========================================================================
+RUNNING NOW (1.10 morning)
+===========================================================================
+GPU 0   4 x sticky ZigZag + plain ZigZag chain 2 (step 14), 19.6 GB, do not add jobs
+GPU 1   CIFAR sticky ZigZag (8d), stage 496 of 500, then step 14 plain Boomerang
+GPU 2   plain ZigZag chains 1 and 3 (step 14), chain 0 finished
+GPU 3   CIFAR sticky Boomerang (8d), stage 498 of 500, then step 14 sticky Boomerang
+CPU     11d, 24 jobs (launched 1.10 morning)
+Mac     rsync of step 14 (deep_wide_convergence_fullbatch, NUTS + finished ZigZag)
+Done since 30.09   11c 24/24 (synced 1.10), step 14 NUTS 4/4
+
+Checks (server, repo root)
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader; uptime; du -sh ~
+Step 14
+echo "running $(pgrep -fc 'grad-budget 10_000_000 --stage-size 2_000')"; grep -al Traceback logs/v2_06g_fb_*.log; for f in logs/v2_06g_fb_*.log; do printf "%-36s %s\n" "$(basename $f .log | sed 's/v2_06g_fb_//')" "$(tr '\r' '\n' < $f | grep -aE '\[stage [0-9]+/' | tail -1 | grep -oE 'stage [0-9]+')"; done
+NUTS test
+for c in 0 1 2 3; do tr '\r' '\n' < logs/v2_06e_deep_wide_nuts_boston_0.log | grep -a "Running chain $c" | tail -1 | cut -c1-90; done; grep -a "sampled\|saved" logs/v2_06e_deep_wide_nuts_boston_0.log | tail -2; ls -l results/paper_v2/deep_wide_v2/deep_wide/boston/split_00/nuts.pt 2>/dev/null
+Step 14 NUTS
+for c in 0 1 2 3; do f=logs/v2_06h_fb_nuts_chain$c.log; printf "MAP %s  chains started %s  saved %s  now %s\n" $c "$(tr '\r' '\n' < $f | grep -ac ' 0/1000 \[00:00')" "$(grep -ac 'saved 4000' $f)" "$(tr '\r' '\n' < $f | grep -aoE '[0-9]+/1000 \[[0-9:]+<[0-9:?]+' | tail -1)"; done
+  (each chain draws two progress bars, warmup and sampling, so 8 started = 4 chains)
+11d (11c the same with 11c in the log names)
+for f in logs/v2_11d_conv10M_*chain*.log; do printf "%-36s %s\n" "$(basename $f .log | sed 's/v2_11d_conv10M_//')" "$(tail -c 300 $f | tr '\r' '\n' | grep -aoE '[0-9]+/10000000' | tail -1)"; done | grep -E "/10000000" | grep -v " 10000000/"; echo "done: $(ls results/paper_v2_convergence_10M/small*/boston/split_00/chain_*/*.pt 2>/dev/null | wc -l)/24"; grep -al Traceback logs/v2_11d_conv10M_*.log
+CIFAR
+for f in logs/v2_08d_cifar_*_rerun.log; do printf "%-45s %s\n" "$(basename $f .log)" "$(tr '\r' '\n' < $f | grep -aE '\[stage [0-9]+/[0-9]+\] sampling' | tail -1 | grep -oE 'stage [0-9]+/[0-9]+')"; done; grep -al Traceback logs/v2_08d_cifar_*_rerun.log
+
+Syncs (Mac, variables in TOOLS)
+6b + NUTS test  until rsync -av --progress --partial --exclude=chunks -e "$R" $S/paper_v2/deep_wide_v2/ $L/paper_v2/deep_wide_v2/; do sleep 30; done
+11c, 11d        mkdir -p $L/paper_v2_convergence_10M; until rsync -av --progress --partial -e "$R" $S/paper_v2_convergence_10M/ $L/paper_v2_convergence_10M/; do sleep 30; done
+8d              until rsync -av --progress --partial --exclude=chunks -e "$R" $S/paper_v2/resnet_cifar/ $L/paper_v2/resnet_cifar/; do sleep 30; done
+14              mkdir -p $L/paper_v2/deep_wide_convergence_fullbatch; until rsync -av --progress --partial --exclude=chunks -e "$R" $S/paper_v2/deep_wide_convergence_fullbatch/ $L/paper_v2/deep_wide_convergence_fullbatch/; do sleep 30; done
+
+
+===========================================================================
+TO DO
+===========================================================================
+---------------------------------------------------------------------------
+14. UCI large, full-batch convergence, boston split 0 (10^7 gradients per chain)
+---------------------------------------------------------------------------
+Plain and sticky ZigZag and Boomerang from the 4 MAPs of 6c, plus NUTS from the
+same MAPs. Full batch, so every sampler is exact, and plain against sticky isolates
+stickiness (same code, only the freeze mask differs). Code 30.09 in deep_wide_uci.py
+(grid_zigzag, grid_boomerang, PDMP_GRAD_BUDGET) and deep_wide_uci_convergence.py
+(--grad-budget), committed and pulled. One job uses about 10 % of a GPU but about
+3.3 GB (stage 2_000), so at most 6 jobs per GPU. Estimated 1.5 to 2 days per chain.
+Output results/paper_v2/deep_wide_convergence_fullbatch/deep_wide/boston/split_00/chain_c/
+ZigZag (launched 30.09, 8 of 8 running after the out-of-memory relaunch)
+for s in grid_zigzag grid_sticky_zigzag; do for c in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=<gpu> nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence sample \
+    --datasets boston --splits 0 --chains $c --samplers $s \
+    --n-skeleton 100_000_000 --grad-budget 10_000_000 --stage-size 2_000 --n-resample 4000 \
+    --prior-inclusion-weight 0.05 --bound-mode single_segment --adapt-rule balanced \
+    --out results/paper_v2/deep_wide_convergence_fullbatch --resume \
+    > logs/v2_06g_fb_${s}_chain$c.log 2>&1 &
+done; done
+☐ Boomerang, launch when both CIFAR processes have exited
+  (ps -eo etime,args | grep fast_cheap_cifar | grep -v grep shows nothing).
+  Plain on GPU 1, sticky on GPU 3, 4 chains each, every chain with its own covariance.
+for sg in "grid_boomerang 1" "grid_sticky_boomerang 3"; do set -- $sg
+  for c in 0 1 2 3; do
+    CUDA_VISIBLE_DEVICES=$2 nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence sample \
+      --datasets boston --splits 0 --chains $c --samplers $1 --per-chain-sigma-inv \
+      --n-skeleton 100_000_000 --grad-budget 10_000_000 --stage-size 2_000 --n-resample 4000 \
+      --prior-inclusion-weight 0.05 --bound-mode single_segment --adapt-rule balanced \
+      --out results/paper_v2/deep_wide_convergence_fullbatch --resume \
+      > logs/v2_06g_fb_${1}_chain$c.log 2>&1 &
+  done
+done
+✅ NUTS from the 4 MAPs, 4/4 saved (MAPs 2 and 3 30.09 evening, MAPs 0 and 1 about 1.10
+  01:00, slower on the shared GPU 2). Each from its own map_0c, 4 chains of 1000 draws.
+  Logs logs/v2_06h_fb_nuts_chain*.log. ⏳ syncing 1.10.
+for cg in "0 2" "1 2" "2 1" "3 3"; do set -- $cg
+  CUDA_VISIBLE_DEVICES=$2 XLA_PYTHON_CLIENT_PREALLOCATE=false nohup python -m sazz.gpu_friendly.scripts.deep_wide_uci_convergence sample \
+    --datasets boston --splits 0 --chains $1 --samplers nuts --stage-size 2_000 \
+    --prior-inclusion-weight 0.05 --out results/paper_v2/deep_wide_convergence_fullbatch --resume \
+    > logs/v2_06h_fb_nuts_chain$1.log 2>&1 &
+done
+☐ sync, notebook (R-hat as in uci_convergence.ipynb, plain against sticky per gradient)
+
+---------------------------------------------------------------------------
+11c. Medium convergence at 10^7 gradients (server CPU, launched 29.09)
+---------------------------------------------------------------------------
+ZigZag w 0.3, sticky ZigZag w 0.3 and 0.1, Boomerang w 0.3, sticky Boomerang w 0.3
+and 0.1, 4 chains each. Chain 0 is the published run continued (published MAP and
+seed), chains 1 to 3 use MAPs 1 to 3 of step 11. Old gradient accounting, like the
+1e6 chains. Output results/paper_v2_convergence_10M/{medium,medium_piw0.1}/...
+✅ 24/24 (30.09 evening)   ✅ synced 1.10   ☐ uci_convergence.ipynb, 1e6 against 1e7 for the medium network
+
+---------------------------------------------------------------------------
+11d. Small convergence at 10^7 gradients (server CPU, launched 1.10 morning)
+---------------------------------------------------------------------------
+Same samplers as 11c (24 jobs), chains 1 to 4. Chains 1 to 3 reuse MAPs 1 to 3 of step
+11, chain 4 a fresh MAP fitted first in a scratch folder (so the six chain-4 jobs do
+not all fit and write it at once). Old gradient accounting like 11c, so do not git pull
+on the server until 11d is done. Guess 5 to 8 h per job (medium took 23 to 35 h).
+Output results/paper_v2_convergence_10M/{small,small_piw0.1}/boston/split_00/chain_{1..4}
+O=results/paper_v2_convergence_10M/small/boston/split_00/maps; mkdir -p $O
+cp results/paper_v2_convergence/small/boston/split_00/maps/map_{1,2,3}.pt $O/
+CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu python -m sazz.paper_ready.scripts.uci_bnn --variant small \
+  --datasets boston --splits 0 --chains 4 --samplers zigzag --budget 1000 --out results/tmp_map4 \
+  && cp results/tmp_map4/small/boston/split_00/maps/map_4.pt $O/ && rm -r results/tmp_map4
+export PY=$(which python)
+for c in 1 2 3 4; do for sp in "zigzag 0.3" "sticky_zigzag 0.3" "sticky_zigzag 0.1" "boomerang 0.3" "sticky_boomerang 0.3" "sticky_boomerang 0.1"; do
+  echo "$c $sp"; done; done > logs/v2_11d_conv10M_jobs.txt
+nohup xargs -P 24 -L 1 sh -c 'CUDA_VISIBLE_DEVICES= JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
+    $PY -m sazz.paper_ready.scripts.uci_bnn --variant small --datasets boston --splits 0 \
+    --chains $0 --samplers $1 --piw $2 --budget 10_000_000 \
+    --out results/paper_v2_convergence_10M --resume \
+    > logs/v2_11d_conv10M_chain$0_$1_piw$2.log 2>&1' \
+    < logs/v2_11d_conv10M_jobs.txt > logs/v2_11d_conv10M_xargs.log 2>&1 &
+☐ 24/24   ☐ synced   ☐ uci_convergence.ipynb, 1e6 against 1e7 for the small network
+
+---------------------------------------------------------------------------
+8d. CIFAR-10 ResNet-20 (GPU 1 and 3, restarted 29.09 after the quota crash)
+---------------------------------------------------------------------------
+⏳ stage 498 and 496 of 500 (1.10 morning)   ☐ synced   ☐ rename   ☐ decide on Boomerang (violations)
+Then GPU 1 and 3 go to the step 14 Boomerang runs.
+
+---------------------------------------------------------------------------
+Other open items
+---------------------------------------------------------------------------
+☐ 6b rename the grid_ files in deep_wide_v2, after the NUTS test is synced too
+☐ 12 LBBNN, decide between the v1 setting and alpha_hi (RESULTS NOTES)
+☐ minibatch comparison for the supplement. Full batch (step 14, sticky ZigZag
+  chain 0) against minibatch (6c, sticky ZigZag chain 0), same MAP, boston split 0.
+  Possibly also small and medium runs with minibatch 128 against the full-batch ones.
+☐ paper_ready gradient reuse change (bounce reuses the proposal gradient) is still
+  uncommitted on the Mac. Commit when 11d is done (it does not affect gpu_friendly),
+  and do not git pull on the server before that.
+☐ 13, optional, read the real K from the v1 diagnostics and compare with (K+3)/4
+
+
+===========================================================================
+NOTEBOOKS AND PAPER
+===========================================================================
+Main text
+  Toy figure           toy_results copy.ipynb (hernandez)   ☐ rename to toy_results.ipynb
+                       ☐ LBBNN toy files hold 8000 draws, use the first 4000
+  UCI tables           uci_full_split.ipynb, paper_table(dataset)   ✅ small + medium
+                       ☐ drop the large rows (decision 30.09)
+  Headline plot        headline_plot.ipynb   ✅ paper_v2
+  MNIST tables         analyze_ffn_mnist_paper.py, analyze_lenet_mnist_paper.py
+                       ✅ read results/paper_v2 (30.09, loading and MAP check tested),
+                       plots to results/plots_v2/MNIST_FFN and MNIST_CNN   ☐ run, tables into the paper
+  Corruption           the same scripts, CIFAR in analyze_cifar_resnet_paper.py
+                       ✅ CIFAR script reads results/paper_v2/resnet_cifar/split_00 (grid_ or not)
+                       ☐ CIFAR after 8d is synced
+  Bounds section       ✅ written (single segment, adaptation, violations)
+Supplement
+  Linreg + banana      sazz/paper_ready/scripts/{linreg_exactness,banana}.py   ✅ figures
+  Sparsity ablation    uci_sparsity_ablation.ipynb   ✅   ☐ medium label d=5852, not d=5802
+  More toys, UCI       toy notebook with other DATASET, uci_full_split.ipynb summary_table
+  Grid vs single seg.  notes/constant_rate_cost/sim.py (figure) + uci_skeletons.ipynb
+                       section 7 (bar chart), text written
+  Convergence          uci_convergence.ipynb (small + medium, R-hat, ESS, NUTS, ONLY switch
+                       for plain samplers), deep_wide_convergence.ipynb (6c), step 14 to add
+  Minibatching         ☐ see Other open items
+  Symmetries           ☐ analysis not decided
+Diagnostics, not in the paper
+  uci_skeletons.ipynb (rate and bound plot, t_max, events, path ESS), reports/uci_convergence.html
+Paper text
+  ☐ the image runs adapt t_max with alpha = 1.02, UCI and toys with 1.01
+  ☐ exactness claim tied to full batch, the image runs use minibatches (MNIST 1024,
+    CIFAR 128), which makes them approximate (Fearnhead et al.)
+  ☐ one sentence on the bounce gradient being recomputed (costs are conservative)
+  ☐ Image data section in the main text is not complete (results, tables, text)
+  ☐ Toy paragraph numbers do not match tab:toys. The text says sticky 0.108 against
+    0.133 to 0.135 for the dense samplers, the table has 0.109 against 0.115 to 0.116.
+    The text also says "narrower predictive bands", which we found does not hold.
+
+
+===========================================================================
+REPRODUCIBILITY CHECKLIST (code upload + supplement), started 1.10
+===========================================================================
+Code, sazz/paper_ready (upload sazz/__init__.py + sazz/paper_ready, no __pycache__)
+  ✅ self-contained (imports nothing from the rest of the repo), no names or paths in it
+  ✅ metrics.py (RMSE, NLL, CRPS, coverage, sparsity, Acc, NLL, ECE, Brier)
+  ✅ scripts/analyse.py toy | uci | images. Reproduces the published Boston table exactly
+  ✅ --smoke in toy_bnn, uci_bnn, image_reference, image_bnn
+  ✅ scripts/smoke_test.py, passes without images in 3.2 min   ☐ with images. Killed 1.10
+     evening before the end (all three image models had passed reference + MNIST
+     sampling, ResNet-20 sampling was too slow in float64 on the CPU, now batch 32 and
+     30 events in smoke mode). Restart:
+     nohup python -u -m sazz.paper_ready.scripts.smoke_test > logs/repro/smoke_full.log 2>&1 &
+  ✅ requirements.txt, README (main results mapped to commands, data files, compute)
+  ✅ toy LBBNN 1.5e4 epochs (as the paper runs)
+  ⏳ toy reproduction check, paper_ready on all 4 toys into results/repro_check/toy_bnns
+     ✅ all 24 runs done 1.10. Its LBBNN used 2e4 epochs, so delete the 4 lbbnn.pt and
+     rerun with 1.5e4, then compare analyse toy against results/paper_v2/toy_bnns
+     rm results/repro_check/toy_bnns/*/split_00/lbbnn.pt
+     python -m sazz.paper_ready.scripts.toy_bnn --samplers lbbnn --out results/repro_check/toy_bnns --resume
+  ☐ test the upload bundle from a clean folder (smoke test there)
+  The main results came partly from gpu_friendly (toys, small UCI, images). Every
+  sampler constant matches paper_ready (checked 1.10), so paper_ready reproduces them
+  up to Monte Carlo variation. Bounce gradient reuse means slightly more events at
+  the same G (in the README).
+
+Supplement table. Prior, w, budget, batch, gamma, refresh, c, t_max, alpha and the shrink
+are checked against the code of the published runs. The MAP rows (steps, learning rate,
+batch, M, tolerance) come from paper_ready, check the image ones against the reference
+file names (FFN steps10000 tol03, ResNet steps2000) before submitting.
+\begin{table}
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccc}
+\toprule
+ & Toy & UCI small & UCI medium & MNIST FFN & MNIST LeNet-5 & CIFAR-10 ResNet-20 \\
+\midrule
+Hidden layers & $[100]$ & $[50]$ & $[50, 50, 50]$ & $[256, 256]$ & LeNet-5 & ResNet-20 \\
+Activation & $\tanh$ & $\tanh$ & $\tanh$ & ReLU & $\tanh$ & ReLU \\
+Likelihood & Gaussian, $\sigma$ fixed & Gaussian, $\sigma$ learned & Gaussian, $\sigma$ learned & Categorical & Categorical & Categorical \\
+$\sigma_w$, $\sigma_b$ & 3, 3 & 1, 1 & 1, 1 & 2, 2 & 2, 2 & 2, 2 \\
+Noise prior scale $s$ & -- & per dataset$^a$ & per dataset$^a$ & -- & -- & -- \\
+Inclusion weight $w$ & 0.1 & 0.3, 0.1 & 0.3, 0.1 & 0.05 & 0.05 & 0.01 \\
+Budget & $G = 2\cdot 10^5$ & $G = 10^6$ & $G = 10^6$ & $K = 10^6$ & $K = 10^6$ & $K = 10^6$ \\
+Gradient batch & full & full & full & 1024 & 1024 & 128 \\
+ZigZag $\gamma$ & $10^{-2}$ & $10^{-2}$ & $10^{-2}$ & $10^{-6}$ & $10^{-6}$ & $10^{-6}$ \\
+Boomerang refresh rate & 1 & 1 & 1 & 1 & 1 & 1 \\
+Reference scale $c$ & 0.1 & 0.1 & per dataset$^b$ & 1 & 1 & 1 \\
+Initial $t_{\max}$, ZigZag & $2\cdot 10^{-4}$ & $2\cdot 10^{-4}$ & $2\cdot 10^{-4}$ & $10^{-5}$ & $10^{-5}$ & $10^{-5}$ \\
+Initial $t_{\max}$, Boomerang & $3\cdot 10^{-3}$ & $3\cdot 10^{-3}$ & $3\cdot 10^{-3}$ & $10^{-3}$ & $10^{-3}$ & $10^{-4}$ \\
+Adaptation $\alpha$ & 1.01 & 1.01 & 1.01 & 1.02 & 1.02 & 1.02 \\
+$t_{\max}$ shrink after a violation & 2 & 2 & 2 & 1.1 & 1.1 & 1.1 \\
+MAP, Adam steps & $10^4$ & $2\cdot 10^4$ & $2\cdot 10^4$ & $10^4$ & $10^4$ & $2\cdot 10^3$ \\
+MAP, learning rate & $10^{-2}$ & $10^{-2}$ & $10^{-2}$ & $2\cdot 10^{-3}$, cosine & $2\cdot 10^{-3}$, cosine & $2\cdot 10^{-3}$, cosine \\
+MAP, batch & full & full & full & full & 512 & 128 \\
+Fisher sample size $M$ & 128 & 128 & 128 & 1024 & 1024 & 128 \\
+Pruning tolerance & -- & -- & -- & 3 pp & 1 pp & 10 pp \\
+\bottomrule
+\end{tabular}
+}
+\caption{Settings per experiment. $^a$ $s = 0.3$, $0.03$, $0.2$ and $0.01$ for Boston, Energy, Concrete and Yacht. $^b$ $c = 0.75$, $0.5$, $10$ and $0.5$ for Boston, Energy, Concrete and Yacht. The ResNet-20 MAP starts from the SGD network, and its BatchNorm scales have prior $\mathcal N(0, 1)$. All PDMPs keep $S = 4000$ draws after a $20\%$ time burn-in, and the tangent bound is inflated by $1 + \varepsilon$ with $\varepsilon = 0.01$.}
+\label{tab:supp_settings}
+\end{table}
+
+Supplement gaps that do not fit the table
+  ☐ Data. UCI 90/10 splits with seeds 42 to 46, inputs and outputs standardised
+    on the training split, metrics reported on the original scale. The three extra
+    toy generators and the test grid (300 points on [-4, 4]), with toy metrics on
+    |x| <= 3 except Hernandez (full grid). Image models use the full training sets.
+  ☐ Pruning images overlap the test set. The 2000 images that pick the pruning
+    threshold come from the MNIST/CIFAR test pool, and the analysis scripts evaluate
+    on all 10,000 test images. Either evaluate on the 8000 disjoint images (as
+    paper_ready does) or state the overlap.
+  ☐ How settings were chosen. Basis for tuning c per dataset, why w = 0.3 and 0.1
+    (and 0.05, 0.01 for images), t_max starts uncritical since they adapt, MAP steps,
+    pruning tolerances. LBBNN temperature is already there.
+  ☐ NUTS details not in the main text. Target acceptance 0.9, NumPyro default tree
+    depth (10), on the toys random init instead of the MAP (main text has the rest).
+  ☐ SGD baselines for the images. FFN and LeNet-5 40 epochs, ResNet-20 180 epochs,
+    SGD with Nesterov momentum 0.9 and a cosine schedule, learning rate 0.05 (MNIST)
+    and 0.1 with weight decay 1e-4 and crop and flip augmentation (CIFAR-10).
+  ☐ Bounding section says t_max is halved after a violation. True for toys and UCI,
+    the image runs shrink it by 1.1. It also says only the MNIST Boomerang records
+    violations, which needs updating for the CIFAR Boomerang (10,286 violations).
+  ☐ Model specifications says sigma_b is "typically in [1, 3]", point to the table.
+  ☐ Image metrics in the metrics section. Class probabilities averaged over draws
+    (300 draws for MNIST, 200 for CIFAR-10), then accuracy, NLL of the averaged
+    probabilities, ECE with 15 equal-width confidence bins, and the Brier score.
+    Sparsity is the share of weights (no biases or BatchNorm) exactly zero,
+    averaged over draws.
+
+
+===========================================================================
+RESULTS NOTES
+===========================================================================
+6c, large network convergence (notebooks/deep_wide_convergence.ipynb, 28.09)
+  The draws are stored in random order without times, so only cross-chain
+  comparison of invariant statistics, no traces or within-chain ESS.
+  MAPs      energies 413, 500, 473, 453, test RMSE 2.71, 3.19, 3.37, 3.13,
+            test predictions differ by 0.3 to 1.6 RMS (y units)
+  ZigZag    partly mixed. R-hat 1.00 to 1.02 for rmse_test, middle-layer norms and
+            sparsity, but 1.11 log sigma, 1.14 train fit, 1.11 and 1.25 last layer,
+            f_test median 1.07 max 1.24. Chains differ by 0.30 to 0.62 against a
+            posterior sd of f of 0.71.
+  Boomerang stays in its starting mode. R-hat 1.2 to 1.9, chain 0 test RMSE 3.02
+            against 3.32 to 3.44. Chains 1 to 3 used MAP 0's covariance, which
+            is mismatched to their modes, hence 6d.
+
+11, convergence chains, small and medium, boston split 0 (29.09,
+  notebooks/uci_convergence.ipynb, figures in results/plots_v2/convergence). 4 chains per sampler, chain 0 the
+  published run, chains 1 to 3 from their own random MAP. Draws are in time order in all
+  chains (lag-1 autocorrelation of log sigma 0.37 to 0.999, about 0 shuffled).
+  Rank R-hat on log sigma, train RMSE, test RMSE, f(test) per point, zero share.
+  small   ZigZag and sticky ZigZag converged, R-hat at most 1.03 (worst test point 1.15
+          for sticky ZigZag w 0.1), zero share agrees to 0.2 points
+          Boomerang family slow but not stuck, chain means agree (test RMSE 2.60 to 2.76),
+          R-hat up to 1.1 to 1.2 on train RMSE, ESS 15 to 130
+  medium  ZigZag family partly mixed, R-hat 1.1 to 1.5 (best at w 0.1), ESS in the teens
+          Boomerang family stays at its starting MAP, R-hat 1.6 to 2.3, ESS 5 to 7. Each
+          chain's test RMSE follows its own MAP's (MAP 2.61, 3.76, 3.33, 2.64 against
+          chains 2.65, 3.59, 3.16, 2.72). Chain 0 (published) started from a good MAP.
+          Same as the large network (6c). Explains the flat medium sticky Boomerang in the
+          sparsity ablation (all w from the same MAP). Say so in the paper.
+  NUTS (11b, 4 MAPs x 4 chains of 1000) converged on both networks. R-hat at most 1.006
+          for every statistic and test point, every MAP ends at the same test RMSE (2.61
+          small, 2.56 to 2.57 medium, also from the medium MAPs at 3.76 and 3.33).
+          ESS per 1e6 grads 620 to 1170 (small) and 160 to 520 (medium), against 40 to 140
+          and 2 to 20 for the ZigZag samplers. Each NUTS run used 3.7x (small) and 7.1x
+          (medium) the gradients of one PDMP chain, max tree depth on most medium draws.
+
+10, skeletons (notebooks/uci_skeletons.ipynb, 28.09, summaries cached in
+  results/paper_v2/skeletons/_summaries, figures in results/plots/skeletons)
+  0 violations in all 12 runs. Grads per event 2.1 to 3.7 (sticky), 4.1 ZigZag, 6.6 Boomerang.
+  Freezes and thaws are 25 to 50 % of sticky ZigZag events and 86 to 97 % of sticky
+  Boomerang events. t_max settles in the first 10 to 30 % of the windows. Draws match the
+  time frozen per weight (about 95 % within 2 binomial sd, so uniform in time holds).
+  Path ESS is LOW, single digits to about 1000 of 4000 grid points (log sigma, sparsity,
+  train RMSE), so the draws are strongly dependent. Worth an honest line in the paper.
+  Grid (v1) vs single segment (v2), section 7, SMALL NETWORK ONLY, the only case
+  where every v1 and v2 run used exactly 1e6 gradients, w = 0.3, boston split 0.
+  Gradients per event v1 to v2, ZigZag 7.67 to 4.16 (1.84 x), sticky ZigZag 8.58 to
+  3.41 (2.52 x), Boomerang 11.01 to 6.64 (1.66 x), sticky Boomerang 3.81 to 2.40 (1.58 x).
+  Dropped as not comparable. The medium network (v1 sticky Boomerang hit its event cap
+  at 925K gradients) and trajectory time per gradient (v1 times come from event-capped
+  ablation runs of 383K to 1.6M gradients, and time units differ between samplers).
+  No v1 UCI skeletons with positions exist, so no ESS comparison.
+
+8, MNIST (1M events each)
+  FFN    ZigZag 0 violations, Boomerang 71, test accuracy 0.977 both
+  LeNet  ZigZag 0 violations, Boomerang 79, test accuracy 0.985 and 0.986
+  So Boomerang violates on the image models too, but rarely (under 1 in 10,000 events).
+
+8d, CIFAR timing test (4000 events)
+  --cudnn-benchmark halves the time (ZigZag 1240 to 627 s, Boomerang 1764 to 686 s).
+  ZigZag 4.0 grads/event, 0 violations. Boomerang 2.1 to 2.4 grads/event,
+  19 and 22 violations in 4000 events (ReLU makes the rate non-smooth). v1 left
+  CIFAR Boomerang out.
+
+12, LBBNN, boston small, splits 0 to 2 (NUTS 2.69, sticky ZigZag 2.86 there)
+  baseline (v1 setup)                    3.37   sparsity 75 %   noise sd 0.40
+  inclusion probabilities start near 1   3.17   75 %
+  wider initial variational sd           3.17   75 %
+  combinations, 5 MC samples, 50k epochs 3.18 to 3.25   75 %
+  temperature 0.3 / 0.35 / 0.5           3.16 / 3.03 / 3.01   36 / 11 / 3 %
+  fixed or learned model prior           3.32 to 3.56   95 to 98 %
+  At 75 % sparsity the LBBNN plateaus about 0.2 below the v1 setup, the
+  variational family is the limit, not training. It only reaches about 3.0 by
+  giving up sparsity.
+  Round 3, small over all 5 splits   base 3.52, alpha_hi 3.46, rho_wide 3.45 (splits 3 and 4 are harder)
+  Round 3, medium splits 0 to 2      base 4.21, alpha_hi 4.01, rho_wide 4.06, both 4.18, all about 76 %
+  alpha_hi (inclusion probabilities start near 1) is the only change that helps on both networks.
+
+
+===========================================================================
+TOOLS
+===========================================================================
+Sync variables, set in the Mac terminal before any rsync above
+R='ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -J augusa@login.math.uio.no'
+S=augusa@nam-shub-02:/mn/sarpanitu/ansatte-u6/augusa/sticky_bnns/results
+L=/Users/augustarnstad/Documents/sticky_samplers/sticky_bnns/results
+The until loop retries on a flaky connection and continues where it stopped.
+The Mac rsync is old (2.6.9). Write --exclude='pattern' with "=", and create
+nested target folders first with mkdir -p. Switching networks kills the shared
+ssh connection (ControlMaster in ~/.ssh/config), just run the command again.
+
+Drop the grid_ prefix (mv -n never overwrites). Only on finished files, and only
+after the last sync of that folder, since rsync would download renamed files again.
+for f in $(find results/paper_v2/<folder> -name 'grid_*.pt'); do mv -n "$f" "$(dirname $f)/$(basename $f | sed 's/^grid_//')"; done
+Still to rename   deep_wide_convergence, deep_wide_v2 (after the NUTS test is synced),
+                  resnet_cifar and deep_wide_convergence_fullbatch (after their last sync)
+
+Server load, GPUs and disk
+uptime; nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv; df -h .
+
+Paper tables (Mac, notebook or python)
+from utils.uci_results_utils import paper_table; print(paper_table("boston"))
+
+Count finished runs in paper_v2 (toy 16, shallow 80, shallow_piw_0.1 40, deep_narrow 80,
+deep_narrow/piw_0.1 40, deep_wide_v2 40). Budget runs should show 200K (toy) or 1M
+(UCI small and medium) grad evals, fewer means the event cap bound.
+python - <<'PY'
+import glob, torch
+from collections import defaultdict
+PDMP = {"zigzag", "sticky_zigzag", "boomerang", "sticky_boomerang"}
+agg = defaultdict(lambda: [0, 0, None, 0])
+for f in glob.glob("results/paper_v2/**/*.pt", recursive=True):
+    name = f.rsplit("/", 1)[1][:-3].removeprefix("grid_")
+    if name not in PDMP or "skeletons" in f or "uci_sparsity_ablation" in f or "convergence" in f:
+        continue
+    r = torch.load(f, map_location="cpu", weights_only=False, mmap=True)
+    parts = f.split("/")
+    key = parts[2] + ("/piw_0.1" if parts[3] == "piw_0.1" else "")
+    ev = r.get("gradient_evals") or r.get("grad_evals") or 0
+    a = agg[key]
+    a[0] += 1
+    a[1] += r.get("bound_violations") or 0
+    a[2] = ev if a[2] is None else min(a[2], ev)
+    a[3] = max(a[3], r["samples"].shape[0])
+for k, (n, viol, min_ev, s) in sorted(agg.items()):
+    print(f"{k:28s} runs {n:3d}   bound violations {viol:4d}   min grad evals {min_ev:,}   S {s}")
+PY
+
+
+===========================================================================
+DONE, where the results are (commands in logs/Status_before_cleanup_28.09.txt)
+===========================================================================
+1   toys           results/paper_v2/toy_bnns, skeletons in toy_bnns/skeletons/fullbatch
+2   UCI small      results/paper_v2/shallow (Mac, gpu_friendly uci_bnn_grid, 2 threads)
+2e  small NUTS     results/paper_v2/shallow/*/split_*/nuts.pt (server, paper_ready)
+3   small PIW 0.1  results/paper_v2/shallow_piw_0.1 (server, gpu_friendly)
+4   UCI medium     results/paper_v2/deep_narrow and deep_narrow/piw_0.1 (server CPU,
+                   paper_ready, converted from paper_v2_medium, NUTS rerun from the same MAP)
+6b  UCI large      results/paper_v2/deep_wide_v2/deep_wide (server GPU, deep_wide_uci, minibatch 128,
+                   40/40, kept only for the minibatch comparison)
+6c  convergence    results/paper_v2/deep_wide_convergence (shared covariance, see 6d)
+8   LeNet, FFN     results/paper_v2/mnist_cnn/split_00, ffn_mnist (GPU, fast_cheap_*)
+9   PIW sweep      results/paper_v2/uci_sparsity_ablation/{shallow,deep_narrow}/boston/split_00/piw_*
+7   linreg, banana results/paper_v2/sticky_exactness, results/paper_v2/banana_sweep (Mac, paper_ready)
+10  skeletons      results/paper_v2/skeletons/{shallow,deep_narrow}/piw_{0.3,0.1}/boston/split_00
+                   (10a, the small PIW 0.3 reruns, bit-identical to the published runs, scratch deleted)
+11  convergence    results/paper_v2_convergence/{small,medium}[_piw0.1] (1e6, 4 chains, + NUTS 11b)
+13  cost analysis  notes/constant_rate_cost (README.md, sim.py, figure for the supplement)
+Code change after the runs (29.09), not rerun
+  sazz/paper_ready samplers now reuse the gradient of the accepted proposal for the
+  bounce, one gradient fewer per bounce. Paths are unchanged (old and new agree to
+  1e-12 on the same seed, exactness check on linreg still passes). Every paper_v2 run
+  predates it and paid 1 extra gradient per bounce, and the gpu_friendly samplers
+  (small network, toys, images) still do. Same budget would give 1.2 to 1.33x more
+  events for ZigZag and sticky ZigZag, 1.17x Boomerang, 1.01 to 1.09x sticky Boomerang.
+  Worth one sentence in the paper.
+All v2 checks that passed
+  - single_segment runs, 0 bound violations on every UCI and toy run (284 runs so far),
+    all at their budget, S = 4000
+  - deep narrow reruns at PIW 0.3 and 0.1 bit-for-bit identical to the published runs
+  - image and staged runs, draws match the path exactly and times are uniform (KS test)
+  - --save-skeleton leaves the draws unchanged (both drivers)
